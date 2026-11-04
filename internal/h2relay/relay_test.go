@@ -608,7 +608,7 @@ func TestStreamWindowViolationClosesTheConnection(t *testing.T) {
 // grants more.
 func TestConnectionWindowViolationClosesTheConnection(t *testing.T) {
 	h := newHarness(t, nil)
-	h.serverSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 1 << 20}))
+	h.serverSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 1 << 20}, Setting{ID: SettingMaxFrameSize, Value: 1 << 20}))
 	h.expect(h.toClient, "client", isType(FrameSettings))
 	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)})
 	h.expect(h.toServer, "server", isType(FrameHeaders))
@@ -669,13 +669,15 @@ func TestLargeServerHeaderTableSize(t *testing.T) {
 		Setting{ID: 3, Value: 100},
 		Setting{ID: SettingHeaderTableSize, Value: 131072},
 		Setting{ID: SettingInitialWindowSize, Value: 1 << 20},
+		Setting{ID: SettingMaxFrameSize, Value: 1 << 20}, // the header block below is one frame
 	))
 	f := h.expect(h.toClient, "client", isType(FrameSettings))
 	got, err := ParseSettings(f.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 || got[0] != (Setting{ID: 3, Value: 100}) || got[1].ID != SettingHeaderTableSize || got[2] != (Setting{ID: SettingInitialWindowSize, Value: 1 << 20}) {
+	if len(got) != 4 || got[0] != (Setting{ID: 3, Value: 100}) || got[1].ID != SettingHeaderTableSize || got[2] != (Setting{ID: SettingInitialWindowSize, Value: 1 << 20}) ||
+		got[3] != (Setting{ID: SettingMaxFrameSize, Value: 1 << 20}) {
 		t.Fatalf("client settings %v", got)
 	}
 	// The client follows what it received: a table size update to it,

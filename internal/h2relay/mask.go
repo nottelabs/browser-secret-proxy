@@ -264,7 +264,7 @@ func (r *relay) serverLoopMasked() error {
 		return nil
 	}
 	for {
-		f, err := ReadFrame(r.server)
+		f, err := r.readServerFrame()
 		if err != nil {
 			return err
 		}
@@ -281,6 +281,8 @@ func (r *relay) serverLoopMasked() error {
 					return err
 				}
 				f.Payload = clientSettings(f.Payload)
+			} else {
+				r.serverFrames.ack()
 			}
 			if !sawPreface {
 				sawPreface = true
