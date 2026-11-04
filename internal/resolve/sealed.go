@@ -276,6 +276,10 @@ type sealedView struct{ entry *sealedEntry }
 // principal, so the argument is not needed.
 func (v *sealedView) StandIns(Principal) []string { return v.entry.standIns }
 
+// Local marks a sealed view as answering from memory: its values are in the
+// decrypted token.
+func (v *sealedView) Local() {}
+
 // Resolve answers the requested stand-ins the token holds.
 func (v *sealedView) Resolve(_ context.Context, req Request) (Result, error) {
 	payload := v.entry.payload
