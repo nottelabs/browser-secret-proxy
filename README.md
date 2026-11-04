@@ -273,7 +273,11 @@ value is inserted in the form its place needs:
   any character as `\uXXXX`); a string that held one is then written again
   with standard escaping, which decodes to the same text with the real value;
 - headers: as is. A real value containing a line break or NUL is refused in a
-  header, and the request is not sent;
+  header, whatever the header already holds, and the request is not sent.
+  Over HTTP/2, a field value holding a NUL, CR or LF, or starting or ending
+  with a space or tab, is malformed (RFC 9113 8.2.1): the request is
+  answered `502`, with or without stand-ins, and a streamed request with
+  such trailers is reset;
 - other bodies: as is.
 
 ## Production setup: where real values come from
