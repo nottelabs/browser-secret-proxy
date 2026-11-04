@@ -99,12 +99,18 @@ To rotate without breaking running sessions:
 2. Give clients a bundle of both certificates, so new sessions trust
    either: `cat ca.pem ca-new.pem > ca-bundle.pem`. For a Notte session,
    put the bundle in the `secret` entry's `ca_certificate`.
-3. Restart the proxy with `-ca-cert ca-new.pem -ca-key ca-new.key`.
-4. Once every session started before step 2 has ended, give clients only
-   `ca-new.pem`, and delete `ca.key`.
+3. Wait until every session started before step 2 has ended. They trust
+   only the old CA, so the proxy must keep using it until then.
+4. Restart the proxy with `-ca-cert ca-new.pem -ca-key ca-new.key`.
+   Sessions from step 2 trust both, so they keep working.
+5. Give new sessions only `ca-new.pem`. Once the sessions that got the
+   bundle have ended, delete `ca.key`.
 
-Sessions that only trust the old CA fail their TLS handshakes once the
-proxy uses the new one: keep step 4 after them.
+If you cannot wait in step 3, run a second proxy with the new CA on
+another address, point new sessions at it, and stop the old proxy once its
+sessions have ended. Restarting the proxy with the new CA while
+old-CA-only sessions still run makes their next TLS handshake fail; those
+sessions must then be restarted.
 
 ## Proxy credentials
 
