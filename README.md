@@ -24,8 +24,11 @@ reproduce instead of substituting its own.
    destination, then completes the client's TLS handshake with a certificate
    for `host` issued on the fly by your CA. The client must trust that CA.
 3. Each request is relayed (HTTP/2 or HTTP/1.1, whichever the destination
-   chose). Stand-ins are replaced in header values, in the query string and in
-   the request body. Responses are passed back unchanged.
+   chose). The proxy finds the stand-ins in header values, the query string
+   and the request body, looks up their real values once for that request,
+   and replaces them. A request whose values cannot all be used is answered
+   `502` and not sent (see [Security model](#security-model)). Responses are
+   passed back unchanged.
 
 Real values are never logged. Log lines name the host and how many fields
 were swapped.
@@ -185,6 +188,37 @@ parent's tunnel.
 
 Credentials in the parent URL are never logged; logs name only its scheme and
 host.
+
+## Security model
+
+### What the proxy guarantees
+
+- **Real values only reach allowlisted hosts.** Traffic to other hosts is
+  tunneled without decryption, so no swap can happen there.
+- **Each value only goes where it is allowed.** A value can carry its own
+  host list (the same syntax as `-hosts`); without one, the `-hosts`
+  allowlist applies. A value is never swapped into a request for any other
+  host.
+- **Expired values are not used.** A value whose expiry has passed is not
+  swapped.
+- **Fail closed.** When a request carries a stand-in that the resolver does
+  not answer for, whose value may not go to the request's host or has
+  expired, or when the resolver fails, nothing of the request is sent: the
+  client gets `502` (on HTTP/1.1 the connection is then closed). The client
+  never sees the real value or the resolver's error, only the reason.
+- **Values are isolated by principal.** The principal is the proxy
+  credential of the `CONNECT` (`SECRET_PROXY_USERNAME` or the resolver's own
+  credential check). Every request is looked up again for its connection's
+  principal, and the proxy caches no value between requests, so a value
+  looked up for one principal is never used for another.
+
+### What it does not guarantee
+
+- **Single use.** The proxy looks values up once per request and does not
+  count uses. A value that must work only once has to be retired by the
+  resolver that issues it.
+- **Responses** are not masked: see [Responses are not masked](#responses-are-not-masked).
+- **WebSockets** and other upgraded connections get no swaps once upgraded.
 
 ## Exposing the proxy
 

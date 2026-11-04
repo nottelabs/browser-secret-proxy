@@ -15,7 +15,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/browser-secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/scope/scopetest"
 )
 
 const waitFor = 5 * time.Second
@@ -59,11 +59,7 @@ func newRawHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *har
 	if err != nil {
 		t.Fatal(err)
 	}
-	swapper, err := swap.New(map[string]string{"tok_standin": "real_value"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	opts := Options{Hosts: hosts, Swapper: swapper}
+	opts := Options{Hosts: hosts, Session: scopetest.Static(t, hosts, map[string]string{"tok_standin": "real_value"})}
 	if mutate != nil {
 		mutate(&opts)
 	}
@@ -751,19 +747,15 @@ func TestSettingsDecreaseTakesEffectOnItsAck(t *testing.T) {
 	h.expect(h.toClient, "client", isGoAway(errCodeFlowControl))
 }
 
-func expandingSwapper(t *testing.T) *swap.Swapper {
+func expandingSession(t *testing.T, o *Options) {
 	t.Helper()
-	s, err := swap.New(map[string]string{"t1": strings.Repeat("R", 200)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s
+	o.Session = scopetest.Static(t, o.Hosts, map[string]string{"t1": strings.Repeat("R", 200)})
 }
 
 // A body within MaxBody whose swap would pass it (a short stand-in repeated)
 // is refused before anything goes upstream, and nothing stays held.
 func TestBodyExpansionIsBoundedByMaxBody(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.MaxBody = 1000; o.Swapper = expandingSwapper(t) })
+	h := newHarness(t, func(o *Options) { o.MaxBody = 1000; expandingSession(t, o) })
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
 		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1", 400))}, // 800 bytes, 80,000 swapped
@@ -775,7 +767,7 @@ func TestBodyExpansionIsBoundedByMaxBody(t *testing.T) {
 
 // The same against the connection budget, with MaxBody out of the way.
 func TestBodyExpansionIsBoundedByTheConnectionBudget(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.MaxBuffered = 5000; o.Swapper = expandingSwapper(t) })
+	h := newHarness(t, func(o *Options) { o.MaxBuffered = 5000; expandingSession(t, o) })
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
 		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1", 400))},
@@ -797,7 +789,7 @@ func TestBodyExpansionIsBoundedByTheConnectionBudget(t *testing.T) {
 // Header values and the query string are bounded the same way, and a real
 // value with a line break never reaches a header.
 func TestHeaderSwapsAreBoundedAndSafe(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.MaxHeaderBytes = 16384; o.Swapper = expandingSwapper(t) })
+	h := newHarness(t, func(o *Options) { o.MaxHeaderBytes = 16384; expandingSession(t, o) })
 	repeated := strings.Repeat("t1", 1000) // 2,000 bytes, 200,000 swapped
 	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1,
 		Payload: h.clientBlock(request("GET", hpack.HeaderField{Name: "x-token", Value: repeated})...)})
@@ -808,11 +800,9 @@ func TestHeaderSwapsAreBoundedAndSafe(t *testing.T) {
 	h.expect(h.toClient, "client", isRefusal(3))
 	h.quiet(h.toServer, 50*time.Millisecond, isType(FrameHeaders))
 
-	unsafe, err := swap.New(map[string]string{"tok": "a\r\nX-Injected: 1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h2 := newHarness(t, func(o *Options) { o.Swapper = unsafe })
+	h2 := newHarness(t, func(o *Options) {
+		o.Session = scopetest.Static(t, o.Hosts, map[string]string{"tok": "a\r\nX-Injected: 1"})
+	})
 	h2.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1,
 		Payload: h2.clientBlock(request("GET", hpack.HeaderField{Name: "authorization", Value: "Bearer tok"})...)})
 	h2.expect(h2.toClient, "client", isRefusal(1))
@@ -1012,11 +1002,7 @@ func TestBufferedUploadAfterZeroInitialWindow(t *testing.T) {
 // Framing headers are not swapped: a stand-in equal to the content-length
 // leaves it alone, and the content-length matches the body that is sent.
 func TestFramingHeadersAreNotSwapped(t *testing.T) {
-	numeric, err := swap.New(map[string]string{"123": "456"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := newHarness(t, func(o *Options) { o.Swapper = numeric })
+	h := newHarness(t, func(o *Options) { o.Session = scopetest.Static(t, o.Hosts, map[string]string{"123": "456"}) })
 	body := bytes.Repeat([]byte("x"), 123)
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST",
@@ -1244,14 +1230,11 @@ func bareRelay(t *testing.T) (client, server net.Conn, done <-chan error, server
 	if err != nil {
 		t.Fatal(err)
 	}
-	swapper, err := swap.New(map[string]string{"tok_standin": "real_value"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := scopetest.Static(t, hosts, map[string]string{"tok_standin": "real_value"})
 	clientTest, clientRelay := net.Pipe()
 	serverRelay, serverTest := net.Pipe()
 	result := make(chan error, 1)
-	go func() { result <- newRelay(clientRelay, serverRelay, Options{Hosts: hosts, Swapper: swapper}).run() }()
+	go func() { result <- newRelay(clientRelay, serverRelay, Options{Hosts: hosts, Session: session}).run() }()
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)

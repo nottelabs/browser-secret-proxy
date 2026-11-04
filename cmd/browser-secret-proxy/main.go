@@ -17,7 +17,7 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/certs"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/proxy"
-	"github.com/nottelabs/browser-secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
 )
 
@@ -65,7 +65,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	swapper, err := swap.Load(*swaps)
+	resolver, err := resolve.LoadFile(*swaps)
+	if err != nil {
+		return err
+	}
+	detector, err := resolve.NewDetector(resolver, resolve.Patterns{})
 	if err != nil {
 		return err
 	}
@@ -82,7 +86,8 @@ func run() error {
 	server, err := proxy.New(proxy.Config{
 		Authority: authority,
 		Hosts:     allow,
-		Swapper:   swapper,
+		Resolver:  resolver,
+		Detector:  detector,
 		Dialer:    dialer,
 		Username:  os.Getenv("SECRET_PROXY_USERNAME"),
 		Password:  os.Getenv("SECRET_PROXY_PASSWORD"),
@@ -96,7 +101,7 @@ func run() error {
 		return err
 	}
 	parentDescription := describeParent(parentURL)
-	logger.Info("listening", "address", ln.Addr().String(), "hosts", *hosts, "stand_ins", swapper.Count(), "upstream_proxy", parentDescription,
+	logger.Info("listening", "address", ln.Addr().String(), "hosts", *hosts, "stand_ins", resolver.Count(), "upstream_proxy", parentDescription,
 		"proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "")
 
 	stop := make(chan os.Signal, 1)
