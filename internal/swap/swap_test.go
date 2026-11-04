@@ -52,14 +52,53 @@ func TestHeaderRefusesLineBreaks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got, _, err := s.Header("Bearer tok_standin", noLimit); !errors.Is(err, ErrUnsafeHeader) {
-			t.Errorf("real value %q: Header = %q, %v; want ErrUnsafeHeader", real, got, err)
+		// A line break, bare CR or NUL the client put in the header itself
+		// does not let the real value through.
+		for _, header := range []string{"Bearer tok_standin", "tok_standin\x00", "\rtok_standin", "a\nb tok_standin"} {
+			if got, _, err := s.Header(header, noLimit); !errors.Is(err, ErrUnsafeHeader) {
+				t.Errorf("real value %q in %q: Header = %q, %v; want ErrUnsafeHeader", real, header, got, err)
+			}
 		}
 		// The same value is fine in a JSON body, escaped.
 		body, _, err := s.Body("application/json", []byte(`{"k":"tok_standin"}`), noLimit)
 		var decoded map[string]string
 		if err != nil || json.Unmarshal(body, &decoded) != nil || decoded["k"] != real {
 			t.Errorf("real value %q: JSON body %q, %v", real, body, err)
+		}
+	}
+}
+
+// Only the real values a header swap inserts are checked: a header that
+// holds a stand-in with a safe value is swapped whatever else the client put
+// in it, and a stand-in with an unsafe value is refused only where it is
+// the one matched, not where a longer stand-in containing it wins.
+func TestHeaderChecksInsertedValues(t *testing.T) {
+	s, err := New(map[string]string{
+		"tok_pem":      "-----BEGIN KEY-----\nAAAA\n-----END KEY-----",
+		"tok_pem_safe": "sk_safe",
+		"tok_plain":    "sk_plain",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"tok_plain\x00":     "sk_plain\x00",
+		"tok_pem_safe":      "sk_safe",
+		"tok_pem_safe\r":    "sk_safe\r",
+		"x tok_plain y":     "x sk_plain y",
+		"no stand-in\x00":   "no stand-in\x00",
+		"tok_pe tok_plain":  "tok_pe sk_plain",
+		"tok_pem_safetok_p": "sk_safetok_p",
+	}
+	for in, want := range cases {
+		got, _, err := s.Header(in, noLimit)
+		if err != nil || got != want {
+			t.Errorf("Header(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"tok_pem", "tok_plain tok_pem", "tok_pem_safe tok_pem\x00"} {
+		if _, _, err := s.Header(in, noLimit); !errors.Is(err, ErrUnsafeHeader) {
+			t.Errorf("Header(%q): %v; want ErrUnsafeHeader", in, err)
 		}
 	}
 }
