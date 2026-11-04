@@ -45,6 +45,7 @@ import (
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -126,6 +127,11 @@ type relay struct {
 	lookupsRunning int
 	lookupQueue    []pendingLookup
 	asyncErrs      chan error
+	// panicked closes when one of the relay's goroutines panics (see
+	// contain); run then waits at most panicWait for the others.
+	panicked  chan struct{}
+	panicOnce sync.Once
+	panicWait time.Duration
 	// streamErrors counts the client's stream errors (frames on a stream it
 	// ended); past maxStreamErrors they end the connection. clientLoop only.
 	streamErrors int
@@ -300,6 +306,7 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.asyncErrs = make(chan error, 1)
+	r.panicked, r.panicWait = make(chan struct{}), defaultPanicWait
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
@@ -327,6 +334,7 @@ func (r *relay) run() error {
 	errs := make(chan error, 3)
 	timeout := make(chan error, 1)
 	timer := time.AfterFunc(r.opts.PrefaceTimeout, func() {
+		defer panics.Recover(r.contain)
 		// No clientMu here: a writer stuck on a client that stopped reading
 		// may hold it.
 		if !r.prefaceSent.Load() {
@@ -338,13 +346,13 @@ func (r *relay) run() error {
 	if r.masking {
 		errs = make(chan error, 4)
 		pending = 4
-		go func() { errs <- r.serverLoopMasked() }()
-		go func() { errs <- r.clientSendLoop() }()
+		r.start(errs, r.serverLoopMasked)
+		r.start(errs, r.clientSendLoop)
 	} else {
-		go func() { errs <- r.serverLoop() }()
+		r.start(errs, r.serverLoop)
 	}
-	go func() { errs <- r.clientLoop() }()
-	go func() { errs <- r.sendLoop() }()
+	r.start(errs, r.clientLoop)
+	r.start(errs, r.sendLoop)
 	var first error
 	select {
 	case first = <-errs:
@@ -352,16 +360,64 @@ func (r *relay) run() error {
 	case first = <-timeout:
 	case first = <-r.asyncErrs:
 	}
-	r.shutdown()
-	for ; pending > 0; pending-- {
-		<-errs //nolint:errcheck // waits for the other loops; first is the cause
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		defer panics.Recover(r.contain)
+		r.shutdown()
+		for ; pending > 0; pending-- {
+			<-errs //nolint:errcheck // waits for the other loops; first is the cause
+		}
+		// shutdown canceled every lookup; none outlives the relay.
+		r.lookups.Wait()
+	}()
+	select {
+	case <-ended:
+	case <-r.panicked:
+		// The panic may have left a lock held, which the goroutines
+		// waiting on it never get: the relay stops waiting for them.
+		select {
+		case <-ended:
+		case <-time.After(r.panicWait):
+			r.opts.Logger.Warn("stopped waiting for the relay's goroutines after a panic", "after", r.panicWait)
+		}
 	}
-	// shutdown canceled every lookup; none outlives the relay.
-	r.lookups.Wait()
 	if errors.Is(first, io.EOF) || errors.Is(first, net.ErrClosed) {
 		return nil
 	}
 	return first
+}
+
+// defaultPanicWait bounds how long run waits for the relay's goroutines
+// after one of them panicked.
+const defaultPanicWait = 5 * time.Second
+
+// start runs loop on a goroutine that sends its result to errs, or the
+// panic that ended it.
+func (r *relay) start(errs chan<- error, loop func() error) {
+	go func() {
+		defer panics.Recover(func(p *panics.Error) {
+			r.contain(p)
+			errs <- p
+		})
+		errs <- loop()
+	}()
+}
+
+// contain is the panic handler of every goroutine the relay starts. It
+// logs where the panic happened, not its value, and ends the connection
+// without taking a lock, which the panic may have left held: both
+// connections close, which ends the other goroutines' I/O, and run stops
+// waiting.
+func (r *relay) contain(p *panics.Error) {
+	r.opts.Logger.Error("HTTP/2 relay panicked; closing the connection", "panic_type", p.Type, "at", p.Site)
+	r.panicOnce.Do(func() { close(r.panicked) })
+	r.cancel()
+	panics.Abort(r.server, r.client)
+	select {
+	case r.asyncErrs <- p:
+	default:
+	}
 }
 
 // shutdown ends the relay. It must not wait on a goroutine stuck in I/O
@@ -1723,6 +1779,7 @@ func (r *relay) goAwayServer(code uint32) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		defer panics.Recover(r.contain)
 		r.serverMu.Lock()
 		defer r.serverMu.Unlock()
 		_ = r.server.SetWriteDeadline(time.Now().Add(goAwayWait))

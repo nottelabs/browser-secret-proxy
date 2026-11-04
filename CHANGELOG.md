@@ -22,6 +22,11 @@ First release, planned as 0.1.0.
   connection's handler, or in uTLS while it rebuilds a ClientHello, now
   closes only that connection; its log line names where it happened but not
   the panic value.
+- A panic on a goroutine a relay or tunnel starts for a connection (the
+  HTTP/2 relay's loops, lookups, response masking and GOAWAY writer, the
+  HTTP/1.1 relay's request and response sides, a tunnel's copies) closes
+  both sides of that connection, logged the same way, instead of ending the
+  whole process.
 - Optional Basic authentication on CONNECT
   (`SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD`). The proxy refuses to
   start with a password but no username, which would leave authentication

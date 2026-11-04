@@ -12,6 +12,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 )
 
 // Response masking.
@@ -793,6 +794,7 @@ func (r *relay) takeDebtReturnLocked() int64 {
 // runMask runs a masked response body through decoding and masking into the
 // stream's queue, then queues its end.
 func (r *relay) runMask(rs *respState, plan respPlan, m *mask.Masker) {
+	defer panics.Recover(r.contain)
 	in := &pipeReader{r: r, rs: rs}
 	src, err := mask.Decoder(plan.decode, in, r.opts.MaxDecoded)
 	if err != nil {

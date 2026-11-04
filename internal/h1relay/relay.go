@@ -25,6 +25,7 @@ import (
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -72,19 +73,33 @@ func Serve(client, server net.Conn, opts Options) error {
 	responsesDone := make(chan struct{})
 	progress := newProgress()
 	done := make(chan error, 2)
+	// A panic on either goroutine ends the connection: both sides close,
+	// which ends the other goroutine, and Serve returns the panic.
+	contain := func(p *panics.Error) {
+		opts.Logger.Error("HTTP/1.1 relay panicked; closing the connection", "panic_type", p.Type, "at", p.Site)
+		panics.Abort(client, server)
+		done <- p
+	}
 	go func() {
 		defer close(responsesDone)
 		defer progress.stop()
+		defer panics.Recover(contain)
 		done <- responses(bufio.NewReader(server), toClient, queue, progress, opts)
 	}()
 	go func() {
+		defer panics.Recover(contain)
 		done <- requests(ctx, bufio.NewReader(client), server, toClient, queue, responsesDone, progress, opts)
 	}()
 	err := <-done
 	cancel()
 	_ = client.Close()
 	_ = server.Close()
-	<-done //nolint:errcheck // waits for the other side; err above is the cause
+	// Waits for the other side. Its error is the cause only if it is a
+	// panic, whose closing of both sides may have ended this side first.
+	var p *panics.Error
+	if other := <-done; errors.As(other, &p) {
+		err = other
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, errRefused) {
 		return nil // a refusal was logged when it was answered
 	}
