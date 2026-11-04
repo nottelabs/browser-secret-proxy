@@ -30,16 +30,25 @@ import (
 func TestMaskingFramingDoesNotRevealPrefixes(t *testing.T) {
 	const real = "sk_live_real_secret_value"
 	page := strings.Repeat("<p>results</p>\n", 40) + "results for "
+	// The client signals once it has the first piece of a search response,
+	// so the rest is written only after the proxy masked and passed on the
+	// first write: the two writes never reach the masker as one, whatever
+	// the scheduling.
+	seen := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/login" {
 			_, _ = io.WriteString(w, "ok")
 			return
 		}
-		// A streaming server: the reflected part is flushed, more follows a
-		// moment later.
+		// A streaming server: the reflected part is flushed, more follows
+		// once the client got some of it.
 		_, _ = io.WriteString(w, page+r.URL.Query().Get("q"))
 		w.(http.Flusher).Flush()
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-seen:
+		case <-time.After(10 * time.Second):
+			t.Errorf("the client got nothing of a flushed %d bytes", len(page)+len(r.URL.Query().Get("q")))
+		}
 		_, _ = io.WriteString(w, " end")
 	})
 	protos(t, func(t *testing.T, proto string) {
@@ -58,15 +67,15 @@ func TestMaskingFramingDoesNotRevealPrefixes(t *testing.T) {
 			pieces = h2Pieces(t, tc)
 		}
 		// A request with the stand-in puts the real value on record.
-		pieces(http.MethodPost, "/login", "pw=tok_standin")
+		pieces(http.MethodPost, "/login", "pw=tok_standin", nil)
 		leaked := 0
 		for n := 1; n < len(real); n++ {
 			miss := byte('z')
 			if real[n-1] == miss {
 				miss = 'y'
 			}
-			hit := pieces(http.MethodGet, "/search?q="+real[:n], "")
-			other := pieces(http.MethodGet, "/search?q="+real[:n-1]+string(miss), "")
+			hit := pieces(http.MethodGet, "/search?q="+real[:n], "", seen)
+			other := pieces(http.MethodGet, "/search?q="+real[:n-1]+string(miss), "", seen)
 			if !slices.Equal(hit, other) {
 				leaked++
 				t.Logf("%d bytes of the value: pieces %v, %v for a wrong last byte", n, hit, other)
@@ -79,10 +88,11 @@ func TestMaskingFramingDoesNotRevealPrefixes(t *testing.T) {
 }
 
 // h1Pieces returns a function that sends a request over c and returns the
-// sizes of the chunks of its response.
-func h1Pieces(t *testing.T, c *tls.Conn) func(method, path, body string) []int {
+// sizes of the chunks of its response. Once it has the first chunk, it
+// signals on seen, if not nil.
+func h1Pieces(t *testing.T, c *tls.Conn) func(method, path, body string, seen chan<- struct{}) []int {
 	br := bufio.NewReader(c)
-	return func(method, path, body string) []int {
+	return func(method, path, body string, seen chan<- struct{}) []int {
 		t.Helper()
 		request := method + " " + path + " HTTP/1.1\r\nHost: " + allowedHost + "\r\n"
 		if body != "" {
@@ -135,20 +145,24 @@ func h1Pieces(t *testing.T, c *tls.Conn) func(method, path, body string) []int {
 				t.Fatal(err)
 			}
 			sizes = append(sizes, int(n))
+			if len(sizes) == 1 && seen != nil {
+				seen <- struct{}{}
+			}
 		}
 	}
 }
 
 // h2Pieces returns a function that sends a request over c, on a new HTTP/2
-// stream, and returns the sizes of the DATA frames of its response.
-func h2Pieces(t *testing.T, c *tls.Conn) func(method, path, body string) []int {
+// stream, and returns the sizes of the DATA frames of its response. Once it
+// has the first non-empty DATA frame, it signals on seen, if not nil.
+func h2Pieces(t *testing.T, c *tls.Conn) func(method, path, body string, seen chan<- struct{}) []int {
 	if _, err := c.Write(h2relay.AppendFrame([]byte(h2relay.Preface), h2relay.FrameSettings, 0, 0, nil)); err != nil {
 		t.Fatal(err)
 	}
 	var block bytes.Buffer
 	enc := hpack.NewEncoder(&block)
 	stream := uint32(1)
-	return func(method, path, body string) []int {
+	return func(method, path, body string, seen chan<- struct{}) []int {
 		t.Helper()
 		block.Reset()
 		for _, f := range [][2]string{{":method", method}, {":scheme", "https"}, {":authority", allowedHost}, {":path", path}} {
@@ -183,6 +197,9 @@ func h2Pieces(t *testing.T, c *tls.Conn) func(method, path, body string) []int {
 			case f.Type == h2relay.FrameData:
 				if len(f.Payload) > 0 {
 					sizes = append(sizes, len(f.Payload))
+					if len(sizes) == 1 && seen != nil {
+						seen <- struct{}{}
+					}
 					credit := binary.BigEndian.AppendUint32(nil, uint32(len(f.Payload)))
 					if _, err := c.Write(h2relay.AppendFrame(nil, h2relay.FrameWindowUpdate, 0, 0, credit)); err != nil {
 						t.Fatal(err)
