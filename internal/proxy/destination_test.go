@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -334,10 +335,12 @@ func TestDestinationAddressesAreTriedInTurn(t *testing.T) {
 }
 
 // stallingDialer never answers for stall: it waits until the dial's context
-// ends and records how long that took. Other addresses go to next.
+// ends and records how long that took, then closes done. Other addresses go
+// to next.
 type stallingDialer struct {
 	stall  string
 	next   *recordingDialer
+	done   chan struct{}
 	mu     sync.Mutex
 	waited time.Duration
 }
@@ -352,6 +355,7 @@ func (d *stallingDialer) DialContext(ctx context.Context, network, addr string) 
 	d.mu.Lock()
 	d.waited = time.Since(start)
 	d.mu.Unlock()
+	close(d.done)
 	return nil, &net.OpError{Op: "dial", Net: network, Err: ctx.Err()}
 }
 
@@ -361,33 +365,131 @@ func (d *stallingDialer) stalled() time.Duration {
 	return d.waited
 }
 
-// When the first checked address does not answer at all, its dial gives up
-// on a share of the handshake timeout, leaving time for the next address.
-func TestStalledDestinationAddressLeavesTimeForTheNext(t *testing.T) {
-	const timeout = 4 * time.Second // the stalled address gets 2s of it
+// When the first checked address does not answer at all, the next one is
+// dialed after fallbackDelay, not after the stalled dial's share of the
+// handshake timeout (15s by default), and the stalled dial is cancelled once
+// the next one connects.
+func TestStalledDestinationAddressDoesNotHoldTheNext(t *testing.T) {
 	dest := startDestination(t, otherHost, []string{"http/1.1"}, respondOK)
 	lookup := &fakeLookup{answers: map[string][]string{otherHost: {"2001:db8::7", "203.0.113.8"}}}
 	dialer := &stallingDialer{
 		stall: "[2001:db8::7]:443",
 		next:  &recordingDialer{routes: mapDialer{"203.0.113.8:443": dest.addr}},
+		done:  make(chan struct{}),
 	}
 	p := startProxy(t, nil, dest.ca, func(c *Config) {
 		c.Dialer = dialer
 		c.AllowPrivateDestinations = false
-		c.HandshakeTimeout = timeout
 		c.lookup = lookup.lookup
 	})
+	start := time.Now()
 	conn, resp := connect(t, p.addr, otherHost+":443", "")
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT answered %s", resp.Status)
 	}
+	if took := time.Since(start); took < fallbackDelay || took > fallbackDelay+5*time.Second {
+		t.Fatalf("CONNECT took %v, fallback delay %v", took, fallbackDelay)
+	}
 	getOK(t, tlsClient(t, conn, otherHost, dest.ca), otherHost)
 	if got := dialer.next.dialed(); len(got) != 2 || got[0] != "[2001:db8::7]:443" || got[1] != "203.0.113.8:443" {
 		t.Fatalf("dialed %v", got)
 	}
-	if waited := dialer.stalled(); waited <= 0 || waited >= timeout*3/4 {
-		t.Fatalf("the stalled address held the dial for %v of %v", waited, timeout)
+	select {
+	case <-dialer.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stalled dial was not cancelled")
+	}
+	if waited := dialer.stalled(); waited < fallbackDelay || waited > fallbackDelay+5*time.Second {
+		t.Fatalf("the stalled address held its dial for %v", waited)
+	}
+}
+
+// closeRecorder is a connection that reports when it is closed.
+type closeRecorder struct {
+	net.Conn
+	closed chan struct{}
+}
+
+func (c *closeRecorder) Close() error {
+	close(c.closed)
+	return c.Conn.Close()
+}
+
+// lateDialer answers slow after delay, whatever its context says, and
+// every other address at once.
+type lateDialer struct {
+	slow  string
+	delay time.Duration
+	late  *closeRecorder
+}
+
+func (d *lateDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+	if addr != d.slow {
+		return client, nil
+	}
+	time.Sleep(d.delay)
+	d.late.Conn = client
+	return d.late, nil
+}
+
+// A dial that connects after another address has won is closed, not leaked.
+func TestLosingDestinationDialIsClosed(t *testing.T) {
+	d := &lateDialer{slow: "203.0.113.7:443", delay: 2 * fallbackDelay, late: &closeRecorder{closed: make(chan struct{})}}
+	s := &Server{cfg: Config{Dialer: d}}
+	addrs := []netip.Addr{netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("203.0.113.8")}
+	conn, err := s.dialAddrs(context.Background(), addrs, "443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if conn == d.late {
+		t.Fatal("the slow address won")
+	}
+	select {
+	case <-d.late.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the losing connection was not closed")
+	}
+}
+
+// failingDialer fails every address with an error naming it.
+type failingDialer struct{}
+
+func (failingDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("refused " + addr)}
+}
+
+// When every address fails, the error is the first address's.
+func TestDestinationDialErrorIsTheFirstAddresss(t *testing.T) {
+	s := &Server{cfg: Config{Dialer: failingDialer{}}}
+	addrs := []netip.Addr{netip.MustParseAddr("2001:db8::7"), netip.MustParseAddr("203.0.113.8"), netip.MustParseAddr("2001:db8::8")}
+	_, err := s.dialAddrs(context.Background(), addrs, "443")
+	if err == nil || !strings.Contains(err.Error(), "refused [2001:db8::7]:443") {
+		t.Fatalf("error %v", err)
+	}
+}
+
+func TestInterleaveFamilies(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"203.0.113.1", "203.0.113.1"},
+		{"2001:db8::1 2001:db8::2 2001:db8::3 203.0.113.1", "2001:db8::1 203.0.113.1 2001:db8::2 2001:db8::3"},
+		{"203.0.113.1 203.0.113.2 2001:db8::1 2001:db8::2", "203.0.113.1 2001:db8::1 203.0.113.2 2001:db8::2"},
+		{"::ffff:203.0.113.1 2001:db8::1 203.0.113.2", "::ffff:203.0.113.1 2001:db8::1 203.0.113.2"},
+	} {
+		var in []netip.Addr
+		for _, a := range strings.Fields(c.in) {
+			in = append(in, netip.MustParseAddr(a))
+		}
+		var got []string
+		for _, a := range interleaveFamilies(in) {
+			got = append(got, a.String())
+		}
+		if strings.Join(got, " ") != c.want {
+			t.Errorf("interleaveFamilies(%s) = %s, want %s", c.in, strings.Join(got, " "), c.want)
+		}
 	}
 }
 

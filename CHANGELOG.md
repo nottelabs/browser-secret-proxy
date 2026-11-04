@@ -227,7 +227,9 @@ First release, planned as 0.1.0.
   link-local (`169.254.169.254` included), unspecified, multicast and
   `100.64.0.0/10`, also in IPv4-mapped or IPv4-compatible form. The proxy
   resolves a name once, refuses it when any of its addresses is internal,
-  and dials the addresses it checked. Through `-upstream-proxy`, only
+  and dials the addresses it checked, alternating IPv6 and IPv4 and
+  starting on the next address when one has not answered within 300ms, as
+  Go's dialer does for a name. Through `-upstream-proxy`, only
   IP-literal destinations are checked. `-allow-private-destinations` turns
   the check off. Tunnels without decryption are logged at info level, with
   their host, port and principal.
