@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -82,8 +83,19 @@ type Config struct {
 	// (default mask.Fixed). mask.Minimal lets a destination that reflects
 	// input reveal real values through the framing of its responses.
 	MaskStreamWindow mask.Window
+	// HandshakeTimeout bounds a connection's CONNECT head, destination dial
+	// and TLS handshakes together (default 30s).
 	HandshakeTimeout time.Duration
-	Logger           *slog.Logger
+	// HeaderTimeout bounds the CONNECT head, and each HTTP/1.1 request head
+	// on an intercepted connection from its first byte (default 10s).
+	HeaderTimeout time.Duration
+	// IdleTimeout closes a tunneled or intercepted connection once no bytes
+	// have moved either way for that long (zero: never).
+	IdleTimeout time.Duration
+	// MaxConns caps the client connections handled at once (zero: no cap).
+	// A connection past it is answered 503 and closed.
+	MaxConns int
+	Logger   *slog.Logger
 }
 
 // shutdownWait bounds how long Serve waits for handlers after closing
@@ -92,9 +104,10 @@ const shutdownWait = 10 * time.Second
 
 // Server is a forward proxy.
 type Server struct {
-	cfg   Config
-	scope *scope.Scope
-	wg    sync.WaitGroup
+	cfg    Config
+	scope  *scope.Scope
+	wg     sync.WaitGroup
+	active atomic.Int64 // client connections being handled
 
 	mu      sync.Mutex
 	conns   map[net.Conn]struct{} // client and destination connections in use
@@ -117,6 +130,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 30 * time.Second
 	}
+	if cfg.HeaderTimeout <= 0 {
+		cfg.HeaderTimeout = 10 * time.Second
+	}
 	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Mask: cfg.MaskResponses, MaskWindow: cfg.MaskStreamWindow, Logger: cfg.Logger})
 	if err != nil {
 		return nil, err
@@ -127,6 +143,7 @@ func New(cfg Config) (*Server, error) {
 // Serve accepts connections until the listener is closed, then closes every
 // connection still open and waits (boundedly) for their handlers.
 func (s *Server) Serve(ln net.Listener) error {
+	refusing := false // logged once each time the cap is reached
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -136,9 +153,24 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
+		if s.cfg.MaxConns > 0 && s.active.Load() >= int64(s.cfg.MaxConns) {
+			if !refusing {
+				s.cfg.Logger.Warn("refusing connections over the limit", "max_conns", s.cfg.MaxConns)
+				refusing = true
+			}
+			// A fresh connection's send buffer takes the answer at once;
+			// the deadline only keeps the loop from ever waiting on it.
+			_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+			writeStatus(conn, http.StatusServiceUnavailable, "too many connections\n")
+			_ = conn.Close()
+			continue
+		}
+		refusing = false
+		s.active.Add(1)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.active.Add(-1)
 			defer s.recoverHandler(conn)
 			s.handle(conn)
 		}()
@@ -224,8 +256,17 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 	defer s.untrack(conn)
+	// Traffic is counted from here on; the deferred calls above keep the
+	// bare connection.
+	idle := newIdleTimer(s.cfg.IdleTimeout)
+	defer idle.stop()
+	conn = idle.wrap(conn)
 	log := s.cfg.Logger.With("client", conn.RemoteAddr().String())
-	_ = conn.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
+	// The head must come within HeaderTimeout, and the handshakes that
+	// follow within HandshakeTimeout of the connection's start.
+	start := time.Now()
+	handshakeDeadline := start.Add(s.cfg.HandshakeTimeout)
+	_ = conn.SetDeadline(start.Add(min(s.cfg.HeaderTimeout, s.cfg.HandshakeTimeout)))
 	// The request head is read before authentication, so it is capped:
 	// http.ReadRequest itself has no limit.
 	limited := &headLimiter{r: conn, remaining: maxRequestHead}
@@ -241,6 +282,7 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 	limited.disable() // what follows is tunneled or TLS, not a request head
+	_ = conn.SetDeadline(handshakeDeadline)
 	if req.Method != http.MethodConnect {
 		writeStatus(conn, http.StatusMethodNotAllowed, "only CONNECT is supported\n")
 		return
@@ -277,6 +319,7 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 	defer s.untrack(upConn)
+	upConn = idle.wrap(upConn)
 	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
@@ -284,10 +327,11 @@ func (s *Server) handle(conn net.Conn) {
 	if !s.cfg.Hosts.Match(host) {
 		log.Info("tunneling without decryption", "principal", principal.ID)
 		_ = conn.SetDeadline(time.Time{})
+		idle.start(log, conn, upConn)
 		tunnel(&readerConn{Conn: conn, r: br}, upConn)
 		return
 	}
-	s.intercept(ctx, log, conn, br, upConn, host, s.scope.Session(principal, host))
+	s.intercept(ctx, log, conn, br, upConn, idle, host, s.scope.Session(principal, host))
 }
 
 // authenticate checks a CONNECT's Proxy-Authorization and returns the
@@ -398,7 +442,7 @@ func (e *ReplayError) Error() string {
 	return "cannot replay the client's ClientHello exactly: " + e.Reason
 }
 
-func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn, br *bufio.Reader, upConn net.Conn, host string, session *scope.Session) {
+func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn, br *bufio.Reader, upConn net.Conn, idle *idleTimer, host string, session *scope.Session) {
 	consumed, recordVersion, message, err := clienthello.Read(br)
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -447,7 +491,9 @@ func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn,
 	if protocol != "" {
 		serverConfig.NextProtos = []string{protocol}
 	}
-	tlsConn := tls.Server(clientConn, serverConfig)
+	// Request heads are timed from the first byte of their TLS record.
+	records := h1relay.WatchRecords(clientConn)
+	tlsConn := tls.Server(records, serverConfig)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		if errors.Is(err, io.EOF) {
 			log.Debug("client closed during the TLS handshake")
@@ -458,12 +504,13 @@ func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn,
 	}
 	_ = conn.SetDeadline(time.Time{})
 	_ = upConn.SetDeadline(time.Time{})
+	idle.start(log, conn, upConn)
 	log.Info("intercepting", "protocol", protocolName(protocol), "principal", session.Principal().ID)
 
 	if protocol == "h2" {
 		err = h2relay.Serve(tlsConn, uconn, h2relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, Logger: log})
 	} else {
-		err = h1relay.Serve(tlsConn, uconn, h1relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, Logger: log})
+		err = h1relay.Serve(tlsConn, uconn, h1relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, HeadTimeout: s.cfg.HeaderTimeout, Records: records, Logger: log})
 	}
 	if err != nil {
 		log.Warn("connection ended with an error", "error", err)

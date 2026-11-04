@@ -29,6 +29,13 @@ First release, planned as 0.1.0.
   forwarded next to the swapped, re-chunked body, so a server that framed
   by it could read part of the body as another request.
 - HTTP/2 and HTTP/1.1 relays.
+- Idle and header timeouts and a connection cap. A connection with no
+  traffic either way for `-idle-timeout` (default `5m`) is closed, the
+  CONNECT head and each HTTP/1.1 request head must arrive within
+  `-header-timeout` (default `10s`), and past `-max-conns` (default `1024`)
+  connections a new one is answered `503`. An HTTP/1.1 request body takes
+  memory as it arrives instead of all at once when its head declares its
+  length.
 - On allowlisted hosts, a ClientHello that repeats an extension type
   (RFC 8446 forbids it) is refused with a `decode_error` alert, as is any
   ClientHello the proxy cannot parse. Before, two `session_ticket`

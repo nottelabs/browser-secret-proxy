@@ -128,6 +128,24 @@ func TestParseParentErrorsLeaveCredentialsOut(t *testing.T) {
 	}
 }
 
+// Resource-limit flags remain on the FlagSet used by run after integrating
+// the credential-safe usage handling.
+func TestConnectionLimitFlags(t *testing.T) {
+	fs, opts := newFlagSet("test", flag.ContinueOnError)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if opts.idleTimeout.String() != "5m0s" || opts.headerTimeout.String() != "10s" || opts.maxConns != 1024 {
+		t.Fatalf("defaults: idle %s, header %s, max %d", opts.idleTimeout, opts.headerTimeout, opts.maxConns)
+	}
+	if err := fs.Parse([]string{"-idle-timeout=0", "-header-timeout=2s", "-max-conns=7"}); err != nil {
+		t.Fatal(err)
+	}
+	if opts.idleTimeout != 0 || opts.headerTimeout.String() != "2s" || opts.maxConns != 7 {
+		t.Fatalf("overrides: idle %s, header %s, max %d", opts.idleTimeout, opts.headerTimeout, opts.maxConns)
+	}
+}
+
 // The private-destination override must remain registered on the FlagSet
 // used by run, alongside the credential-safe usage handling.
 func TestAllowPrivateDestinationsFlag(t *testing.T) {

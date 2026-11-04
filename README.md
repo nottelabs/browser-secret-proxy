@@ -252,6 +252,9 @@ real value in the echo.
 | `-allow-private-destinations` | Let `CONNECT` reach loopback, private, link-local and other internal addresses (default `false`: they are refused with `403`). See [Security model](#security-model). |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty; a `SECRET_PROXY_PASSWORD` without it is refused at start. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
+| `-idle-timeout` | Close a connection, tunneled or decrypted, once no bytes have moved either way for this long (default `5m`, `0` never). See [Limits and known gaps](#limits-and-known-gaps). |
+| `-header-timeout` | Longest wait for the CONNECT request head, and for each HTTP/1.1 request head on a decrypted connection from its first byte (default `10s`). |
+| `-max-conns` | Most client connections handled at once (default `1024`, `0` no limit). A connection past it is answered `503` and closed. |
 | `-mask-stream-window` | What masking holds back at the end of a streamed response: `fixed` (default), a window of bytes whatever they are, or `minimal`, only bytes that could begin a real value. `minimal` lowers streaming latency, but lets any allowlisted endpoint that reflects input reveal real values. Any other value is refused at start. See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
 | `-version` | Print the version and exit. |
@@ -826,6 +829,22 @@ return.
 
 - CONNECT only: plain `http://` proxy requests get `405`. The CONNECT request
   head is capped at 64 KiB (`431` beyond it), before authentication.
+- The proxy handles at most `-max-conns` client connections at once (1024 by
+  default); a new one past that is answered `503` and closed. The cap is
+  global: there is no cap per principal, and failed authentications are not
+  rate limited.
+- The CONNECT head must arrive within `-header-timeout` (10 seconds by
+  default), and the head, the destination dial and both TLS handshakes within
+  30 seconds. On a decrypted HTTP/1.1 connection, each request head must
+  arrive within `-header-timeout` of the first byte of the TLS record that
+  carries it, however slowly that record comes. HTTP/2 heads have no time
+  limit of their own: an HTTP/2 connection is bounded by the idle timeout
+  below and by its buffer caps.
+- A connection with no bytes moving either way for `-idle-timeout` (5 minutes
+  by default) is closed, tunnels included. Traffic in one direction keeps it
+  open, so a WebSocket or event stream that sends something more often stays
+  up; one that stays silent longer is cut. A peer that stops reading stalls
+  the connection, so it is cut too.
 - TLS session resumption is not supported. A ClientHello that offers
   `pre_shared_key` or early data on an allowlisted host is refused, and every
   connection to an allowlisted host performs a full handshake.
