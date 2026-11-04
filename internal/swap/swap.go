@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -83,6 +84,19 @@ func New(values map[string]string) (*Swapper, error) {
 		jsonString: strings.NewReplacer(jsonString...),
 		keys:       keys,
 	}, nil
+}
+
+// Forms returns the distinct forms in which a Swapper recognizes a
+// stand-in: as is, query-escaped, path-escaped and JSON-escaped. A request
+// carries the stand-in when it contains any of them.
+func Forms(standIn string) []string {
+	forms := []string{standIn}
+	for _, f := range []string{url.QueryEscape(standIn), url.PathEscape(standIn), jsonEscape(standIn)} {
+		if !slices.Contains(forms, f) {
+			forms = append(forms, f)
+		}
+	}
+	return forms
 }
 
 // appendForms adds a replacement of each distinct form of a stand-in by
