@@ -186,22 +186,22 @@ func TestUpstreamIDsFollowOpeningOrder(t *testing.T) {
 	getPath(h, 3, "/?k=tok_b")
 	g.waitStarted(t, "tok_b")
 	getPath(h, 5, "/plain")
-	g.release("b")
-	time.Sleep(20 * time.Millisecond)
-	g.release("a")
-	var paths []string
+	// Each stream is seen to go upstream before the next lookup answers, so
+	// the opening order is the one the test sets, not the scheduler's.
 	last := uint32(0)
-	for i := 0; i < 3; i++ {
+	next := func(want string) {
+		t.Helper()
 		f := h.expect(h.toServer, "server", isType(FrameHeaders))
-		if f.Stream <= last {
-			t.Fatalf("upstream stream %d after %d", f.Stream, last)
+		if p := serverPath(t, dec, f); p != want || f.Stream <= last {
+			t.Fatalf("server got %s on stream %d after stream %d, want %s on a later one", p, f.Stream, last, want)
 		}
 		last = f.Stream
-		paths = append(paths, serverPath(t, dec, f))
 	}
-	if strings.Join(paths, " ") != "/plain /?k=real_b /?k=real_a" {
-		t.Fatalf("server got %q", paths)
-	}
+	next("/plain")
+	g.release("b")
+	next("/?k=real_b")
+	g.release("a")
+	next("/?k=real_a")
 }
 
 // The client's RST_STREAM during a lookup cancels it; nothing goes upstream
