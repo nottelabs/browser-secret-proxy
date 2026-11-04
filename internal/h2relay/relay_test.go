@@ -1364,7 +1364,7 @@ func startConnection(t *testing.T, client, server net.Conn) {
 func TestShutdownWithAStuckClientWrite(t *testing.T) {
 	client, server, done, serverClosed := bareRelay(t)
 	startConnection(t, client, server)
-	writeAsync(server, Frame{Type: FramePing, Payload: make([]byte, 8)}) // the client never reads it
+	writeAsync(server, Frame{Type: FrameSettings}) // the client never reads it
 	time.Sleep(50 * time.Millisecond)
 	checkPromptShutdown(t, client, done, serverClosed)
 }

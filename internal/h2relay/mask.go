@@ -345,8 +345,10 @@ func (r *relay) serverLoopMasked() error {
 			return errors.New("server sent PUSH_PROMISE, which this proxy does not support")
 		case FrameGoAway:
 			err = r.onServerGoAway(f)
+		case FramePing:
+			err = r.onServerPing(f)
 		default:
-			err = r.writeClient(f)
+			// An extension or unknown frame type (control.go): dropped.
 		}
 		if err != nil {
 			return err

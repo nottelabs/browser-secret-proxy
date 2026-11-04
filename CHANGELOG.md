@@ -155,6 +155,12 @@ First release, planned as 0.1.0.
   with `502`, and trailers are masked with the values chosen at the head.
   Client frames of unknown types go upstream under their stream's server
   ID, or are dropped.
+- Over HTTP/2, the destination's control frames no longer carry its data to
+  the browser: GOAWAY debug data, which can echo a real value, is dropped;
+  the proxy answers the destination's PINGs itself and passes on only ACKs
+  of the browser's own PINGs; and `ALTSVC`, `ORIGIN`, `PRIORITY_UPDATE` and
+  frames of unknown types from the destination are dropped instead of
+  reaching the browser unmasked, some on the destination's stream IDs.
 - Real values with a line break or NUL are refused in every header, also
   when the client's header already holds such a byte (a NUL after a
   stand-in let a multi-line value through). Over HTTP/2, a request whose
