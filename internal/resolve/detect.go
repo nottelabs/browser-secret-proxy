@@ -119,7 +119,9 @@ func tokenByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
 }
 
-// findPrefixed adds every prefix-led token of text to found.
+// findPrefixed adds every prefix-led token of text to found, in one pass:
+// an occurrence inside a token is skipped before its run is scanned, and the
+// search goes on after the end of each token found.
 func findPrefixed(text, prefix string, found map[string]bool) {
 	for i := 0; i < len(text); {
 		j := strings.Index(text[i:], prefix)
@@ -127,14 +129,18 @@ func findPrefixed(text, prefix string, found map[string]bool) {
 			return
 		}
 		start := i + j
+		if start > 0 && tokenByte(text[start-1]) {
+			i = start + 1
+			continue
+		}
 		end := start + len(prefix)
 		for end < len(text) && tokenByte(text[end]) {
 			end++
 		}
-		if end > start+len(prefix) && (start == 0 || !tokenByte(text[start-1])) {
+		if end > start+len(prefix) {
 			found[text[start:end]] = true
 		}
-		i = start + 1
+		i = max(end, start+1)
 	}
 }
 

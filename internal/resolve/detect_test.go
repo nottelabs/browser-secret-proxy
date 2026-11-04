@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 type unknownResolver struct{}
@@ -123,5 +124,32 @@ func TestSecretsAreNotFormatted(t *testing.T) {
 		if strings.Contains(s, "hunter2") || strings.Contains(s, "real-secret") {
 			t.Errorf("formatted output leaks a secret: %s", s)
 		}
+	}
+}
+
+// A run of repeated prefixes is scanned once, not once per occurrence.
+func TestPrefixScanIsLinear(t *testing.T) {
+	d, err := NewDetector(unknownResolver{}, Patterns{Prefixes: []string{"tok_"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{strings.Repeat("tok_", 1<<18), "x" + strings.Repeat("tok_", 1<<18)} {
+		start := time.Now()
+		d.Find(Principal{}, text)
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("1 MiB of repeated prefixes took %v", elapsed)
+		}
+	}
+	if got := d.Find(Principal{}, "tok_a,tok_b tok_tok_c"); !reflect.DeepEqual(got, []string{"tok_a", "tok_b", "tok_tok_c"}) {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func BenchmarkFindRepeatedPrefixes(b *testing.B) {
+	d, _ := NewDetector(unknownResolver{}, Patterns{Prefixes: []string{"tok_"}})
+	text := strings.Repeat("tok_", 1<<16)
+	b.SetBytes(int64(len(text)))
+	for b.Loop() {
+		d.Find(Principal{}, text)
 	}
 }
