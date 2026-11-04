@@ -57,7 +57,15 @@ never as extra fields.
 
 For per-session passwords from a vault, use the
 [`http` resolver](../resolvers.md#http) with `-standin-prefixes pw_,user_`
-and a `hosts` list of `["login.example.com"]` on each value.
+and a `hosts` list of `["login.example.com"]` on each value. In `http` and
+`sealed` modes the proxy finds stand-ins in the raw request text, and a
+prefix match stops at the first character other than a letter, digit, `_`
+or `-`. Use stand-ins made only of those characters there, such as
+`user_acme_ops_1`. An email-shaped stand-in does not work in these modes:
+the prefix match stops at `@`, and a form body sends `@` as `%40`, so a
+`-standin-pattern` for the full address does not match it either. If the
+username field only accepts an email address, keep that value in `file`
+mode, which also matches the escaped forms of its keys.
 
 ## Browser side
 

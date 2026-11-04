@@ -205,3 +205,17 @@ func TestRequireName(t *testing.T) {
 		t.Fatal("no certificate was accepted")
 	}
 }
+
+func TestAllowsIgnoresTrailingDotsAndCase(t *testing.T) {
+	s := &seed{hosts: []string{"Login.Example.com.", "*.auth.example.com."}}
+	for _, host := range []string{"login.example.com", "login.example.com.", "LOGIN.example.com", "eu.auth.example.com", "eu.auth.example.com."} {
+		if !s.allows(host, "") {
+			t.Errorf("allows(%q) = false, want true", host)
+		}
+	}
+	for _, host := range []string{"example.com", "auth.example.com", "login.example.com.evil.test"} {
+		if s.allows(host, "") {
+			t.Errorf("allows(%q) = true, want false", host)
+		}
+	}
+}

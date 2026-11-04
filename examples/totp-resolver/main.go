@@ -175,7 +175,7 @@ func (s *seed) allows(host, principal string) bool {
 	}
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	for _, h := range s.hosts {
-		h = strings.ToLower(h)
+		h = strings.ToLower(strings.TrimSuffix(h, "."))
 		if suffix, ok := strings.CutPrefix(h, "*."); ok {
 			if strings.HasSuffix(host, "."+suffix) {
 				return true
