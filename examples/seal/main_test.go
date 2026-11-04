@@ -74,6 +74,12 @@ func TestSealedTokenOpensInTheProxy(t *testing.T) {
 		"past exp":       {`{"values": {"tok_a": "real_a"}, "exp": 1}`, "10m"},
 		"unknown field":  {`{"values": {"tok_a": "real_a"}, "host": ["api.test"]}`, "10m"},
 		"empty hosts":    {`{"values": {"tok_a": "real_a"}, "hosts": []}`, "10m"},
+		// encoding/json alone would read these as hosts, values or exp.
+		"hosts in another case":  {`{"values": {"tok_a": "real_a"}, "hosts": ["api.test"], "HOSTS": ["other.test"]}`, "10m"},
+		"hosts twice":            {`{"values": {"tok_a": "real_a"}, "hosts": ["api.test"], "hosts": ["other.test"]}`, "10m"},
+		"values in another case": {`{"Values": {"tok_a": "real_a"}}`, "10m"},
+		"a stand-in twice":       {`{"values": {"tok_a": "real_a", "tok_a": "real_b"}}`, "10m"},
+		"exp in another case":    {`{"values": {"tok_a": "real_a"}, "EXP": 4102444800}`, "10m"},
 	} {
 		if err := os.WriteFile(payload, []byte(c.payload), 0o600); err != nil {
 			t.Fatal(err)

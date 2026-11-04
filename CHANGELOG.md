@@ -38,6 +38,11 @@ First release, planned as 0.1.0.
   a member or spell a claim in another case (`"HOSTS"`) gets `407`. With
   masking on, a request carrying more than 1,024 values is refused instead
   of evicting some of its own values from the masking record.
+- The `http` resolver's answer is read as the service wrote it, like sealed
+  claims: an answer that names a member twice, at any depth, or spells
+  `values`, `real`, `hosts` or `expires_at` in another case (`"HOSTS"`) is
+  malformed, and the request is refused. `examples/seal` refuses such a
+  payload file, and `examples/http-resolver` such a values file or request.
 - Requests that name their host ambiguously are answered `502` and not sent:
   more than one `Host`, `:authority` or `host`, a `host` or absolute-form
   target that differs from the request's other authority, an authority with

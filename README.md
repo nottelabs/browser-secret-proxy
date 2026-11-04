@@ -344,6 +344,12 @@ Your service answers `200` with the values it releases:
   `-hosts`. An empty list (`"hosts": []`) is not the same: like any invalid
   list, it refuses the request.
 - `expires_at` (optional) is when the value stops being used.
+- The answer is read as written. One that names a member twice, at any
+  depth (a stand-in, or `hosts` within one value), or spells `values`,
+  `real`, `hosts` or `expires_at` in another case (`"HOSTS"`,
+  `"Expires_At"`) is malformed: a JSON parser that keeps the last
+  duplicate, or ignores case, would read another scope than your service
+  meant. Other members are ignored.
 - Leave out any stand-in you do not release for this host or principal. The
   request is then refused, as it is for any other status, a malformed answer,
   a redirect or a timeout (`-resolver-timeout`, 2 seconds by default).
@@ -355,7 +361,8 @@ Your service answers `200` with the values it releases:
   client certificate.
 
 [`examples/http-resolver`](examples/http-resolver) is a small reference
-service that answers from a JSON file and requires a client certificate:
+service that answers from a JSON file and requires a client certificate. It
+reads the file and each request as strictly as the proxy reads its answer:
 
 ```sh
 go run ./examples/http-resolver -cert server.pem -key server.key \
@@ -457,7 +464,8 @@ Key rotation:
   key once the tokens encrypted to it have expired.
 
 For testing, [`examples/seal`](examples/seal) signs and seals a payload
-file:
+file. It refuses a file with a member it does not know, or one the proxy
+would refuse in the claims:
 
 ```sh
 go run ./examples/seal -public-key sealed-public.pem -issuer-key issuer.key \

@@ -1,7 +1,6 @@
 package resolve
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -22,6 +21,8 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/strictjson"
 )
 
 // The only algorithms a sealed token may use: the outer JWE, and the JWS it
@@ -509,8 +510,8 @@ func (s *Sealed) decrypt(token string, now time.Time) (*sealedEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: the sealed token is not signed by a configured issuer key", ErrUnauthenticated)
 	}
-	if !strictClaims(claims) {
-		return nil, fmt.Errorf("%w: the sealed token's claims repeat a member or spell a claim's name in another case", ErrUnauthenticated)
+	if err := CheckSealedClaims(claims); err != nil {
+		return nil, fmt.Errorf("%w: the sealed token's claims are ambiguous: %w", ErrUnauthenticated, err)
 	}
 	var payload SealedPayload
 	if err := json.Unmarshal(claims, &payload); err != nil {
@@ -541,69 +542,21 @@ func (s *Sealed) decrypt(token string, now time.Time) (*sealedEntry, error) {
 	return e, nil
 }
 
-// sealedClaimNames are the members of SealedPayload, as their json tags
-// spell them.
-var sealedClaimNames = []string{"values", "hosts", "aud", "exp", "nbf", "iat", "sub"}
-
-// strictClaims reports whether claims, a JSON object, names no member
-// twice, at any depth, and spells every member that is a claim of
-// SealedPayload exactly as its name. encoding/json matches member names in
-// any case and keeps the last of two, so without this {"hosts": [...],
-// "HOSTS": []} would be read as no host restriction, while an issuer that
-// checks the claims another way sees one. Other members are allowed.
-func strictClaims(claims []byte) bool {
-	if !uniqueMembers(json.NewDecoder(bytes.NewReader(claims))) {
-		return false
-	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(claims, &members); err != nil {
-		return false
-	}
-	for name := range members {
-		for _, claim := range sealedClaimNames {
-			if name != claim && strings.EqualFold(name, claim) {
-				return false
-			}
-		}
-	}
-	return true
+// sealedClaims names the members of SealedPayload, as their json tags
+// spell them. encoding/json matches member names in any case and keeps the
+// last of two, so without checking them {"hosts": [...], "HOSTS": []} would
+// be read as no host restriction, while an issuer that checks the claims
+// another way sees one. Other members are allowed.
+var sealedClaims = strictjson.Object{
+	"values": strictjson.Map{}, "hosts": nil, "aud": nil, "exp": nil, "nbf": nil, "iat": nil, "sub": nil,
 }
 
-// uniqueMembers reads one JSON value from dec and reports whether no object
-// in it names a member twice.
-func uniqueMembers(dec *json.Decoder) bool {
-	tok, err := dec.Token()
-	if err != nil {
-		return false
-	}
-	switch tok {
-	case json.Delim('{'):
-		seen := map[string]bool{}
-		for dec.More() {
-			tok, err := dec.Token()
-			if err != nil {
-				return false
-			}
-			name, _ := tok.(string)
-			if seen[name] {
-				return false
-			}
-			seen[name] = true
-			if !uniqueMembers(dec) {
-				return false
-			}
-		}
-	case json.Delim('['):
-		for dec.More() {
-			if !uniqueMembers(dec) {
-				return false
-			}
-		}
-	default:
-		return true
-	}
-	_, err = dec.Token() // the closing delimiter
-	return err == nil
+// CheckSealedClaims reports an error when claims, the JSON of a
+// SealedPayload, names a member twice, at any depth, or spells a member of
+// SealedPayload in another case: the proxy refuses such a token. The error
+// never quotes the claims.
+func CheckSealedClaims(claims []byte) error {
+	return strictjson.Check(claims, sealedClaims)
 }
 
 // Seal makes a sealed token: it signs payload with the issuer's private key

@@ -10,6 +10,9 @@
 //	  "4242424242424242": {"real": "<real card number>", "hosts": ["api.payments.example"]}
 //	}
 //
+// The file and each request are read as written: a member named twice, or a
+// known member spelled in another case ("HOSTS"), is refused.
+//
 // It is a starting point for testing, not a production service: a real one
 // looks values up in your vault and decides per principal_id.
 package main
@@ -20,10 +23,13 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/strictjson"
 )
 
 type value struct {
@@ -52,6 +58,27 @@ func (v *value) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// valuesShape and requestShape name the members the values file and a request
+// are read by, as their json tags spell them. encoding/json alone would take
+// "HOSTS" for hosts and keep the last of two members, so a value could go to
+// other hosts than the file seems to say.
+var (
+	valuesShape  = strictjson.Map{Elem: strictjson.Object{"real": nil, "hosts": nil}}
+	requestShape = strictjson.Object{"stand_ins": nil, "host": nil, "principal_id": nil}
+)
+
+// loadValues reads a values file. Its errors never quote the file.
+func loadValues(data []byte) (map[string]value, error) {
+	if err := strictjson.Check(data, valuesShape); err != nil {
+		return nil, err
+	}
+	var values map[string]value
+	if err := json.Unmarshal(data, &values); err != nil {
+		return nil, errors.New("want a JSON object of stand-in to real value")
+	}
+	return values, nil
+}
+
 // handler answers detokenize requests from values.
 func handler(values map[string]value) http.Handler {
 	mux := http.NewServeMux()
@@ -61,7 +88,8 @@ func handler(values map[string]value) http.Handler {
 			Host        string   `json:"host"`
 			PrincipalID string   `json:"principal_id"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil || strictjson.Check(body, requestShape) != nil || json.Unmarshal(body, &req) != nil {
 			http.Error(w, "want {stand_ins, host, principal_id}", http.StatusBadRequest)
 			return
 		}
@@ -92,9 +120,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	var values map[string]value
-	if err := json.Unmarshal(data, &values); err != nil {
-		log.Fatalf("%s: want a JSON object of stand-in to real value", *valuesFile)
+	values, err := loadValues(data)
+	if err != nil {
+		log.Fatalf("%s: %v", *valuesFile, err)
 	}
 	caPEM, err := os.ReadFile(*clientCA)
 	if err != nil {

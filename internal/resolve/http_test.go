@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -339,6 +340,61 @@ func TestHTTPKeepsAnEmptyHostList(t *testing.T) {
 	}
 	if d.calls.Load() != 1 {
 		t.Fatalf("%d calls, want 1", d.calls.Load())
+	}
+}
+
+// The answer is read as the service wrote it. encoding/json alone would
+// take a member in any case and let the last of two win, so "HOSTS": [] or a
+// second "hosts" after the one the service meant would change the value's
+// scope: such answers are refused. Members the proxy does not use are still
+// allowed.
+func TestHTTPAnswerIsDecodedStrictly(t *testing.T) {
+	expires := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	later := expires.Add(10 * 365 * 24 * time.Hour).Format(time.RFC3339)
+	answer := func(entry, extra string) string {
+		return fmt.Sprintf(`{"values":{"tok_a":{"real":"real-secret-a","hosts":["api.test"],"expires_at":%q%s}}%s}`, expires.Format(time.RFC3339), entry, extra)
+	}
+	for name, body := range map[string]string{
+		"as answered":       answer("", ""),
+		"unknown members":   answer(`,"note":"n","nested":{"a":1,"A":2}`, `,"request_id":"r1","Extra":{"b":1,"B":2}`),
+		"stand-ins by case": `{"values":{"TOK_A":{"real":"real-secret-b"},"tok_a":{"real":"real-secret-a","hosts":["api.test"],"expires_at":"` + expires.Format(time.RFC3339) + `"}}}`,
+		"a huge number":     answer(`,"n":1e400`, ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := startDetokenizer(t, func(_ detokenizeRequest, w http.ResponseWriter) { _, _ = w.Write([]byte(body)) })
+			h := newTestHTTP(t, d.config())
+			res, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: "api.test"})
+			if v := res.Values["tok_a"]; err != nil || v.Real != "real-secret-a" || strings.Join(v.Hosts, ",") != "api.test" || !v.ExpiresAt.Equal(expires) {
+				t.Fatalf("resolved %v, hosts %q, expiry %v, err %v", v.Real == "real-secret-a", v.Hosts, v.ExpiresAt, err)
+			}
+		})
+	}
+	for name, body := range map[string]string{
+		"hosts in upper case":        answer(`,"HOSTS":[]`, ""),
+		"hosts with a long s":        answer(`,"hoſts":[]`, ""),
+		"hosts escaped in upper":     answer(`,"\u0048OSTS":[]`, ""),
+		"hosts twice":                answer(`,"hosts":[]`, ""),
+		"real in another case":       answer(`,"Real":"real-secret-b"`, ""),
+		"real twice":                 answer(`,"real":"real-secret-b"`, ""),
+		"expires_at in another case": answer(fmt.Sprintf(`,"EXPIRES_AT":%q`, later), ""),
+		"expires_at twice":           answer(fmt.Sprintf(`,"expires_at":%q`, later), ""),
+		"values in another case":     answer("", `,"VALUES":{"tok_a":{"real":"real-secret-b"}}`),
+		"values twice":               answer("", `,"values":{"tok_a":{"real":"real-secret-b"}}`),
+		"a stand-in twice":           `{"values":{"tok_a":{"real":"real-secret-a"},"tok_a":{"real":"real-secret-b"}}}`,
+		"a nested member twice":      answer(`,"extra":{"a":1,"a":2}`, ""),
+		"trailing data":              answer("", "") + `{"values":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := startDetokenizer(t, func(_ detokenizeRequest, w http.ResponseWriter) { _, _ = w.Write([]byte(body)) })
+			h := newTestHTTP(t, d.config())
+			res, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: "api.test"})
+			if err == nil || len(res.Values) != 0 {
+				t.Fatalf("resolved %d values, err %v", len(res.Values), err)
+			}
+			if strings.Contains(err.Error(), "real-secret") || strings.Contains(err.Error(), "tok_") {
+				t.Fatalf("the error quotes the answer: %v", err)
+			}
+		})
 	}
 }
 
