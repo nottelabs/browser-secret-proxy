@@ -114,6 +114,10 @@ func TestEachModeBuilds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if setup.close == nil {
+		t.Fatal("the sealed resolver is never closed")
+	}
+	t.Cleanup(setup.close)
 	if _, ok := setup.resolver.(resolve.Authenticator); !ok {
 		t.Fatal("the sealed resolver does not authenticate")
 	}

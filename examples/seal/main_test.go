@@ -44,6 +44,7 @@ func TestSealedTokenOpensInTheProxy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(s.Close)
 		return s
 	}
 	if _, err := proxy("proxy-2").Authenticate("u", strings.TrimSpace(out.String())); err == nil {

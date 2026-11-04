@@ -395,7 +395,9 @@ The signed claims carry the values:
   `nbf`, or when `iat` is in the future, beyond 30 seconds of clock skew.
 - `hosts` (optional) restricts every value of the token to those hosts.
 - `sub` (optional) names the principal in logs; the username is used when it
-  is empty.
+  is empty. Neither changes what the token gives: the principal is the token
+  itself, so its values are masked on all of its connections, whatever
+  username each one gives.
 
 The proxy opens the token on every `CONNECT`: it decrypts it, verifies the
 signature against the `-sealed-issuer-key` keys, then checks the claims.
@@ -403,9 +405,12 @@ That both admits the client and gives the values, with no lookup service
 and no external storage. A token that does not decrypt with the proxy's
 key, is not signed by a configured issuer key, was altered, is for another
 audience, or has expired gets `407`. So does a token in the earlier
-encrypt-only format. A connection whose token expires while it is open gets
-`502` for every later request to an allowlisted host, whether or not the
-request holds a stand-in.
+encrypt-only format, and a token that is not in its canonical compact form
+(five segments of unpadded base64url, without line breaks or non-zero
+unused bits), so a token cannot be presented as several passwords. A
+connection whose token expires while it is open gets `502` for every later
+request to an allowlisted host, whether or not the request holds a
+stand-in.
 
 What each layer gives:
 
@@ -424,7 +429,9 @@ issuer's private key where the real values already are.
 
 Decrypted tokens, real values included, are kept in memory so each request
 does not decrypt again: at most 256 tokens, each until the earlier of its
-`exp` and 5 minutes after it was decrypted. Nothing is written to disk.
+`exp` and 5 minutes after it was decrypted. They leave memory within 5
+seconds of that time, whether or not more requests come. Nothing is written
+to disk.
 The token's own stand-ins are what the proxy looks for, so no pattern is
 needed.
 
@@ -486,7 +493,9 @@ in the entry go through your proxy; every other host keeps using the exit.
 - `hosts` should match the proxy's `-hosts` list. A host in the entry but not
   in `-hosts` is tunneled without swaps.
 - In `sealed` mode, `password` is the session's sealed token. `username` is
-  then free: it names the principal when the token has no `sub`.
+  then free: it names the principal in logs when the token has no `sub`, and
+  changes nothing else. The token alone is the principal, for its values and
+  for masking.
 - `ca_certificate` is the PEM of `ca.pem`, never the key. The session's
   browser trusts it. If the proxy's own `https://` endpoint uses a
   certificate from a private CA, include that CA in the bundle too.
@@ -580,8 +589,12 @@ browser, its logs and recordings. That covers all of the principal's
 connections. To keep real values in memory no longer than needed, a value
 is masked for 15 minutes after its last lookup, or until it expires if that
 is sooner, and no longer once the principal's credential is reported
-invalid (at most 1,024 values per principal). Expired values leave memory
-within 5 seconds, whether or not more requests come.
+invalid (at most 1,024 values per principal, the least recently looked up
+dropped first). Values are kept for at most 4,096 principals: when one more
+principal looks a value up, the least recently active principal's values are
+dropped, and its responses are not masked until it looks values up again.
+Expired values leave memory within 5 seconds, whether or not more requests
+come.
 
 What is masked:
 

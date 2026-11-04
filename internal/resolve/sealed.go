@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -53,7 +54,7 @@ type SealedPayload struct {
 	// nbf, or when iat is in the future, beyond sealedClockSkew.
 	Nbf int64 `json:"nbf,omitempty"`
 	Iat int64 `json:"iat,omitempty"`
-	// Sub names the principal (logged and passed as its ID).
+	// Sub names the principal in logs (passed as its ID).
 	Sub string `json:"sub,omitempty"`
 }
 
@@ -68,9 +69,14 @@ type SealedPayload struct {
 // another. A token that fails any of these, or has expired, is refused with
 // 407.
 //
+// Only a token's canonical compact form is accepted, so one token is one
+// credential: the same token spelled another way is refused.
+//
 // Decrypted tokens, real values included, are kept in memory so a request
 // does not pay an ECDH per lookup: at most maxSealedCache of them, each
-// until the earlier of its exp and sealedCacheTTL after it was decrypted.
+// until the earlier of its exp and sealedCacheTTL after it was decrypted. A
+// timer sweep drops them at that time, whether or not more requests come;
+// Close stops it.
 type Sealed struct {
 	keys       []crypto.PrivateKey // decrypt tokens
 	issuerKeys []crypto.PublicKey  // verify their signature
@@ -79,6 +85,14 @@ type Sealed struct {
 
 	mu    sync.Mutex
 	cache map[[sha256.Size]byte]*sealedEntry // decrypted tokens, by hash
+	// The expiry sweep: a timer armed for the earliest time an entry must
+	// leave the cache, no sooner than sweepEvery after the previous sweep,
+	// and stopped by Close.
+	sweepEvery time.Duration
+	timer      *time.Timer
+	next       time.Time // when the timer fires; zero when it is not armed
+	lastSweep  time.Time
+	closed     bool
 }
 
 type sealedEntry struct {
@@ -94,6 +108,9 @@ const (
 	// sealedCacheTTL bounds how long a decrypted token stays in memory; it is
 	// decrypted again after that.
 	sealedCacheTTL = 5 * time.Minute
+	// sealedSweepEvery is the shortest time between two sweeps of the cache:
+	// an entry leaves memory at most this long after its time.
+	sealedSweepEvery = 5 * time.Second
 )
 
 // SealedConfig configures a Sealed resolver.
@@ -229,12 +246,26 @@ func NewSealed(cfg SealedConfig) (*Sealed, error) {
 	}
 	return &Sealed{
 		keys: cfg.Keys, issuerKeys: cfg.IssuerKeys, audience: cfg.Audience,
-		now: time.Now, cache: map[[sha256.Size]byte]*sealedEntry{},
+		now: time.Now, cache: map[[sha256.Size]byte]*sealedEntry{}, sweepEvery: sealedSweepEvery,
 	}, nil
 }
 
-// Authenticate decrypts the token in password. The principal's ID is the
-// token's sub, or the username when sub is empty.
+// Close stops the cache's expiry sweep and drops every decrypted token.
+// Tokens still open afterwards, but are no longer kept in memory.
+func (s *Sealed) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+	s.next = time.Time{}
+	s.cache = map[[sha256.Size]byte]*sealedEntry{}
+}
+
+// Authenticate decrypts the token in password. The principal is the token
+// alone (SecretOnly): its ID, which names it in logs, is the token's sub, or
+// the username when sub is empty, and the username changes nothing else.
 func (s *Sealed) Authenticate(username, password string) (Principal, error) {
 	e, err := s.open(password)
 	if err != nil {
@@ -244,7 +275,7 @@ func (s *Sealed) Authenticate(username, password string) (Principal, error) {
 	if id == "" {
 		id = username
 	}
-	return Principal{ID: id, Password: password}, nil
+	return Principal{ID: id, Password: password, SecretOnly: true}, nil
 }
 
 // StandIns returns the stand-ins of the principal's token, nil when the
@@ -308,7 +339,7 @@ func (s *Sealed) view(p Principal) (*sealedView, error) {
 // recently. Errors wrap ErrUnauthenticated and never quote the token.
 func (s *Sealed) open(token string) (*sealedEntry, error) {
 	now := s.now()
-	if token == "" || len(token) > maxSealedToken {
+	if token == "" || len(token) > maxSealedToken || !canonicalCompact(token) {
 		return nil, fmt.Errorf("%w: not a sealed token", ErrUnauthenticated)
 	}
 	sum := sha256.Sum256([]byte(token))
@@ -338,16 +369,45 @@ func (s *Sealed) open(token string) (*sealedEntry, error) {
 	return e, nil
 }
 
+// canonicalCompact reports whether token is a compact JWE spelled the one
+// way its bytes encode: five segments of unpadded base64url, each exactly
+// what encoding its decoded bytes gives. go-jose's decoder also takes CR and
+// LF inside a segment and non-zero unused trailing bits, so without this one
+// token could be presented as any number of distinct passwords, each a
+// credential of its own. An empty segment is canonical too (the encrypted
+// key of some algorithms; ECDH-ES+A256KW always has one, which go-jose
+// checks).
+func canonicalCompact(token string) bool {
+	segments := strings.Split(token, ".")
+	if len(segments) != 5 {
+		return false
+	}
+	for _, segment := range segments {
+		for i := range len(segment) {
+			switch c := segment[i]; {
+			case 'A' <= c && c <= 'Z', 'a' <= c && c <= 'z', '0' <= c && c <= '9', c == '-', c == '_':
+			default:
+				return false
+			}
+		}
+		raw, err := base64.RawURLEncoding.Strict().DecodeString(segment)
+		if err != nil || base64.RawURLEncoding.EncodeToString(raw) != segment {
+			return false
+		}
+	}
+	return true
+}
+
 // store caches a decrypted token, first dropping every entry past its time,
-// then arbitrary ones while the cache is full.
+// then arbitrary ones while the cache is full, and makes sure the sweep
+// drops it at its time. A closed resolver caches nothing.
 func (s *Sealed) store(sum [sha256.Size]byte, e *sealedEntry, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for k, old := range s.cache {
-		if !now.Before(old.until) {
-			delete(s.cache, k)
-		}
+	if s.closed {
+		return
 	}
+	s.pruneLocked(now)
 	for k := range s.cache {
 		if len(s.cache) < maxSealedCache {
 			break
@@ -355,6 +415,60 @@ func (s *Sealed) store(sum [sha256.Size]byte, e *sealedEntry, now time.Time) {
 		delete(s.cache, k)
 	}
 	s.cache[sum] = e
+	s.armLocked(e.until)
+}
+
+// pruneLocked drops every entry past its time.
+func (s *Sealed) pruneLocked(now time.Time) {
+	for k, old := range s.cache {
+		if !now.Before(old.until) {
+			delete(s.cache, k)
+		}
+	}
+}
+
+// armLocked makes sure the sweep runs by until, or sweepEvery after the
+// previous sweep if that is later.
+func (s *Sealed) armLocked(until time.Time) {
+	if s.closed {
+		return
+	}
+	at := until
+	if earliest := s.lastSweep.Add(s.sweepEvery); at.Before(earliest) {
+		at = earliest
+	}
+	if !s.next.IsZero() && !at.Before(s.next) {
+		return // already armed for that time or sooner
+	}
+	s.next = at
+	d := max(at.Sub(s.now()), 0)
+	if s.timer == nil {
+		s.timer = time.AfterFunc(d, s.sweep)
+	} else {
+		s.timer.Reset(d)
+	}
+}
+
+// sweep drops the entries past their time, then arms the next sweep for the
+// earliest time left.
+func (s *Sealed) sweep() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	now := s.now()
+	s.next, s.lastSweep = time.Time{}, now
+	s.pruneLocked(now)
+	var earliest time.Time
+	for _, e := range s.cache {
+		if earliest.IsZero() || e.until.Before(earliest) {
+			earliest = e.until
+		}
+	}
+	if !earliest.IsZero() {
+		s.armLocked(earliest)
+	}
 }
 
 // decrypt opens a token: decrypts it, verifies its signature, then checks

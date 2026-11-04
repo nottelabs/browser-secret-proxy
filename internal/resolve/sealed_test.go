@@ -43,9 +43,14 @@ var testIssuer = func() ed25519.PrivateKey {
 
 const testAudience = "proxy-test"
 
-// testSealed is a Sealed resolver for key that trusts testIssuer.
-func testSealed(key *ecdsa.PrivateKey) (*Sealed, error) {
-	return NewSealed(SealedConfig{Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{testIssuer.Public()}, Audience: testAudience})
+// testSealed is a Sealed resolver for key that trusts testIssuer, closed
+// when the test ends so its expiry sweep stops.
+func testSealed(t *testing.T, key *ecdsa.PrivateKey) (*Sealed, error) {
+	s, err := NewSealed(SealedConfig{Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{testIssuer.Public()}, Audience: testAudience})
+	if err == nil {
+		t.Cleanup(s.Close)
+	}
+	return s, err
 }
 
 func seal(t *testing.T, key *ecdsa.PrivateKey, p SealedPayload) string {
@@ -69,7 +74,7 @@ func payload(exp time.Time) SealedPayload {
 
 func TestSealedAuthenticatesAndResolves(t *testing.T) {
 	key := ecKey(t)
-	s, err := testSealed(key)
+	s, err := testSealed(t, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,18 +117,77 @@ func TestSealedAuthenticatesAndResolves(t *testing.T) {
 
 func TestSealedPrincipalFallsBackToTheUsername(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	p := payload(time.Now().Add(time.Hour))
 	p.Sub = ""
 	principal, err := s.Authenticate("proxy-user", seal(t, key, p))
 	if err != nil || principal.ID != "proxy-user" {
 		t.Fatalf("principal %q, %v", principal.ID, err)
 	}
+	// The username only names the principal: the token alone identifies it.
+	if !principal.SecretOnly {
+		t.Fatal("a sealed principal is not identified by its token alone")
+	}
+}
+
+// One token is one credential: the same token spelled any other way that
+// base64url decoding would still take (CR or LF inside a segment, non-zero
+// unused bits, padding, extra segments) is refused, so it can become neither
+// another principal nor another cache entry.
+func TestSealedAcceptsOnlyTheCanonicalForm(t *testing.T) {
+	key := ecKey(t)
+	s, _ := testSealed(t, key)
+	token := seal(t, key, payload(time.Now().Add(time.Hour)))
+	parts := strings.Split(token, ".")
+	if len(parts) != 5 || parts[1] == "" {
+		t.Fatalf("%d segments, encrypted key %q: want ECDH-ES+A256KW to give five, with a wrapped key", len(parts), parts[1])
+	}
+	respell := func(part int, f func(string) string) string {
+		p := append([]string(nil), parts...)
+		p[part] = f(p[part])
+		return strings.Join(p, ".")
+	}
+	insert := func(at int, s string) func(string) string {
+		return func(segment string) string { return segment[:at] + s + segment[at:] }
+	}
+	// The 16-byte tag is 22 characters, the last of which has 2 unused bits.
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	unusedBit := func(segment string) string {
+		last := strings.IndexByte(alphabet, segment[len(segment)-1])
+		return segment[:len(segment)-1] + string(alphabet[last|1])
+	}
+	if unusedBit(parts[4]) == parts[4] {
+		t.Fatal("the tag already has an unused bit set")
+	}
+	variants := map[string]string{
+		"LF in the ciphertext": respell(3, insert(10, "\n")),
+		"CRLF in the header":   respell(0, insert(5, "\r\n")),
+		"LFs in the tag":       respell(4, insert(1, "\n\n\n")),
+		"unused bit in tag":    respell(4, unusedBit),
+		"padded tag":           respell(4, func(segment string) string { return segment + "==" }),
+		"trailing LF":          token + "\n",
+		"sixth segment":        token + ".",
+		"four segments":        strings.Join(parts[:4], "."),
+	}
+	for name, variant := range variants {
+		if _, err := s.Authenticate("u", variant); !errors.Is(err, ErrUnauthenticated) {
+			t.Errorf("%s: err = %v, want ErrUnauthenticated", name, err)
+		}
+	}
+	if _, err := s.Authenticate("u", token); err != nil {
+		t.Fatalf("the canonical token was refused: %v", err)
+	}
+	s.mu.Lock()
+	cached := len(s.cache)
+	s.mu.Unlock()
+	if cached != 1 {
+		t.Fatalf("%d cached tokens, want the canonical one only", cached)
+	}
 }
 
 func TestSealedRefusesBadTokens(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	good := seal(t, key, payload(time.Now().Add(time.Hour)))
 
 	tamper := func(token string, part int) string {
@@ -187,7 +251,7 @@ func TestSealedRefusesBadTokens(t *testing.T) {
 
 func TestSealedTokenExpiresAfterConnect(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	token := seal(t, key, payload(now.Add(time.Minute)))
@@ -264,7 +328,7 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	if _, err := s.Authenticate("u", token); err != nil {
 		t.Fatalf("a token Seal accepted was refused: %v", err)
 	}
@@ -272,7 +336,7 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 
 func TestSealedCacheIsBoundedByExpiryTTLAndSize(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	cached := func() int {
@@ -329,9 +393,66 @@ func TestSealedCacheIsBoundedByExpiryTTLAndSize(t *testing.T) {
 	}
 }
 
+// Decrypted tokens leave memory at their time even when no request comes:
+// a sweep drops them, and leaves the ones whose time has not come.
+func TestSealedCacheIsSweptWhileIdle(t *testing.T) {
+	key := ecKey(t)
+	s, _ := testSealed(t, key)
+	defer s.Close()
+	s.sweepEvery = 10 * time.Millisecond
+	short := payload(time.Now().Add(time.Hour))
+	long := payload(time.Now().Add(2 * time.Hour))
+	// The proxy's clock reads 100ms before the short token's exp, so its time
+	// comes without waiting an hour.
+	offset := time.Until(time.Unix(short.Exp, 0)) - 100*time.Millisecond
+	s.now = func() time.Time { return time.Now().Add(offset) }
+	for _, p := range []SealedPayload{short, long} {
+		if _, err := s.Authenticate("u", seal(t, key, p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		var kept []time.Time
+		for _, e := range s.cache {
+			kept = append(kept, e.expires)
+		}
+		s.mu.Unlock()
+		if len(kept) == 1 && kept[0].Equal(time.Unix(long.Exp, 0)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("with no request, %d tokens still cached past the short token's exp (want only the long one)", len(kept))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Close stops the sweep and drops every decrypted token; tokens still open
+// afterwards, without being kept.
+func TestSealedCloseStopsTheSweep(t *testing.T) {
+	key := ecKey(t)
+	s, _ := testSealed(t, key)
+	token := seal(t, key, payload(time.Now().Add(time.Hour)))
+	if _, err := s.Authenticate("u", token); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if len(s.cache) != 0 || !s.next.IsZero() {
+		t.Fatal("Close kept tokens or the sweep")
+	}
+	if _, err := s.Authenticate("u", token); err != nil {
+		t.Fatalf("a token was refused after Close: %v", err)
+	}
+	if len(s.cache) != 0 || !s.next.IsZero() {
+		t.Fatal("a closed resolver cached a token or armed its sweep")
+	}
+}
+
 func TestSealedViewFailsClosedOnExpiry(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
@@ -363,7 +484,7 @@ var (
 
 func TestSealedSnapshotIsTheView(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
@@ -425,7 +546,7 @@ func signJWS(t *testing.T, alg jose.SignatureAlgorithm, issuer any, p SealedPayl
 
 func TestSealedRequiresASignatureAndTheAudience(t *testing.T) {
 	key := ecKey(t)
-	s, err := testSealed(key)
+	s, err := testSealed(t, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,6 +619,7 @@ func TestSealedIssuerKeyRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close)
 	for name, issuer := range map[string]crypto.Signer{"old EdDSA key": oldIssuer, "new ES256 key": newIssuer} {
 		token, err := Seal(&key.PublicKey, issuer, payload(time.Now().Add(time.Hour)))
 		if err != nil {

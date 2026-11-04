@@ -76,6 +76,9 @@ type resolverSetup struct {
 	timeout time.Duration
 	// watch, when set, runs until ctx ends (file reloads).
 	watch func(ctx context.Context)
+	// close, when set, releases the resolver once the proxy stops (the
+	// sealed cache's sweep).
+	close func()
 	// logAttrs describe the setup for the start log line, without secrets.
 	logAttrs []any
 }
@@ -150,6 +153,7 @@ func (f *resolverFlags) build(fixedUsername string, logger *slog.Logger) (*resol
 			return nil, err
 		}
 		setup.resolver = s
+		setup.close = s.Close
 		setup.logAttrs = append(setup.logAttrs, "issuer_key_files", len(f.sealedIssuerKeys), "audience", f.sealedAudience)
 	}
 
