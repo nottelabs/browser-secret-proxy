@@ -3,6 +3,7 @@ package h2relay
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"golang.org/x/net/http2/hpack"
 
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope/scopetest"
 )
@@ -104,7 +106,10 @@ func newPanicking(t *testing.T, mutate func(*Options), setup func(*relay)) *pani
 func (p *panicking) ended(site string) {
 	t := p.t
 	t.Helper()
-	_ = p.result()
+	var pe *panics.Error
+	if err := p.result(); !errors.As(err, &pe) {
+		t.Fatalf("the relay returned %v, not the panic", err)
+	}
 	p.closed()
 	got := p.logs.String()
 	if !strings.Contains(got, "HTTP/2 relay panicked") || !strings.Contains(got, "panic_type=string") || !strings.Contains(got, site) {
@@ -241,4 +246,21 @@ func TestPanicWithTheLockHeldStillEndsTheRelay(t *testing.T) {
 	}
 	p.r.mu.Unlock()
 	unlocked = true
+}
+
+// A panic is what the relay returns, even when another goroutine's error
+// reached run first: here the client closed, then writing the connection
+// error to it during shutdown panicked.
+func TestRelayReturnsAPanicThatFollowsAnotherError(t *testing.T) {
+	var client *panicConn
+	h := newRawHarness(t, nil, func(r *relay) {
+		client = &panicConn{Conn: r.client}
+		r.client = client
+	})
+	client.onWrite.Store(true)
+	_ = h.client.Close()
+	var p *panics.Error
+	if err := h.result(); !errors.As(err, &p) {
+		t.Fatalf("the relay returned %v, not the panic", err)
+	}
 }

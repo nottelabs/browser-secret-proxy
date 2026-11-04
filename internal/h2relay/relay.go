@@ -128,9 +128,11 @@ type relay struct {
 	lookupQueue    []pendingLookup
 	asyncErrs      chan error
 	// panicked closes when one of the relay's goroutines panics (see
-	// contain); run then waits at most panicWait for the others.
+	// contain); run then waits at most panicWait for the others, and
+	// returns panicErr, the first panic, whatever error reached it first.
 	panicked  chan struct{}
 	panicOnce sync.Once
+	panicErr  atomic.Pointer[panics.Error]
 	panicWait time.Duration
 	// streamErrors counts the client's stream errors (frames on a stream it
 	// ended); past maxStreamErrors they end the connection. clientLoop only.
@@ -382,6 +384,11 @@ func (r *relay) run() error {
 			r.opts.Logger.Warn("stopped waiting for the relay's goroutines after a panic", "after", r.panicWait)
 		}
 	}
+	// The panic closed both connections, which may have ended another
+	// goroutine first, or came after another error: it is the cause.
+	if p := r.panicErr.Load(); p != nil {
+		return p
+	}
 	if errors.Is(first, io.EOF) || errors.Is(first, net.ErrClosed) {
 		return nil
 	}
@@ -410,6 +417,7 @@ func (r *relay) start(errs chan<- error, loop func() error) {
 // connections close, which ends the other goroutines' I/O, and run stops
 // waiting.
 func (r *relay) contain(p *panics.Error) {
+	r.panicErr.CompareAndSwap(nil, p)
 	r.opts.Logger.Error("HTTP/2 relay panicked; closing the connection", "panic_type", p.Type, "at", p.Site)
 	r.panicOnce.Do(func() { close(r.panicked) })
 	r.cancel()
