@@ -35,7 +35,8 @@ type Encoding string
 // ParseEncoding reads the Content-Encoding values of a response. It returns
 // "" for none or identity, the coding for a single one this package decodes
 // (gzip, deflate, br, zstd), and ErrUnsupportedEncoding for anything else,
-// several codings included.
+// several codings included. The error never quotes a coding: a destination
+// can echo a real value into the header, and the error is logged.
 func ParseEncoding(values []string) (Encoding, error) {
 	var codings []string
 	for _, v := range values {
@@ -58,7 +59,7 @@ func ParseEncoding(values []string) (Encoding, error) {
 	case "deflate", "br", "zstd":
 		return Encoding(codings[0]), nil
 	}
-	return "", fmt.Errorf("%w: %q", ErrUnsupportedEncoding, codings[0])
+	return "", fmt.Errorf("%w: an unknown coding", ErrUnsupportedEncoding)
 }
 
 // Decoder returns a reader of r decoded with e, which yields ErrTooLarge

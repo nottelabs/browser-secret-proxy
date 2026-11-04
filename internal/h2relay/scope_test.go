@@ -2,6 +2,7 @@ package h2relay
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -142,6 +143,15 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 				hpack.HeaderField{Name: "Content-Length", Value: "13"}),
 			body: "k=tok_standin",
 		},
+		"NUL in a value":                {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: "tok_standin\x00"})},
+		"CR in a value":                 {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: "\rtok_standin"})},
+		"LF in a value, no stand-in":    {fields: request("GET", hpack.HeaderField{Name: "x-a", Value: "a\nhost: evil.test"})},
+		"leading space in a value":      {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: " tok_standin"})},
+		"trailing tab in a value":       {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: "tok_standin\t"})},
+		"CRLF in a pseudo-header value": {fields: withPath("/?k=tok_standin\r\nx-a: 1", request("GET"))},
+		"malformed value after an empty name": {fields: request("GET",
+			hpack.HeaderField{Name: "", Value: "a\nb"},
+			hpack.HeaderField{Name: "x-token", Value: "tok_standin\r\nx-a: 1"})},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -156,6 +166,42 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 			}
 			h.expect(h.toClient, "client", isBadGateway(1))
 			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+		})
+	}
+}
+
+// Trailers with a malformed value (RFC 9113 8.2.1) stop the request: a
+// buffered one is answered 502 and never reaches the server, a streamed one
+// is reset on both sides.
+func TestMalformedTrailerValuesStopTheRequest(t *testing.T) {
+	cases := map[string][]hpack.HeaderField{
+		"NUL in a value": {{Name: "x-token", Value: "tok_standin\x00"}},
+		"malformed value after an empty name": {
+			{Name: "", Value: "a\nb"},
+			{Name: "x-token", Value: "tok_standin\r\nx-a: 1"},
+		},
+	}
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			h.clientSend(
+				Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
+				Frame{Type: FrameData, Stream: 1, Payload: []byte("plain")},
+				Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(bad...)},
+			)
+			h.expect(h.toClient, "client", isBadGateway(1))
+			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 3, Payload: h.clientBlock(otherRequest("")...)})
+			opened := h.expect(h.toServer, "server", isType(FrameHeaders))
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 3, Payload: h.clientBlock(bad...)})
+			h.expect(h.toClient, "client", func(f Frame) bool {
+				return f.Type == FrameRSTStream && f.Stream == 3 && binary.BigEndian.Uint32(f.Payload) == errCodeProtocol
+			})
+			h.expect(h.toServer, "server", func(f Frame) bool {
+				return f.Type == FrameRSTStream && f.Stream == opened.Stream
+			})
+			h.settle("malformed trailers")
 		})
 	}
 }

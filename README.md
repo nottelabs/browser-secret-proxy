@@ -31,12 +31,13 @@ reproduce instead of substituting its own.
    real values are replaced by their stand-ins before they reach the client
    (see [Response masking](#response-masking)).
 
-Real values are never logged. Log lines name the host and how many fields
-were swapped.
+Real values are never logged, nor are their lengths. Log lines name the host
+and how many fields were swapped.
 
 ## Quick start
 
-You need Go 1.26 or later to build from source, or Docker.
+You need Go 1.26 or later to build from source, or Docker. CI runs the
+tests on the latest Go 1.26 and on the Go version the Dockerfile builds with.
 
 ### 1. Create a CA
 
@@ -247,7 +248,7 @@ real value in the echo.
 | `-standin-pattern` | Regular expression (RE2) matching stand-ins. Repeatable. See [Finding stand-ins](#finding-stand-ins). |
 | `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
 | `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
-| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
+| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. Nothing but an optional `/` may follow the port; percent-encode special characters in the user and password. The flag wins over the variable. |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty; a `SECRET_PROXY_PASSWORD` without it is refused at start. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
 | `-mask-stream-window` | What masking holds back at the end of a streamed response: `fixed` (default), a window of bytes whatever they are, or `minimal`, only bytes that could begin a real value. `minimal` lowers streaming latency, but lets any allowlisted endpoint that reflects input reveal real values. Any other value is refused at start. See [Response masking](#response-masking). |
@@ -273,7 +274,11 @@ value is inserted in the form its place needs:
   any character as `\uXXXX`); a string that held one is then written again
   with standard escaping, which decodes to the same text with the real value;
 - headers: as is. A real value containing a line break or NUL is refused in a
-  header, and the request is not sent;
+  header, whatever the header already holds, and the request is not sent.
+  Over HTTP/2, a field value holding a NUL, CR or LF, or starting or ending
+  with a space or tab, is malformed (RFC 9113 8.2.1): the request is
+  answered `502`, with or without stand-ins, and a streamed request with
+  such trailers is reset;
 - other bodies: as is.
 
 ## Production setup: where real values come from
@@ -516,7 +521,8 @@ through that parent. The parent sees only encrypted traffic for decrypted
 hosts: the proxy opens its TLS connection to the destination through the
 parent's tunnel.
 
-Credentials in the parent URL are never logged; logs name only its scheme and
+Credentials in the parent URL are never logged or printed, not even in the
+usage text or when the URL does not parse; logs name only its scheme and
 host.
 
 ## Security model
@@ -537,6 +543,15 @@ host.
   differs from `Host`; an authority with userinfo (`user@host`), a path,
   query, fragment or whitespace, or a port that is not a number. Over
   HTTP/2, a header name with uppercase letters is refused the same way.
+  Over HTTP/1.1, so is a request whose body a server could frame
+  differently, or whose head it could split into other lines (RFC 9112):
+  `Transfer-Encoding` with `Content-Length`, a `Transfer-Encoding` other
+  than a single `chunked` or on a request that is not HTTP/1.1, more than
+  one `Content-Length` or one that is not a decimal number (only spaces and
+  tabs may surround either value), a folded (obs-fold) header line, a
+  header name that is not a token (`Name : value`), and a bare CR or NUL
+  in the request line or a header line. A chunked trailer
+  line like that closes the connection before anything is sent.
 - **Expired values are not used.** A value whose expiry has passed is not
   swapped.
 - **Fail closed.** When a request carries a stand-in that the resolver does
@@ -739,6 +754,9 @@ return.
 - TLS session resumption is not supported. A ClientHello that offers
   `pre_shared_key` or early data on an allowlisted host is refused, and every
   connection to an allowlisted host performs a full handshake.
+- On an allowlisted host, a ClientHello the proxy cannot parse is refused
+  with a TLS `decode_error` alert. That includes one that repeats an
+  extension type, which RFC 8446 forbids.
 - Request bodies on allowlisted hosts are buffered: 32 MiB per body and 64 MiB
   per HTTP/2 connection, with at most 256 open streams and 1 MiB per header
   block. An HTTP/2 stream over a limit is refused with `REFUSED_STREAM`, so the
@@ -784,15 +802,26 @@ Each release publishes binaries for linux and darwin (amd64, arm64), a
 keyless signing, an SPDX SBOM per archive, and a signed multi-arch image,
 `ghcr.io/nottelabs/browser-secret-proxy`.
 
+No release is published yet; the first is planned as 0.1.0.
+
+Only `.github/workflows/release.yml`, run for the release's tag, signs a
+release. Check for that exact identity: a pattern that matches any workflow
+of the repository also accepts a signature made by another workflow or on a
+branch. Git tags have a leading `v` (`v0.1.0`), image tags do not (`0.1.0`).
+
 ```sh
+VERSION=0.1.0
+IDENTITY="https://github.com/nottelabs/browser-secret-proxy/.github/workflows/release.yml@refs/tags/v$VERSION"
+
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/nottelabs/browser-secret-proxy/' \
+  --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-sha256sum --ignore-missing -c checksums.txt
+sha256sum --ignore-missing -c checksums.txt      # Linux
+shasum -a 256 --ignore-missing -c checksums.txt  # macOS
 
-cosign verify ghcr.io/nottelabs/browser-secret-proxy:<version> \
-  --certificate-identity-regexp '^https://github.com/nottelabs/browser-secret-proxy/' \
+cosign verify "ghcr.io/nottelabs/browser-secret-proxy:$VERSION" \
+  --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 

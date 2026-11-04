@@ -3,6 +3,7 @@ package clienthello
 import (
 	"bytes"
 	"net"
+	"strings"
 	"testing"
 
 	utls "github.com/refraction-networking/utls"
@@ -162,5 +163,50 @@ func TestIsGREASE(t *testing.T) {
 		if IsGREASE(v) {
 			t.Errorf("%#04x is not GREASE", v)
 		}
+	}
+}
+
+// buildHello builds a ClientHello handshake message with the given
+// extensions, in order.
+func buildHello(extensions ...Extension) []byte {
+	var exts []byte
+	for _, e := range extensions {
+		exts = append(exts, byte(e.Type>>8), byte(e.Type), byte(len(e.Data)>>8), byte(len(e.Data)))
+		exts = append(exts, e.Data...)
+	}
+	body := []byte{3, 3}
+	body = append(body, make([]byte, 32)...) // random
+	body = append(body, 0)                   // session ID
+	body = append(body, 0, 2, 0x13, 0x01)    // cipher suites
+	body = append(body, 1, 0)                // compression methods
+	body = append(body, byte(len(exts)>>8), byte(len(exts)))
+	body = append(body, exts...)
+	return append([]byte{handshakeClientHello, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)
+}
+
+// RFC 8446 section 4.2 forbids repeating an extension type. uTLS panics on
+// some repeats (two session_ticket extensions), so Parse refuses them all.
+func TestParseRejectsRepeatedExtensions(t *testing.T) {
+	sni := Extension{ExtServerName, []byte{0, 15, 0, 0, 12, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 't', 'e', 's', 't'}}
+	versions := Extension{ExtSupportedVersions, []byte{2, 3, 4}}
+	if _, err := Parse(buildHello(sni, versions)); err != nil {
+		t.Fatalf("a hello without repeats was refused: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		extensions []Extension
+		repeated   string
+	}{
+		"session_ticket": {[]Extension{sni, {35, nil}, {35, nil}, versions}, "35"},
+		"server_name":    {[]Extension{sni, versions, sni}, "0"},
+		"GREASE":         {[]Extension{{0x2a2a, nil}, sni, versions, {0x2a2a, nil}}, "10794"},
+	} {
+		_, err := Parse(buildHello(tc.extensions...))
+		if err == nil || !strings.Contains(err.Error(), "repeats extension "+tc.repeated) {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+	// Two different GREASE values are two extension types, as Chrome sends.
+	if _, err := Parse(buildHello(Extension{0x2a2a, nil}, sni, versions, Extension{0x3a3a, []byte{0}})); err != nil {
+		t.Fatalf("two different GREASE extensions were refused: %v", err)
 	}
 }
