@@ -249,6 +249,11 @@ func FuzzRelay(f *testing.F) {
 			_, _ = clientTest.Write([]byte(Preface))
 			_, _ = clientTest.Write(in)
 		}
+		// Both sides end a moment after the input is written, not once the
+		// relay has acted on all of it, and in the fromServer case the
+		// server's write races the close. A failure found here may take a
+		// few runs to reproduce; the target only checks that the relay
+		// does not panic or hang.
 		time.Sleep(time.Millisecond)
 		_ = clientTest.Close()
 		_ = serverTest.Close()

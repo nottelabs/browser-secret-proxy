@@ -44,11 +44,18 @@ race: ## Run the tests with the race detector
 # How long `make fuzz` runs each fuzz target.
 FUZZTIME ?= 20s
 
+# The fuzzing engine itself sometimes ends a run with "context deadline
+# exceeded" and writes no input. A target that fails that way runs once
+# more; a failure that writes an input to testdata/fuzz does not.
 fuzz: ## Run each fuzz target for FUZZTIME (default 20s)
 	@for file in $$(grep -rl --include='*_test.go' '^func Fuzz' cmd internal | sort); do \
 	  dir=./$$(dirname $$file); \
 	  for target in $$(sed -n 's/^func \(Fuzz[A-Za-z0-9_]*\)(.*/\1/p' $$file); do \
 	    echo "fuzzing $$target in $$dir"; \
+	    inputs=$$(ls $$dir/testdata/fuzz/$$target 2>/dev/null | wc -l); \
+	    go test -run='^$$' -fuzz="^$$target\$$" -fuzztime=$(FUZZTIME) $$dir && continue; \
+	    [ "$$(ls $$dir/testdata/fuzz/$$target 2>/dev/null | wc -l)" = "$$inputs" ] || exit 1; \
+	    echo "$$target failed without writing an input; running it again"; \
 	    go test -run='^$$' -fuzz="^$$target\$$" -fuzztime=$(FUZZTIME) $$dir || exit 1; \
 	  done; \
 	done

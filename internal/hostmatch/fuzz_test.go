@@ -48,6 +48,12 @@ func FuzzHostOf(f *testing.F) {
 			}
 			return
 		}
+		// net/url and SplitHostPort accept a port that is not a number.
+		if i := strings.LastIndexByte(authority, ':'); i > strings.LastIndexByte(authority, ']') {
+			if port := authority[i+1:]; port == "" || strings.Trim(port, "0123456789") != "" {
+				t.Fatalf("hostOf(%q) = %q, with port %q", authority, host, port)
+			}
+		}
 		if u, err := url.Parse("https://" + authority); err == nil && !strings.Contains(authority, "%") {
 			if u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 				t.Fatalf("hostOf(%q) = %q, but net/url finds more than an authority: %#v", authority, host, u)

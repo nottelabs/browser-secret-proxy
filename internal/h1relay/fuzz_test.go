@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,6 +56,67 @@ func relayOnce(t *testing.T, o Options, client func(net.Conn), server func(net.C
 
 const waitFor = 5 * time.Second
 
+// inputConn is the relay's end of a client that has sent in and keeps the
+// connection open: reads return in, then block until Close, and writes are
+// discarded. drained closes on the first read past the end of in, when the
+// relay has acted on every byte it could.
+type inputConn struct {
+	net.Conn // one end of a pipe nobody writes to, for the blocking read and Close
+	in       *bytes.Reader
+	drained  chan struct{}
+	once     sync.Once
+}
+
+func (c *inputConn) Read(p []byte) (int, error) {
+	if c.in.Len() > 0 {
+		return c.in.Read(p)
+	}
+	c.once.Do(func() { close(c.drained) })
+	return c.Conn.Read(p)
+}
+
+func (c *inputConn) Write(p []byte) (int, error) { return len(p), nil }
+
+// relayInput runs a relay from a client that sends in, to server. The
+// client stays open until the relay has read all of in and the server has
+// read all the relay sent, so every request the relay forwards reaches
+// server, pipelined ones included. Reads by server then fail with a
+// timeout, and its connection closes when it returns. It fails the test if
+// the relay does not stop.
+func relayInput(t *testing.T, o Options, in []byte, server func(net.Conn)) {
+	t.Helper()
+	other, relayEnd := net.Pipe()
+	client := &inputConn{Conn: relayEnd, in: bytes.NewReader(in), drained: make(chan struct{})}
+	relayServer, serverSide := net.Pipe()
+	_ = serverSide.SetDeadline(time.Now().Add(2 * time.Second))
+	done := make(chan error, 1)
+	go func() { done <- Serve(client, relayServer, o) }()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		defer func() { _ = serverSide.Close() }()
+		server(serverSide)
+	}()
+	select {
+	case <-client.drained:
+		// All the relay writes to the server comes from the goroutine
+		// now reading the client, and pipe writes return once read, so
+		// the server has every byte it will get.
+		_ = serverSide.SetReadDeadline(time.Now())
+	case <-served:
+	case err := <-done:
+		done <- err
+	}
+	<-served
+	_ = client.Close()
+	select {
+	case <-done: //nolint:errcheck // any error is fine; only a hang is not
+	case <-time.After(waitFor):
+		t.Fatal("relay did not stop")
+	}
+	_ = other.Close()
+}
+
 // FuzzRequests feeds arbitrary bytes from the client to a relay whose
 // server answers every request it can parse. Besides not panicking or
 // hanging, the relay must keep its promise about hosts: every request the
@@ -69,6 +131,14 @@ func FuzzRequests(f *testing.F) {
 		"GET /socket HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nraw bytes",
 		"GET / HTTP/1.1\r\nHost: allowed.test:443@evil.test\r\n\r\n",
 		"\r\nGET / HTTP/1.1\r\nHost: other.test\r\nHost: allowed.test\r\n\r\n",
+		// Pipelined requests for another host, by Host and by target.
+		"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\nGET /x HTTP/1.1\r\nHost: evil.test\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\nGET http://evil.test/x HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		// A request net/http refuses, then one the relay refuses after the
+		// response to the first, which never comes.
+		"POS\x03 / HTTP/1.1\r\nHost: allowed.test\r\n\r\nGET / HTTP/1.1\r\nHost: evil.test\r\n\r\n",
+		// After a CONNECT the rest is a tunnel, not requests.
+		"HEAD / HTTP/1.1\r\nHost: allowed.test\r\n\r\nCONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test\r\n\r\nGET / HTTP/1.1\r\nHost: evil.test\r\n\r\n",
 		// net/http reads no Content-Length in these, so the body is a
 		// request of its own.
 		"POST / HTTP/1.1\r\nHost: allowed.test\r\nX: a\r\n Content-Length: 35\r\n\r\nGET / HTTP/1.1\r\nHost: evil.test\r\n\r\n",
@@ -78,23 +148,26 @@ func FuzzRequests(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, in []byte) {
 		var bad []string
-		relayOnce(t, fuzzOptions(t, false), func(c net.Conn) {
-			go func() { _, _ = io.Copy(io.Discard, c) }()
-			_, _ = c.Write(in)
-		}, func(s net.Conn) {
+		relayInput(t, fuzzOptions(t, false), in, func(s net.Conn) {
 			br := bufio.NewReader(s)
 			for {
 				req, err := http.ReadRequest(br)
 				if err != nil {
-					_, _ = io.Copy(io.Discard, br)
 					return
 				}
 				if !hostmatch.SameHost(req.Host, "allowed.test") || req.URL.Host != "" && !hostmatch.SameHost(req.URL.Host, "allowed.test") {
 					bad = append(bad, req.Host+" "+req.URL.String())
 				}
 				_, _ = io.Copy(io.Discard, req.Body)
-				if _, err := io.WriteString(s, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"); err != nil {
+				response := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+				if req.Method == "HEAD" {
+					response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"
+				}
+				if _, err := io.WriteString(s, response); err != nil {
 					return
+				}
+				if req.Method == "CONNECT" {
+					return // a tunnel now: what follows is not HTTP
 				}
 			}
 		})
