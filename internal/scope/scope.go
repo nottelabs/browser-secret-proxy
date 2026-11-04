@@ -12,9 +12,17 @@
 // CONNECT host and has not expired; otherwise the whole request is refused,
 // before anything is sent upstream. A resolver that is a resolve.Snapshotter
 // gives one consistent version for detection and resolution, and can refuse
-// the principal outright (an expired credential). Nothing is cached here: every request is resolved again, so
-// a value resolved for one principal is never used for another, and a
-// resolver's own expiry and revocation apply to the next request.
+// the principal outright (an expired credential). Nothing is cached here:
+// every request is resolved again, so a value resolved for one principal is
+// never used for another, and a value is no longer swapped once the
+// resolver stops giving it. In the file and sealed modes that is the next
+// request; the http resolver answers from its own cache, so a value revoked
+// at the service is still swapped for up to -resolver-cache-ttl.
+//
+// The resolver is asked about the CONNECT host as the allowlist matches it
+// (hostmatch.Host): in lower case, without a port or a trailing dot. A
+// value's host list is nil for the allowlist; an empty one is invalid, and
+// refuses the request like any other invalid list.
 //
 // When masking is on, every value resolved for a principal is also kept on
 // record, until its expiry or for Retention after its last lookup,
@@ -86,14 +94,16 @@ func (s *Scope) Close() { s.record.close() }
 // Session is the scope of one connection: the principal its CONNECT
 // authenticated as, and the host it CONNECTed to.
 func (s *Scope) Session(p resolve.Principal, host string) *Session {
-	return &Session{scope: s, principal: p, host: host}
+	return &Session{scope: s, principal: p, host: hostmatch.Host(host)}
 }
 
 // Session resolves the requests of one connection.
 type Session struct {
 	scope     *Scope
 	principal resolve.Principal
-	host      string // the CONNECT destination
+	// The CONNECT destination, as hostmatch.Host gives it; empty, which
+	// nothing matches, when it is not a plain host.
+	host string
 }
 
 // CheckAuthority refuses a request whose authority is not the host the
@@ -266,10 +276,13 @@ func (l *Lookup) Values(ctx context.Context) (map[string]resolve.Value, error) {
 		cfg.Logger.Warn("resolver failed", "principal", s.principal.ID, "host", s.host, "stand_ins", len(standIns), "error", errorCategory(err))
 		return nil, refused("the resolver failed")
 	}
-	if cfg.Mask {
-		// Recorded before the checks: a value refused here is still the
-		// principal's, and a destination may hold it already.
-		s.scope.record.add(s.principal, result.Values)
+	// Recorded before the checks: a value refused here is still the
+	// principal's, and a destination may hold it already. A lookup with
+	// more values than the record keeps would leave some of them out, and
+	// their echo unmasked: it is refused instead.
+	if cfg.Mask && !s.scope.record.add(s.principal, result.Values) {
+		cfg.Logger.Warn("refusing a request with more values than are masked", "principal", s.principal.ID, "host", s.host, "limit", MaxValuesPerPrincipal)
+		return nil, refused("the request carries more than %d values, more than masking keeps per principal", MaxValuesPerPrincipal)
 	}
 	now := cfg.Now()
 	values := make(map[string]resolve.Value, len(standIns))
@@ -310,9 +323,10 @@ func errorCategory(err error) string {
 }
 
 // allows reports whether v may be sent to host: one of its own hosts, or,
-// when it has none, the proxy's allowlist.
+// when it has no host list (nil), the proxy's allowlist. An empty list is
+// an error, as an invalid one is: it is not the same as none.
 func (s *Session) allows(v resolve.Value, host string) (bool, error) {
-	if len(v.Hosts) == 0 {
+	if v.Hosts == nil {
 		return s.scope.cfg.Hosts.Match(host), nil
 	}
 	list, err := hostmatch.New(v.Hosts)

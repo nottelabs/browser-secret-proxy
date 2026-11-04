@@ -62,9 +62,9 @@ func (r *relay) resolveLookup(s *stream, lookup *scope.Lookup, done func(*swap.S
 //
 // At most MaxLookups lookups run at once, each on a goroutine; the others
 // wait in lookupQueue, in order, with no goroutine of their own. A stream
-// has at most two lookups (its request, and an extended CONNECT's
-// trailers), and a dropped stream's waiting lookups leave the queue, so the
-// queue is bounded by the open streams (MaxStreams).
+// has at most two lookups (its request, and a streamed request's trailers),
+// and a dropped stream's waiting lookups leave the queue, so the queue is
+// bounded by the open streams (MaxStreams).
 func (r *relay) lookupLocked(s *stream, lookup *scope.Lookup, done func(*swap.Swapper, error) error) {
 	if s.lookupCtx == nil {
 		s.lookupCtx, s.lookupCancel = context.WithCancel(r.ctx)
@@ -170,8 +170,8 @@ func (r *relay) refuseLookup(s *stream, cause error) error {
 	return r.badGateway(s.clientID, s.authority, ended, cause)
 }
 
-// openResolved opens a stream that is not buffered (no body, or an extended
-// CONNECT) once its lookup answered.
+// openResolved opens a stream that is not buffered (no body) once its lookup
+// answered.
 func (r *relay) openResolved(s *stream, fields []hpack.HeaderField, priority *Priority, endStream bool, swapper *swap.Swapper, err error) error {
 	if err != nil {
 		return r.refuseLookup(s, err)
