@@ -33,7 +33,7 @@ docker run -d --name "$container" -p 127.0.0.1:18380:8080 \
   -swaps /etc/bsp/swaps.json -hosts 'postman-echo.com,www.birkenstock.com,checkoutshopper-live.adyen.com,live.adyen.com,www.booking.com,secure.booking.com' >/dev/null
 ready=""
 for _ in $(seq 1 20); do
-  status=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 http://127.0.0.1:18380/ || true)
+  status=$(curl -s -o /dev/null -w '%{http_connect}' --connect-timeout 1 --max-time 2 --proxy http://127.0.0.1:18380 https://postman-echo.com/ || true)
   if [ "$status" = 407 ]; then ready=1; break; fi
   if [ "$(docker inspect -f '{{.State.Running}}' "$container")" != true ]; then
     echo 'Proxy exited before readiness; no browser will be allocated' >&2
