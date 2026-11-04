@@ -162,7 +162,7 @@ func TestReloadFollowsASymlinkSwap(t *testing.T) {
 
 func TestWatchReloadsWhileResolving(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "swaps.json")
-	writeFile(t, path, `{"tok_a": "real_1"}`)
+	writeFile(t, path, `{"tok_a": "a_1", "tok_b": "b_1"}`)
 	f, err := LoadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -177,8 +177,11 @@ func TestWatchReloadsWhileResolving(t *testing.T) {
 	}()
 	defer func() { cancel(); <-watched }()
 
+	// Readers resolve both stand-ins in one call while the file changes: the
+	// two values must always come from the same version of the map.
 	stop := make(chan struct{})
 	readers := make(chan struct{})
+	defer func() { close(stop); <-readers }()
 	go func() {
 		defer close(readers)
 		for {
@@ -187,8 +190,14 @@ func TestWatchReloadsWhileResolving(t *testing.T) {
 				return
 			default:
 			}
-			if got := realOf(t, f, "tok_a"); got != "real_1" && got != "real_2" {
-				t.Errorf("a request saw %q", got)
+			res, err := f.Resolve(context.Background(), Request{StandIns: []string{"tok_a", "tok_b"}})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			a, b := res.Values["tok_a"].Real, res.Values["tok_b"].Real
+			if (a != "a_1" || b != "b_1") && (a != "a_2" || b != "b_2") {
+				t.Errorf("one request saw %q and %q", a, b)
 				return
 			}
 		}
@@ -200,13 +209,13 @@ func TestWatchReloadsWhileResolving(t *testing.T) {
 	if n := strings.Count(logs.String(), "does not load"); n != 1 {
 		t.Fatalf("a broken file was logged %d times, want once", n)
 	}
-	writeFile(t, path, `{"tok_a": "real_2"}`)
-	waitFor(t, func() bool { return realOf(t, f, "tok_a") == "real_2" })
-	close(stop)
-	<-readers
+	writeFile(t, path, `{"tok_a": "a_2", "tok_b": "b_2"}`)
+	waitFor(t, func() bool { return realOf(t, f, "tok_b") == "b_2" })
 	waitFor(t, func() bool { return strings.Contains(logs.String(), "reloaded the swaps file") })
-	if strings.Contains(logs.String(), "real_") || strings.Contains(logs.String(), "broken") {
-		t.Fatalf("the log shows file content: %s", logs.String())
+	for _, leaked := range []string{"a_1", "b_2", "broken"} {
+		if strings.Contains(logs.String(), leaked) {
+			t.Fatalf("the log shows file content: %s", logs.String())
+		}
 	}
 }
 
