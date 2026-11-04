@@ -599,15 +599,12 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 			contentType = f.Value
 		}
 	}
-	// An accepted CONNECT (2xx: a WebSocket over extended CONNECT) carries a
-	// tunnel, not a body: its frames pass through untouched, like an
-	// HTTP/1.1 upgrade. A refused one has an ordinary body, masked like any
-	// other.
-	tunnel := method == "CONNECT" && len(status) == 3 && status[0] == '2'
-	// A 2xx to CONNECT, 204 included, is a tunnel: its DATA is the tunnel's.
-	bodiless := !tunnel && (method == "HEAD" || status == "204" || status == "304")
+	// No response is a tunnel whose DATA passes through unmasked: requestHead
+	// refuses every CONNECT, and if one reached the server anyway, a 2xx to
+	// it would be masked as a body here, not passed on raw.
+	bodiless := method == "HEAD" || status == "204" || status == "304"
 	plan := respPlan{
-		body:     !ends && !tunnel && !bodiless,
+		body:     !ends && !bodiless,
 		bodiless: bodiless,
 		context:  mask.ContextOf(contentType),
 	}
@@ -773,8 +770,8 @@ func (r *relay) onServerDataMasked(f Frame) error {
 // content is not passed on. Both sides get RST_STREAM; the server is
 // credited the n bytes the relay dropped. The client stops sending once
 // reset, so the request ends here too, even when the server already ended
-// the stream: one still uploading (a CONNECT) would otherwise keep its
-// stream slot, and the server's stream is reset as well.
+// the stream: one still uploading would otherwise keep its stream slot, and
+// the server's stream is reset as well.
 func (r *relay) resetMalformed(s *stream, rs *respState, n int, serverDone bool) error {
 	r.opts.Logger.Warn("resetting a malformed response", "stream", s.clientID)
 	r.mu.Lock()
