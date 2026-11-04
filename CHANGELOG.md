@@ -99,3 +99,8 @@ First release, planned as 0.1.0.
   memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value
   over 1 KiB ends the connection with `PROTOCOL_ERROR`. Before, one client
   could make the relay hold gigabytes on one connection.
+- Over HTTP/2, a client that sends no connection preface within 10 seconds,
+  or does not acknowledge a `SETTINGS` frame within 10 seconds (`GOAWAY`
+  with `SETTINGS_TIMEOUT`), loses the connection, and so does a destination
+  that leaves a response header block unfinished for 10 seconds. Before,
+  either could hold the connection open for good.

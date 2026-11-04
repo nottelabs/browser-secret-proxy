@@ -309,6 +309,9 @@ func (r *relay) serverLoopMasked() error {
 				return err
 			}
 			block, blockStream, blockEnds, inBlock = block[:0], f.Stream, f.Flags&FlagEndStream != 0, true
+			if f.Flags&FlagEndHeaders == 0 {
+				r.serverBlock(true)
+			}
 			if err := appendFragment(fragment); err != nil {
 				return err
 			}
@@ -318,6 +321,9 @@ func (r *relay) serverLoopMasked() error {
 			}
 			if err := appendFragment(f.Payload); err != nil {
 				return err
+			}
+			if f.Flags&FlagEndHeaders != 0 {
+				r.serverBlock(false)
 			}
 		case FrameData:
 			err = r.onServerDataMasked(f)

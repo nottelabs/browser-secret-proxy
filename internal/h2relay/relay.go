@@ -30,6 +30,11 @@
 // much is limited too: the client's HPACK table is no larger than the
 // relay's upstream one (decoderTableSize), and a client that resets streams
 // faster than it could use them (rapid reset) loses the connection.
+//
+// A peer that stalls a protocol step loses the connection too, rather than
+// holding it: a client that sends no preface in time or does not
+// acknowledge a SETTINGS frame in time (RFC 9113 6.5.3), and a server that
+// leaves a response header block unfinished.
 package h2relay
 
 import (
@@ -41,6 +46,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,6 +90,18 @@ type Options struct {
 	// PrefaceTimeout bounds the wait for the server's first SETTINGS frame
 	// (default 30 s); past it the client gets a connection error.
 	PrefaceTimeout time.Duration
+	// ClientPrefaceTimeout bounds the wait for the client's connection
+	// preface, its first frame included (default 10 s); past it the
+	// connection closes.
+	ClientPrefaceTimeout time.Duration
+	// SettingsTimeout bounds the wait for the client's ACK of each SETTINGS
+	// frame it is sent (default 10 s); past it the client gets GOAWAY with
+	// SETTINGS_TIMEOUT.
+	SettingsTimeout time.Duration
+	// HeaderBlockTimeout bounds how long the server may leave a response
+	// header block unfinished, waiting for CONTINUATION frames (default
+	// 10 s); past it the connection closes.
+	HeaderBlockTimeout time.Duration
 	// MaxDecoded caps the decoded size of one compressed response that is
 	// masked (default mask.DefaultMaxDecoded); past it the stream is reset.
 	MaxDecoded int64
@@ -100,15 +118,16 @@ var (
 )
 
 const (
-	errCodeNoError       = 0x0
-	errCodeProtocol      = 0x1
-	errCodeStreamClosed  = 0x5
-	errCodeInternal      = 0x2
-	errCodeFlowControl   = 0x3
-	errCodeFrameSize     = 0x6
-	errCodeRefusedStream = 0x7
-	errCodeCancel        = 0x8
-	errCodeCalm          = 0xb // ENHANCE_YOUR_CALM
+	errCodeNoError         = 0x0
+	errCodeProtocol        = 0x1
+	errCodeStreamClosed    = 0x5
+	errCodeInternal        = 0x2
+	errCodeFlowControl     = 0x3
+	errCodeSettingsTimeout = 0x4
+	errCodeFrameSize       = 0x6
+	errCodeRefusedStream   = 0x7
+	errCodeCancel          = 0x8
+	errCodeCalm            = 0xb // ENHANCE_YOUR_CALM
 	// decoderTableSize is the largest HPACK table the relay's request
 	// decoder accepts, and so the largest the client is told it may use: the
 	// HPACK default, which is the table of the relay's upstream encoder too.
@@ -131,6 +150,12 @@ const (
 	// (clientDropped).
 	resetWindow = 10 * time.Second
 )
+
+// DefaultStepTimeout is the default of the timeouts on single protocol
+// steps: the client's preface, its ACK of a SETTINGS frame, and a server
+// header block. A peer that takes longer stalls the connection, so these
+// are short; browsers take milliseconds.
+const DefaultStepTimeout = 10 * time.Second
 
 type relay struct {
 	opts           Options
@@ -155,6 +180,19 @@ type relay struct {
 	resets      int
 	resetsSince time.Time
 	now         func() time.Time // time.Now; tests replace it
+	// The SETTINGS frames sent to the client that it has not acknowledged
+	// yet (guarded by mu): their number, and the time by which each must be
+	// acknowledged, oldest first. ackDeadlines keeps at most
+	// maxUnackedSettings; when it runs out with frames still pending, the
+	// next deadline counts from the last ACK. ackTimer, armed while frames
+	// are pending (ackArmed), checks the oldest deadline.
+	ackPending   int
+	ackDeadlines []time.Time
+	ackTimer     *time.Timer
+	ackArmed     bool
+	// timeouts carries a protocol-step timeout found off the relay's loops
+	// (an unacknowledged SETTINGS frame), which ends the connection.
+	timeouts chan error
 	// decAllowed is the table size dec accepts (clientLoop only).
 	decAllowed uint32
 	// The largest frame each side may send: the client, what the server's
@@ -323,6 +361,15 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	if opts.PrefaceTimeout <= 0 {
 		opts.PrefaceTimeout = 30 * time.Second
 	}
+	if opts.ClientPrefaceTimeout <= 0 {
+		opts.ClientPrefaceTimeout = DefaultStepTimeout
+	}
+	if opts.SettingsTimeout <= 0 {
+		opts.SettingsTimeout = DefaultStepTimeout
+	}
+	if opts.HeaderBlockTimeout <= 0 {
+		opts.HeaderBlockTimeout = DefaultStepTimeout
+	}
 	if opts.MaxDecoded <= 0 {
 		opts.MaxDecoded = mask.DefaultMaxDecoded
 	}
@@ -340,6 +387,7 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.asyncErrs = make(chan error, 1)
+	r.timeouts = make(chan error, 1)
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
@@ -358,6 +406,15 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 
 // errNoServerPreface is a server that sent no SETTINGS in time.
 var errNoServerPreface = errors.New("server sent no SETTINGS frame in time")
+
+// errClientPreface is a client that sent no HTTP/2 preface in time.
+var errClientPreface = errors.New("client sent no HTTP/2 preface in time")
+
+// errSettingsTimeout is a client that did not acknowledge SETTINGS in time.
+var errSettingsTimeout = errors.New("client did not acknowledge SETTINGS in time")
+
+// errHeaderBlockTimeout is a server that left a header block unfinished.
+var errHeaderBlockTimeout = errors.New("server did not finish a header block in time")
 
 // errHeldFrames is more relay frames waiting for the server's SETTINGS
 // than the buffer budget allows.
@@ -390,6 +447,7 @@ func (r *relay) run() error {
 	case first = <-errs:
 		pending--
 	case first = <-timeout:
+	case first = <-r.timeouts:
 	case first = <-r.asyncErrs:
 	}
 	r.shutdown()
@@ -416,6 +474,9 @@ func (r *relay) shutdown() {
 	r.cancel()
 	r.mu.Lock()
 	r.closed = true
+	if r.ackTimer != nil {
+		r.ackTimer.Stop()
+	}
 	r.cond.Broadcast()
 	r.mu.Unlock()
 	_ = r.server.Close()
@@ -556,9 +617,19 @@ func (r *relay) connectionError(code uint32, cause error) error {
 }
 
 // clientLoop reads the client's frames and sends them on.
+//
+// The client's connection preface, the magic and the frame after it (RFC
+// 9113 3.4: its SETTINGS), must arrive within ClientPrefaceTimeout. A
+// client that opens the connection and stays silent would otherwise hold
+// it, and the destination's, for good.
 func (r *relay) clientLoop() error {
+	_ = r.client.SetReadDeadline(time.Now().Add(r.opts.ClientPrefaceTimeout))
+	inPreface := true
 	preface := make([]byte, len(Preface))
 	if _, err := io.ReadFull(r.client, preface); err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return errClientPreface
+		}
 		return fmt.Errorf("read client preface: %w", err)
 	}
 	if string(preface) != Preface {
@@ -588,8 +659,15 @@ func (r *relay) clientLoop() error {
 		if errors.Is(err, ErrFrameSize) {
 			return r.connectionError(errCodeFrameSize, fmt.Errorf("client: %w", err))
 		}
+		if inPreface && errors.Is(err, os.ErrDeadlineExceeded) {
+			return errClientPreface
+		}
 		if err != nil {
 			return err
+		}
+		if inPreface {
+			inPreface = false
+			_ = r.client.SetReadDeadline(time.Time{})
 		}
 		if inBlock && (f.Type != FrameContinuation || f.Stream != blockStream) {
 			return errors.New("client interrupted a header block")
@@ -1830,8 +1908,14 @@ func (r *relay) serverLoop() error {
 			}
 			_, err = r.client.Write(encodeFrames([]Frame{f}))
 			if f.Flags&FlagEndHeaders == 0 {
+				if block == nil {
+					r.serverBlock(true)
+				}
 				block = s
 				break
+			}
+			if block != nil {
+				r.serverBlock(false)
 			}
 			block = nil
 			r.clientMu.Unlock()
@@ -1879,7 +1963,25 @@ func (r *relay) readServerFrame() (Frame, error) {
 		r.goAwayServer(errCodeFrameSize)
 		return Frame{}, fmt.Errorf("server: %w", err)
 	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		// The only read deadline on the server is serverBlock's.
+		return Frame{}, errHeaderBlockTimeout
+	}
 	return f, err
+}
+
+// serverBlock bounds by HeaderBlockTimeout the time the server's header
+// block may stay open: open starts the clock when a block begins without
+// END_HEADERS, and !open stops it when the block ends. The server can send
+// no other frame meanwhile (RFC 9113 6.10), so every response waits, and
+// without masking the relay also holds the client write lock: a server
+// that stalls mid-block stalls the whole connection.
+func (r *relay) serverBlock(open bool) {
+	if open {
+		_ = r.server.SetReadDeadline(time.Now().Add(r.opts.HeaderBlockTimeout))
+	} else {
+		_ = r.server.SetReadDeadline(time.Time{})
+	}
 }
 
 // goAwayWait bounds how long the relay waits to tell the server with GOAWAY
@@ -2047,6 +2149,7 @@ func largestState(acked int64, unacked []int64) int64 {
 // Buffering streams a decrease leaves short are topped up again.
 func (r *relay) applyClientAck() error {
 	r.mu.Lock()
+	r.settingsAckedLocked(time.Now())
 	if len(r.unackedInitial) == 0 {
 		r.mu.Unlock()
 		return nil
@@ -2101,6 +2204,7 @@ func (r *relay) onServerSettings(payload []byte) error {
 		}
 	}
 	r.mu.Lock()
+	r.settingsSentLocked(time.Now())
 	r.unackedInitial = append(r.unackedInitial, initial)
 	r.unackedTable = append(r.unackedTable, table)
 	r.maxInitialSent = max(r.maxInitialSent, initial)
@@ -2157,4 +2261,89 @@ func (r *relay) onServerSettings(payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// settingsSentLocked records a SETTINGS frame sent to the client at now,
+// which it must acknowledge within SettingsTimeout.
+func (r *relay) settingsSentLocked(now time.Time) {
+	r.ackPending++
+	if len(r.ackDeadlines) < maxUnackedSettings {
+		r.ackDeadlines = append(r.ackDeadlines, now.Add(r.opts.SettingsTimeout))
+	}
+	if !r.ackArmed && !r.closed {
+		r.ackArmed = true
+		if r.ackTimer == nil {
+			r.ackTimer = time.AfterFunc(r.opts.SettingsTimeout, r.checkSettingsAck)
+		} else {
+			r.ackTimer.Reset(r.opts.SettingsTimeout)
+		}
+	}
+}
+
+// settingsAckedLocked records the client's ACK, at now, of the oldest
+// SETTINGS frame it has not acknowledged. An ACK with none pending is the
+// server's to judge.
+func (r *relay) settingsAckedLocked(now time.Time) {
+	if r.ackPending == 0 {
+		return
+	}
+	r.ackPending--
+	if len(r.ackDeadlines) > 0 {
+		r.ackDeadlines = r.ackDeadlines[1:]
+	}
+	if r.ackPending > 0 && len(r.ackDeadlines) == 0 {
+		r.ackDeadlines = append(r.ackDeadlines, now.Add(r.opts.SettingsTimeout))
+	}
+	// The timer stays as it is: deadlines only move later, so when it
+	// fires, checkSettingsAck re-arms it for the next one.
+}
+
+// checkSettingsAck runs when the oldest SETTINGS frame may be overdue
+// (RFC 9113 6.5.3). If it is, the client gets GOAWAY with SETTINGS_TIMEOUT
+// and the relay ends; if not, the timer waits for the oldest deadline.
+func (r *relay) checkSettingsAck() {
+	r.mu.Lock()
+	if r.closed || r.ackPending == 0 {
+		r.ackArmed = false
+		r.mu.Unlock()
+		return
+	}
+	if wait := time.Until(r.ackDeadlines[0]); wait > 0 {
+		r.ackTimer.Reset(wait)
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	r.goAwayClient(errCodeSettingsTimeout)
+	select {
+	case r.timeouts <- errSettingsTimeout:
+	default:
+	}
+}
+
+// goAwayClient tells the client with GOAWAY that the connection ends for
+// code, waiting at most goAwayWait: a writer stuck on a client that stopped
+// reading may hold clientMu. The relay closes the connection either way,
+// which ends a write still waiting.
+func (r *relay) goAwayClient(code uint32) {
+	r.mu.Lock()
+	last := r.maxClientID
+	r.mu.Unlock()
+	goaway := Frame{Type: FrameGoAway, Payload: binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, last), code)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.clientMu.Lock()
+		defer r.clientMu.Unlock()
+		if !r.prefaceSent.Load() {
+			_ = r.holdLocked([]Frame{goaway}) // failBeforePreface sends it
+			return
+		}
+		_ = r.client.SetWriteDeadline(time.Now().Add(goAwayWait))
+		_, _ = r.client.Write(encodeFrames([]Frame{goaway}))
+	}()
+	select {
+	case <-done:
+	case <-time.After(goAwayWait):
+	}
 }
