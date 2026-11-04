@@ -362,6 +362,24 @@ func TestSwapLimitsEndTheConnection(t *testing.T) {
 	}
 }
 
+// A NUL or bare CR the client put in a header does not let a real value with
+// a line break into it: nothing of the request reaches the server.
+func TestHeaderControlCharactersDoNotLetLineBreaksIn(t *testing.T) {
+	for name, header := range map[string]string{"nul": "Bearer t1\x00", "bare cr": "\rBearer t1"} {
+		t.Run(name, func(t *testing.T) {
+			client, clientReader, _, serverReader, _ := pipesWith(t, expandingOptions(t, "a\r\nX-Injected: 1"))
+			go func() { _, _ = io.Copy(io.Discard, clientReader) }()
+			go func() {
+				_, _ = io.WriteString(client, "GET / HTTP/1.1\r\nHost: allowed.test\r\nAuthorization: "+header+"\r\n\r\n")
+			}()
+			// The relay closes the server connection when it refuses.
+			if got, _ := io.ReadAll(serverReader); len(got) > 0 {
+				t.Fatalf("server received %q", got)
+			}
+		})
+	}
+}
+
 // Framing headers are not swapped: a stand-in equal to the Content-Length
 // leaves it alone, so the body and the next request keep their boundaries.
 func TestFramingHeadersAreNotSwapped(t *testing.T) {
