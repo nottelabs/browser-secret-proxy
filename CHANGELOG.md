@@ -16,7 +16,9 @@ First release, planned as 0.1.0.
 - Plain CONNECT tunnels, without decryption, for every other host.
 - HTTP/2 and HTTP/1.1 relays.
 - Optional Basic authentication on CONNECT
-  (`SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD`).
+  (`SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD`). The proxy refuses to
+  start with a password but no username, which would leave authentication
+  off.
 - Parent proxy support (`-upstream-proxy`, `SECRET_PROXY_UPSTREAM`):
   `http://`, `https://` and `socks5://`.
 - Static binaries for linux and darwin (amd64, arm64) and a multi-arch

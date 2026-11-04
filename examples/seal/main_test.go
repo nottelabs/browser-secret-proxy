@@ -71,6 +71,7 @@ func TestSealedTokenOpensInTheProxy(t *testing.T) {
 		"empty stand-in": {`{"values": {"": "real_a"}}`, "10m"},
 		"negative ttl":   {`{"values": {"tok_a": "real_a"}}`, "-1m"},
 		"past exp":       {`{"values": {"tok_a": "real_a"}, "exp": 1}`, "10m"},
+		"unknown field":  {`{"values": {"tok_a": "real_a"}, "host": ["api.test"]}`, "10m"},
 	} {
 		if err := os.WriteFile(payload, []byte(c.payload), 0o600); err != nil {
 			t.Fatal(err)
