@@ -1423,7 +1423,9 @@ func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.
 		}
 	}
 	if changed {
-		r.opts.Logger.Info("swapped stand-ins in a request body", "bytes_before", len(original), "bytes_after", len(body))
+		// No sizes: with the stand-ins known, the change in length gives
+		// away the real values' lengths.
+		r.opts.Logger.Info("swapped stand-ins in a request body", "authority", s.authority)
 	}
 
 	r.mu.Lock()

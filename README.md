@@ -31,8 +31,8 @@ reproduce instead of substituting its own.
    real values are replaced by their stand-ins before they reach the client
    (see [Response masking](#response-masking)).
 
-Real values are never logged. Log lines name the host and how many fields
-were swapped.
+Real values are never logged, nor are their lengths. Log lines name the host
+and how many fields were swapped.
 
 ## Quick start
 
@@ -247,7 +247,7 @@ real value in the echo.
 | `-standin-pattern` | Regular expression (RE2) matching stand-ins. Repeatable. See [Finding stand-ins](#finding-stand-ins). |
 | `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
 | `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
-| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
+| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. Nothing but an optional `/` may follow the port; percent-encode special characters in the user and password. The flag wins over the variable. |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty; a `SECRET_PROXY_PASSWORD` without it is refused at start. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
@@ -515,7 +515,8 @@ through that parent. The parent sees only encrypted traffic for decrypted
 hosts: the proxy opens its TLS connection to the destination through the
 parent's tunnel.
 
-Credentials in the parent URL are never logged; logs name only its scheme and
+Credentials in the parent URL are never logged or printed, not even in the
+usage text or when the URL does not parse; logs name only its scheme and
 host.
 
 ## Security model

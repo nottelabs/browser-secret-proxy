@@ -85,6 +85,14 @@ First release, planned as 0.1.0.
   is the principal: the username names it in logs but no longer splits its
   values for masking. Decrypted tokens leave memory at their time even when
   no request comes.
+- Logs, errors and the usage text keep credentials and real values out:
+  `-h` and flag errors no longer print the `SECRET_PROXY_UPSTREAM` URL; a
+  parent URL that does not parse, or has something after its port, is
+  refused without quoting it; with `-v`, a `CONNECT` head that does not
+  parse is logged by category, not quoted with its `Proxy-Authorization`;
+  a refused `Content-Encoding` or `Transfer-Encoding` is not quoted; and the
+  HTTP/2 body swap line no longer logs byte counts, which gave away the
+  length of real values. `-help` lists the environment variables.
 - Over HTTP/2, a frame longer than the max frame size its sender was told
   ends the connection with `FRAME_SIZE_ERROR`, and a frame's payload takes
   memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value
