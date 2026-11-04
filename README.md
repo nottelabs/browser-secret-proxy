@@ -535,7 +535,9 @@ host.
   `:authority`, or an absolute-form target (`GET https://host/`) that
   differs from `Host`; an authority with userinfo (`user@host`), a path,
   query, fragment or whitespace, or a port that is not a number. Over
-  HTTP/2, a header name with uppercase letters is refused the same way.
+  HTTP/2, a header name with uppercase letters is refused the same way, and
+  so is a pseudo-header that is repeated (two `:method` fields), unknown, or
+  after a regular field.
 - **Expired values are not used.** A value whose expiry has passed is not
   swapped.
 - **Fail closed.** When a request carries a stand-in that the resolver does
@@ -652,15 +654,16 @@ How a masked response changes:
   put it back together, even with a stand-in of the same length.
 - Also refused with a `502`: a real value in a header that frames the
   HTTP/1.1 message or connection (`Content-Length`, `Transfer-Encoding`,
-  `Content-Encoding`, `Connection`, `Keep-Alive`, `Trailer`, `Upgrade`),
-  which are kept as they are; a real value in the HTTP/1.1 status line
+  `Content-Encoding`, `Connection`, `Keep-Alive`, `Trailer`, `Upgrade`), or
+  in an HTTP/2 `content-length`, which are kept as they are; a real value in the HTTP/1.1 status line
   outside its reason phrase; and, over HTTP/2, a field name with an
   upper-case letter (malformed, RFC 9113 8.2.1). An HTTP/1.1 `101` to a
   request that did not ask to upgrade is refused the same way, with masking
   on or off: it would turn the rest of the connection into a raw stream,
   neither swapped nor masked.
-- Over HTTP/2, content in DATA on a response that cannot have any (to a
-  `HEAD`, or a `204` or `304`) is malformed (RFC 9113 8.1.1): the stream is
+- Over HTTP/2, DATA before the final response head (none yet, or only a
+  `1xx`), and content in DATA on a response that cannot have any (to a
+  `HEAD`, or a `204` or `304`), are malformed (RFC 9113 8.1): the stream is
   reset and the content is not passed on.
 - Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
   the proxy is the flow-control endpoint for a masked stream, and keeps every
@@ -689,7 +692,8 @@ How a masked response changes:
   with `%20` for a space (Python's `urllib.parse.quote`).
 - A value first recorded while a response is already open, such as a
   server-sent events stream or another long response: which values are
-  masked is decided when the response head arrives, so a value the
+  masked, in the body and the trailers, is decided when the response head
+  arrives, so a value the
   principal sends afterwards, on any connection, is masked only in later
   responses.
 - Values that overlap: when the end of one real value is the start of
@@ -739,6 +743,9 @@ return.
 - When the destination sends GOAWAY, requests it will not process are refused
   with `REFUSED_STREAM`.
 - Server push is not supported.
+- HTTP/2 frames of a type the proxy does not know go to the destination on
+  the stream they belong to there, or are dropped when that stream is not
+  open upstream (its request still buffered, or ended).
 - Response masking has limits of its own: see
   [What masking misses](#what-masking-misses).
 - The CA, the `http` mode's client certificate and the `sealed` key are
