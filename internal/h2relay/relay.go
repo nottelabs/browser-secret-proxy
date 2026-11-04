@@ -1008,6 +1008,19 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 	if ended {
 		return r.endedStream(s, 0)
 	}
+	// Malformed trailers end the request: a buffered one is answered 502, a
+	// streamed one, already upstream, is reset.
+	if name, bad := malformedValue(fields); bad {
+		cause := fmt.Errorf("%w: trailer %q has a malformed value", scope.ErrRefused, name)
+		if buffering {
+			r.mu.Lock()
+			s.clientEnded = s.clientEnded || endStream
+			r.mu.Unlock()
+			return r.refuseLookup(s, cause)
+		}
+		r.opts.Logger.Warn("resetting a request with malformed trailers", "stream", clientID, "reason", cause.Error())
+		return r.abort(s, errCodeProtocol)
+	}
 	if s.swap && !buffering {
 		lookup, err := r.opts.Session.Prepare(fieldText(fields)...)
 		if err != nil {
@@ -1061,11 +1074,12 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // one checked; or a pseudo-header that is repeated, unknown, or after a
 // regular field, which a server may read otherwise or not at all (with two
 // :method fields, the relay would take a POST for a CONNECT, whose response
-// it does not mask). Session.CheckAuthority refuses a host that disagrees
-// with :authority.
+// it does not mask), or a malformed field value. Session.CheckAuthority
+// refuses a host that disagrees with :authority.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
 	authorityFields, hostFields, uppercase := 0, 0, ""
 	pseudo, badPseudo, regular := map[string]bool{}, "", false
+	malformed, hasMalformed := malformedValue(fields)
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
@@ -1101,6 +1115,8 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
 	case badPseudo != "":
 		err = fmt.Errorf("%w: %s", scope.ErrRefused, badPseudo)
+	case hasMalformed:
+		err = fmt.Errorf("%w: field %q has a malformed value", scope.ErrRefused, malformed)
 	}
 	return method, authorities, err
 }
@@ -1108,6 +1124,22 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 // requestPseudo are the pseudo-headers a request may have (RFC 9113 8.3.1,
 // and :protocol for extended CONNECT, RFC 8441).
 var requestPseudo = map[string]bool{":method": true, ":scheme": true, ":authority": true, ":path": true, ":protocol": true}
+
+// malformedValue returns the name of the first field whose value RFC 9113
+// 8.2.1 forbids: one holding a NUL, CR or LF, which a server or a later
+// HTTP/1.1 hop could split the field on, or starting or ending with a space
+// or tab. It reports false when every value is well formed; the name may be
+// empty, so callers go by the boolean.
+func malformedValue(fields []hpack.HeaderField) (name string, malformed bool) {
+	for _, f := range fields {
+		v := f.Value
+		if strings.ContainsAny(v, "\x00\r\n") ||
+			v != "" && (v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
+			return f.Name, true
+		}
+	}
+	return "", false
+}
 
 // fieldText is the text of a header list that stand-ins are swapped in: the
 // query part of :path and the values of fields that are neither
@@ -1490,7 +1522,9 @@ func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.
 		}
 	}
 	if changed {
-		r.opts.Logger.Info("swapped stand-ins in a request body", "bytes_before", len(original), "bytes_after", len(body))
+		// No sizes: with the stand-ins known, the change in length gives
+		// away the real values' lengths.
+		r.opts.Logger.Info("swapped stand-ins in a request body", "authority", s.authority)
 	}
 
 	r.mu.Lock()
