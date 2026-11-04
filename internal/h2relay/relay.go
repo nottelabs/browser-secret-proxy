@@ -63,8 +63,9 @@ type Options struct {
 	// MaxStreams caps the client streams open at once (default 256).
 	// Streams waiting for a lookup count toward it.
 	MaxStreams int
-	// MaxLookups caps the resolver lookups in flight at once on the
-	// connection (default DefaultMaxLookups); more wait for a free one.
+	// MaxLookups caps the resolver lookups running at once on the
+	// connection, each on a goroutine (default DefaultMaxLookups); more wait
+	// in a queue, without a goroutine, for a free one.
 	MaxLookups int
 	// MaxHeaderBytes caps a client header block, encoded and decoded
 	// (default 1 MiB).
@@ -89,6 +90,8 @@ var (
 
 const (
 	errCodeNoError       = 0x0
+	errCodeProtocol      = 0x1
+	errCodeStreamClosed  = 0x5
 	errCodeInternal      = 0x2
 	errCodeFlowControl   = 0x3
 	errCodeRefusedStream = 0x7
@@ -109,13 +112,18 @@ type relay struct {
 	// ctx ends with the relay, canceling every resolver lookup in progress.
 	ctx    context.Context
 	cancel context.CancelFunc
-	// Resolver lookups run off clientLoop, one goroutine per lookup:
-	// lookups tracks them so the relay ends only after they did,
-	// lookupSlots bounds those in flight, and asyncErrs carries an I/O error
-	// one of them met to run, which ends the connection.
-	lookups     sync.WaitGroup
-	lookupSlots chan struct{}
-	asyncErrs   chan error
+	// Resolver lookups run off clientLoop (lookup.go): lookups tracks their
+	// goroutines so the relay ends only after they did, lookupsRunning and
+	// lookupQueue (guarded by mu) are the running and waiting ones, and
+	// asyncErrs carries an I/O error one of them met to run, which ends the
+	// connection.
+	lookups        sync.WaitGroup
+	lookupsRunning int
+	lookupQueue    []pendingLookup
+	asyncErrs      chan error
+	// streamErrors counts the client's stream errors (frames on a stream it
+	// ended); past maxStreamErrors they end the connection. clientLoop only.
+	streamErrors int
 
 	clientMu sync.Mutex // serializes writes to the client
 	// The server's first SETTINGS must be the first frame the client gets
@@ -204,14 +212,17 @@ type stream struct {
 	// when the stream is dropped (guarded by relay.mu).
 	lookupCtx    context.Context
 	lookupCancel context.CancelFunc
-	swap         bool
-	authority    string
-	method       string
-	buffering    bool
-	headers      []hpack.HeaderField
-	priority     *Priority
-	body         bytes.Buffer
-	trailers     []hpack.HeaderField
+	// finishing is set once finish took the buffered request to swap and
+	// send it (guarded by relay.mu).
+	finishing bool
+	swap      bool
+	authority string
+	method    string
+	buffering bool
+	headers   []hpack.HeaderField
+	priority  *Priority
+	body      bytes.Buffer
+	trailers  []hpack.HeaderField
 	// Control frames for a stream that has no server ID yet, combined so a
 	// client cannot grow them: the summed WINDOW_UPDATE increment and the
 	// latest PRIORITY_UPDATE.
@@ -279,7 +290,6 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 		recvConn: defaultWindow, clientInitial: defaultWindow, maxConcurrent: -1, ackedInitial: defaultWindow, maxInitialSent: defaultWindow,
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
-	r.lookupSlots = make(chan struct{}, opts.MaxLookups)
 	r.asyncErrs = make(chan error, 1)
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
@@ -482,12 +492,18 @@ var errFlowControl = errors.New("client exceeded its flow-control window")
 
 // flowControlError ends the connection after a window violation.
 func (r *relay) flowControlError() error {
+	return r.connectionError(errCodeFlowControl, errFlowControl)
+}
+
+// connectionError tells the client with GOAWAY that the connection ends for
+// code, and returns cause, which ends the relay.
+func (r *relay) connectionError(code uint32, cause error) error {
 	r.mu.Lock()
 	last := r.maxClientID
 	r.mu.Unlock()
-	payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, last), errCodeFlowControl)
+	payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, last), code)
 	_ = r.writeClient(Frame{Type: FrameGoAway, Payload: payload})
-	return errFlowControl
+	return cause
 }
 
 // clientLoop reads the client's frames and sends them on.
@@ -698,6 +714,7 @@ func (r *relay) dropLocked(s *stream) {
 	delete(r.streams, s.clientID)
 	if s.lookupCancel != nil {
 		s.lookupCancel() // a lookup still in flight is no longer wanted
+		r.dropLookupsLocked(s)
 	}
 	if r.masking && s.serverID == 0 {
 		// Never sent upstream: no response will come.
@@ -917,10 +934,14 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 
 	// Trailers. A buffered request's are swapped with its body in finish;
 	// a streamed request (extended CONNECT) on an allowlisted authority gets
-	// a lookup of its own.
+	// a lookup of its own. A header block after the client ended the stream
+	// is a stream error.
 	r.mu.Lock()
-	buffering := s.buffering
+	buffering, ended := s.buffering, s.clientEnded
 	r.mu.Unlock()
+	if ended {
+		return r.endedStream(s, 0)
+	}
 	if s.swap && !buffering {
 		lookup, err := r.opts.Session.Prepare(fieldText(fields)...)
 		if err != nil {
@@ -1221,6 +1242,11 @@ func (r *relay) onData(f Frame) error {
 		r.mu.Unlock()
 		return r.flowControlError()
 	}
+	if s.clientEnded {
+		// DATA after the client ended the stream.
+		r.mu.Unlock()
+		return r.endedStream(s, len(f.Payload))
+	}
 	s.clientEnded = s.clientEnded || end
 	if s.buffering {
 		overBody := s.body.Len()+len(data) > r.opts.MaxBody
@@ -1273,10 +1299,13 @@ func (r *relay) onData(f Frame) error {
 // releases it through dropLocked.
 func (r *relay) finish(s *stream) error {
 	r.mu.Lock()
-	if r.streams[s.clientID] != s || !s.buffering {
+	if r.streams[s.clientID] != s || !s.buffering || s.finishing {
 		r.mu.Unlock()
-		return nil // dropped meanwhile (reset, refused, server going away)
+		return nil // dropped meanwhile (reset, refused, server going away), or already finishing
 	}
+	// Finishing from here on, so nothing the client sends starts it again
+	// while the lookup runs.
+	s.finishing = true
 	// s.body is not written again: the client ended the stream, and so its
 	// trailers are final too.
 	original := s.body.Bytes()

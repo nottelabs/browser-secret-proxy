@@ -2,6 +2,10 @@ package h2relay
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -92,6 +96,26 @@ func (g *gatedResolver) waitStarted(t *testing.T, want string) {
 	}
 }
 
+// waitStartedSet waits for lookups of want to start, in any order.
+func (g *gatedResolver) waitStartedSet(t *testing.T, want ...string) {
+	t.Helper()
+	left := map[string]bool{}
+	for _, w := range want {
+		left[w] = true
+	}
+	for len(left) > 0 {
+		select {
+		case got := <-g.started:
+			if !left[got] {
+				t.Fatalf("unexpected lookup for %s", got)
+			}
+			delete(left, got)
+		case <-time.After(waitFor):
+			t.Fatalf("lookups for %v did not start", left)
+		}
+	}
+}
+
 func (g *gatedResolver) waitCanceled(t *testing.T, want string) {
 	t.Helper()
 	select {
@@ -155,9 +179,11 @@ func TestUpstreamIDsFollowOpeningOrder(t *testing.T) {
 	g := newGatedResolver("a", "b")
 	h := newHarness(t, gated(t, g, 0))
 	dec := hpack.NewDecoder(4096, nil)
+	// Each lookup is seen to start before the next request is sent: the
+	// order lookup goroutines run in is not the client's.
 	getPath(h, 1, "/?k=tok_a")
-	getPath(h, 3, "/?k=tok_b")
 	g.waitStarted(t, "tok_a")
+	getPath(h, 3, "/?k=tok_b")
 	g.waitStarted(t, "tok_b")
 	getPath(h, 5, "/plain")
 	g.release("b")
@@ -256,8 +282,7 @@ func TestShutdownCancelsLookups(t *testing.T) {
 	h := newHarness(t, gated(t, g, 0))
 	getPath(h, 1, "/?k=tok_a")
 	getPath(h, 3, "/?k=tok_b")
-	g.waitStarted(t, "tok_a")
-	g.waitStarted(t, "tok_b")
+	g.waitStartedSet(t, "tok_a", "tok_b")
 	_ = h.client.Close()
 	_ = h.result()
 	canceled := map[string]bool{}
@@ -318,5 +343,99 @@ func TestLocalLookupsKeepTheClientsOrder(t *testing.T) {
 		if p := serverPath(t, dec, h.expect(h.toServer, "server", isType(FrameHeaders))); p != want {
 			t.Fatalf("server got %s, want %s", p, want)
 		}
+	}
+}
+
+// A client ending a stream again while its lookup runs (DATA or HEADERS
+// with END_STREAM after the first) gets RST_STREAM STREAM_CLOSED: no second
+// lookup starts, the stream's lookup is canceled, and nothing goes upstream.
+func TestFramesAfterTheEndAreAStreamError(t *testing.T) {
+	for name, extra := range map[string]func(h *harness) Frame{
+		"data": func(*harness) Frame { return Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1} },
+		"headers": func(h *harness) Frame {
+			return Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(hpack.HeaderField{Name: "x-t", Value: "1"})}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newGatedResolver("a")
+			h := newHarness(t, gated(t, g, 0))
+			h.clientSend(
+				Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
+				Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte("card=tok_a")},
+			)
+			g.waitStarted(t, "tok_a")
+			for i := 0; i < 20; i++ {
+				h.clientSend(extra(h))
+			}
+			f := h.expect(h.toClient, "client", func(f Frame) bool { return f.Type == FrameRSTStream && f.Stream == 1 })
+			if code := binary.BigEndian.Uint32(f.Payload); code != errCodeStreamClosed {
+				t.Fatalf("RST_STREAM code %d, want STREAM_CLOSED", code)
+			}
+			g.waitCanceled(t, "tok_a")
+			select {
+			case s := <-g.started:
+				t.Fatalf("another lookup (%s) started", s)
+			case <-time.After(50 * time.Millisecond):
+			}
+			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+			h.settle("frames after the end")
+		})
+	}
+}
+
+// Stream errors past maxStreamErrors end the connection with PROTOCOL_ERROR.
+func TestRepeatedStreamErrorsEndTheConnection(t *testing.T) {
+	h := newHarness(t, nil)
+	for i := 0; i <= maxStreamErrors; i++ {
+		id := uint32(2*i + 1)
+		h.clientSend(
+			Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: id, Payload: h.clientBlock(request("GET")...)},
+			Frame{Type: FrameData, Flags: FlagEndStream, Stream: id},
+		)
+	}
+	h.expect(h.toClient, "client", isGoAway(errCodeProtocol))
+	if err := h.result(); !errors.Is(err, errTooManyStreamErrors) {
+		t.Fatalf("relay error %v", err)
+	}
+}
+
+// Lookups waiting for a slot have no goroutine: many streams waiting on a
+// slow resolver cost MaxLookups goroutines, not one each.
+func TestWaitingLookupsHaveNoGoroutine(t *testing.T) {
+	names := make([]string, 40)
+	for i := range names {
+		names[i] = fmt.Sprintf("n%d", i)
+	}
+	g := newGatedResolver(names...)
+	h := newHarness(t, gated(t, g, 2))
+	before := runtime.NumGoroutine()
+	for i, n := range names {
+		getPath(h, uint32(2*i+1), "/?k=tok_"+n)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-g.started:
+		case <-time.After(waitFor):
+			t.Fatal("lookups did not start")
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if grown := runtime.NumGoroutine() - before; grown > 5 {
+		t.Fatalf("%d goroutines for 40 waiting lookups with 2 slots", grown)
+	}
+	h.r.mu.Lock()
+	running, waiting := h.r.lookupsRunning, len(h.r.lookupQueue)
+	h.r.mu.Unlock()
+	if running != 2 || waiting != 38 {
+		t.Fatalf("%d running, %d waiting; want 2 and 38", running, waiting)
+	}
+	// A stream reset while waiting leaves the queue.
+	h.clientSend(rstStream(39, errCodeCancel))
+	time.Sleep(50 * time.Millisecond)
+	h.r.mu.Lock()
+	waiting = len(h.r.lookupQueue)
+	h.r.mu.Unlock()
+	if waiting != 37 {
+		t.Fatalf("%d waiting after a reset, want 37", waiting)
 	}
 }

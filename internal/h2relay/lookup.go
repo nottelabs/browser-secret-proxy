@@ -2,6 +2,8 @@ package h2relay
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -12,6 +14,12 @@ import (
 // DefaultMaxLookups is the default bound on resolver lookups in flight on
 // one connection.
 const DefaultMaxLookups = 16
+
+// maxStreamErrors bounds the stream errors a client may cause on one
+// connection (frames on streams it ended) before the connection ends.
+const maxStreamErrors = 64
+
+var errTooManyStreamErrors = errors.New("client sent too many frames on streams it had ended")
 
 // Resolver lookups that can wait (the http resolver, up to its timeout) run
 // off clientLoop, so a slow one holds back only its own stream. Lookups
@@ -51,34 +59,99 @@ func (r *relay) resolveLookup(s *stream, lookup *scope.Lookup, done func(*swap.S
 // goroutine. Once it has an answer, and only if the stream is still current
 // and the lookup was not canceled, done runs on that goroutine with the
 // result; an error done returns is an I/O error that ends the connection.
+//
+// At most MaxLookups lookups run at once, each on a goroutine; the others
+// wait in lookupQueue, in order, with no goroutine of their own. A stream
+// has at most two lookups (its request, and an extended CONNECT's
+// trailers), and a dropped stream's waiting lookups leave the queue, so the
+// queue is bounded by the open streams (MaxStreams).
 func (r *relay) lookupLocked(s *stream, lookup *scope.Lookup, done func(*swap.Swapper, error) error) {
 	if s.lookupCtx == nil {
 		s.lookupCtx, s.lookupCancel = context.WithCancel(r.ctx)
 	}
-	ctx := s.lookupCtx
-	r.lookups.Add(1)
-	go func() {
-		defer r.lookups.Done()
+	r.lookupQueue = append(r.lookupQueue, pendingLookup{s: s, lookup: lookup, done: done})
+	r.startLookupsLocked()
+}
+
+// pendingLookup is a lookup waiting for a free slot.
+type pendingLookup struct {
+	s      *stream
+	lookup *scope.Lookup
+	done   func(*swap.Swapper, error) error
+}
+
+// startLookupsLocked starts waiting lookups while slots are free.
+func (r *relay) startLookupsLocked() {
+	for r.lookupsRunning < r.opts.MaxLookups && len(r.lookupQueue) > 0 && !r.closed {
+		p := r.lookupQueue[0]
+		r.lookupQueue = r.lookupQueue[1:]
+		r.lookupsRunning++
+		r.lookups.Add(1)
+		go r.runLookup(p.s.lookupCtx, p)
+	}
+}
+
+// dropLookupsLocked removes a dropped stream's waiting lookups.
+func (r *relay) dropLookupsLocked(s *stream) {
+	kept := r.lookupQueue[:0]
+	for _, p := range r.lookupQueue {
+		if p.s != s {
+			kept = append(kept, p)
+		}
+	}
+	clear(r.lookupQueue[len(kept):])
+	r.lookupQueue = kept
+}
+
+func (r *relay) runLookup(ctx context.Context, p pendingLookup) {
+	defer r.lookups.Done()
+	swapper, err := p.lookup.Swapper(ctx)
+	r.mu.Lock()
+	r.lookupsRunning--
+	r.startLookupsLocked()
+	current := r.streams[p.s.clientID] == p.s && ctx.Err() == nil
+	r.mu.Unlock()
+	if !current {
+		return // dropped, or the relay ended: nothing more to do
+	}
+	if err := p.done(swapper, err); err != nil {
 		select {
-		case r.lookupSlots <- struct{}{}:
-		case <-ctx.Done():
-			return
+		case r.asyncErrs <- err:
+		default:
 		}
-		swapper, err := lookup.Swapper(ctx)
-		<-r.lookupSlots
-		r.mu.Lock()
-		current := r.streams[s.clientID] == s && ctx.Err() == nil
+	}
+}
+
+// endedStream handles a frame the client sent on a stream after ending it:
+// a stream error of type STREAM_CLOSED (RFC 9113 5.1), which resets the
+// stream on both sides, and cancels its lookup. Such a frame never starts
+// another lookup or reaches the server. Past maxStreamErrors, the
+// connection ends with PROTOCOL_ERROR.
+func (r *relay) endedStream(s *stream, credit int) error {
+	r.streamErrors++
+	if r.streamErrors > maxStreamErrors {
+		return r.connectionError(errCodeProtocol, errTooManyStreamErrors)
+	}
+	if err := r.creditClient(0, credit, false); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.streams[s.clientID] != s {
 		r.mu.Unlock()
-		if !current {
-			return // dropped, or the relay ended: nothing more to do
+		return nil
+	}
+	serverID := s.serverID
+	r.dropLocked(s)
+	if serverID != 0 {
+		r.forgetResetLocked(s)
+	}
+	r.mu.Unlock()
+	if serverID != 0 {
+		if err := r.writeServer(Frame{Type: FrameRSTStream, Stream: serverID, Payload: binary.BigEndian.AppendUint32(nil, errCodeCancel)}); err != nil {
+			return err
 		}
-		if err := done(swapper, err); err != nil {
-			select {
-			case r.asyncErrs <- err:
-			default:
-			}
-		}
-	}()
+	}
+	return r.writeClient(Frame{Type: FrameRSTStream, Stream: s.clientID, Payload: binary.BigEndian.AppendUint32(nil, errCodeStreamClosed)})
 }
 
 // refuseLookup answers a stream whose lookup refused the request with 502,
