@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"path"
 	"runtime"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/h1relay"
 	"github.com/nottelabs/browser-secret-proxy/internal/h2relay"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
@@ -52,6 +54,16 @@ type Config struct {
 	Detector *resolve.Detector
 	// Dialer reaches destinations, directly or through a parent proxy.
 	Dialer upstream.Dialer
+	// AllowPrivateDestinations lets CONNECT reach loopback, private,
+	// link-local and other internal addresses. Without it, the proxy
+	// resolves each destination itself, refuses it with 403 when any of its
+	// addresses is internal, and dials the addresses it checked.
+	AllowPrivateDestinations bool
+	// ParentProxy reports that Dialer goes through a parent proxy, which
+	// resolves destination names itself: only IP literals are then checked.
+	ParentProxy bool
+	// lookup resolves a destination name (default net.DefaultResolver).
+	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 	// Username and Password, when Username is set, are required as
 	// Proxy-Authorization Basic credentials on every CONNECT, unless the
 	// Resolver is a resolve.Authenticator, which then checks every CONNECT's
@@ -67,6 +79,10 @@ type Config struct {
 	// MaskResponses replaces real values resolved for a connection's
 	// principal with their stand-ins in responses on allowlisted hosts.
 	MaskResponses bool
+	// MaskStreamWindow is what masking holds back of a streamed response
+	// (default mask.Fixed). mask.Minimal lets a destination that reflects
+	// input reveal real values through the framing of its responses.
+	MaskStreamWindow mask.Window
 	// HandshakeTimeout bounds a connection's CONNECT head, destination dial
 	// and TLS handshakes together (default 30s).
 	HandshakeTimeout time.Duration
@@ -117,7 +133,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = 10 * time.Second
 	}
-	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Mask: cfg.MaskResponses, Logger: cfg.Logger})
+	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Mask: cfg.MaskResponses, MaskWindow: cfg.MaskStreamWindow, Logger: cfg.Logger})
 	if err != nil {
 		return nil, err
 	}
@@ -286,8 +302,14 @@ func (s *Server) handle(conn net.Conn) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.HandshakeTimeout)
 	defer cancel()
-	upConn, err := s.cfg.Dialer.DialContext(ctx, "tcp", target)
+	upConn, err := s.dial(ctx, host, port)
 	if err != nil {
+		var refused *destinationError
+		if errors.As(err, &refused) {
+			log.Warn("refusing an internal destination", "address", refused.addr, "reason", refused.reason, "principal", principal.ID)
+			writeStatus(conn, http.StatusForbidden, "destination is a private or internal address\n")
+			return
+		}
 		log.Error("cannot reach the destination", "error", err)
 		writeStatus(conn, http.StatusBadGateway, "cannot reach "+target+"\n")
 		return
@@ -303,7 +325,7 @@ func (s *Server) handle(conn net.Conn) {
 	}
 
 	if !s.cfg.Hosts.Match(host) {
-		log.Debug("tunneling without decryption")
+		log.Info("tunneling without decryption", "principal", principal.ID)
 		_ = conn.SetDeadline(time.Time{})
 		idle.start(log, conn, upConn)
 		tunnel(&readerConn{Conn: conn, r: br}, upConn)

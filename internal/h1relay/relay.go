@@ -160,8 +160,8 @@ func (p *progress) wait(n int) bool {
 type exchange struct {
 	unsolicited bool // a response no request asked for, such as a 408
 	method      string
-	// switching requests (Upgrade, CONNECT) learn here whether the server
-	// switched the connection to another protocol.
+	// switching requests (a WebSocket upgrade, the only one sent) learn here
+	// whether the server switched the connection to another protocol.
 	switching bool
 	upgrade   bool // the request carried Upgrade, so a 101 may answer it
 	switched  chan bool
@@ -229,7 +229,7 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 
 		host, contentType := "", ""
 		hosts := 0
-		upgrade, expectContinue := false, false
+		upgrade, otherUpgrade, expectContinue := false, false, false
 		for _, h := range headers {
 			switch h.name {
 			case "host":
@@ -239,9 +239,21 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 				contentType = h.value
 			case "upgrade":
 				upgrade = true
+				otherUpgrade = otherUpgrade || !websocketOnly(h.value)
 			case "expect":
 				expectContinue = strings.EqualFold(h.value, "100-continue")
 			}
+		}
+		// A tunnel passes the server's answer and the rest of the connection
+		// through raw, neither swapped nor masked. Only a WebSocket needs
+		// one; a CONNECT (which any catch-all handler answers 200) or
+		// another upgrade (h2c, after which the server answers this very
+		// request) is refused before anything is swapped.
+		switch {
+		case strings.EqualFold(parts[0], "CONNECT"):
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: CONNECT inside an intercepted connection", scope.ErrRefused))
+		case otherUpgrade:
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: an upgrade to another protocol than WebSocket", scope.ErrRefused))
 		}
 		// The body is framed as the server will frame it, and the head is
 		// split into the lines the server will see, or the request is
@@ -259,7 +271,7 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: more than one Host header", scope.ErrRefused))
 		}
 		authorities := []string{host}
-		if authority, ok := targetAuthority(parts[0], parts[1]); ok {
+		if authority, ok := targetAuthority(parts[1]); ok {
 			authorities = append(authorities, authority)
 		}
 		if err := opts.Session.CheckAuthority(authorities...); err != nil {
@@ -372,7 +384,7 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 			opts.Logger.Info("swapped stand-ins in a request", "host", host, "parts", swapped)
 		}
 		ex := &exchange{method: strings.ToUpper(parts[0]), upgrade: upgrade}
-		if upgrade || ex.method == "CONNECT" {
+		if upgrade {
 			ex.switching, ex.switched = true, make(chan bool, 1)
 		}
 		// Queued before the request is sent, so its response finds it.
@@ -387,7 +399,7 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 		}
 		if ex.switching {
 			// Wait for the server's answer: only a switch makes the rest
-			// of the connection a raw stream (a WebSocket, a tunnel). After
+			// of the connection a raw stream (a WebSocket). After
 			// a refusal the client sends HTTP requests again, which are
 			// swapped as usual.
 			select {
@@ -552,6 +564,22 @@ func readBody(r io.Reader, n int) ([]byte, error) {
 	return body, nil
 }
 
+// websocketOnly reports whether an Upgrade value offers WebSocket and no
+// other protocol (RFC 6455 4.1: the token is case-insensitive).
+func websocketOnly(value string) bool {
+	offered := false
+	for token := range strings.SplitSeq(value, ",") {
+		switch token = strings.TrimSpace(token); {
+		case token == "": // an empty list element (RFC 9110 5.6.1)
+		case strings.EqualFold(token, "websocket"):
+			offered = true
+		default:
+			return false
+		}
+	}
+	return offered
+}
+
 // framing checks a request head that a server could read differently from
 // the relay, and returns how its body is framed: chunked, or its
 // Content-Length (-1 when absent). It refuses, as RFC 9112 allows or
@@ -687,16 +715,13 @@ func swappableText(target string, headers []header, contentType string, body []b
 }
 
 // targetAuthority returns the authority a request target names, if any: the
-// target of a CONNECT (authority-form), or the authority of an absolute-form
-// target ("https://host/path"). An origin-form ("/path") or asterisk-form
-// ("*") target names none. Any other target names an empty authority, which
-// no connection is opened to.
-func targetAuthority(method, target string) (string, bool) {
-	switch {
-	case strings.HasPrefix(target, "/") || target == "*":
+// authority of an absolute-form target ("https://host/path"). An origin-form
+// ("/path") or asterisk-form ("*") target names none. Any other target
+// (authority-form is CONNECT's, which is refused) names an empty authority,
+// which no connection is opened to.
+func targetAuthority(target string) (string, bool) {
+	if strings.HasPrefix(target, "/") || target == "*" {
 		return "", false
-	case method == "CONNECT":
-		return target, true
 	}
 	_, rest, ok := strings.Cut(target, "://")
 	if !ok {
@@ -741,14 +766,16 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 		}
 		// A 101 turns the rest of the connection into a raw stream that is
 		// neither swapped nor masked, so only a request that asked to
-		// upgrade may get one (RFC 9110 15.2.2). Any other 101 is refused.
+		// upgrade (to a WebSocket, the only upgrade sent) may get one (RFC
+		// 9110 15.2.2). Any other 101 is refused. Nothing else switches: a
+		// 2xx is an ordinary response, masked like any other.
 		if status == 101 && !current.upgrade {
 			opts.Logger.Warn("refusing a 101 to a request that did not ask to upgrade")
 			body := "secret-proxy: unrequested protocol switch\n"
 			_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 			return errRefused
 		}
-		switched := status == 101 || current.method == "CONNECT" && status >= 200 && status < 300
+		switched := status == 101
 		// Values resolved before this response's request was sent are on
 		// record by now.
 		masker := opts.Session.Masker()

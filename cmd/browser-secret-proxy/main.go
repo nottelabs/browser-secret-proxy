@@ -19,6 +19,7 @@ import (
 
 	"github.com/nottelabs/browser-secret-proxy/internal/certs"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/proxy"
 	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
 )
@@ -99,10 +100,15 @@ func run() error {
 		Password:       os.Getenv("SECRET_PROXY_PASSWORD"),
 		Logger:         logger,
 		// Real values in responses are replaced by their stand-ins.
-		MaskResponses: opts.maskResponses,
-		HeaderTimeout: opts.headerTimeout,
-		IdleTimeout:   opts.idleTimeout,
-		MaxConns:      opts.maxConns,
+		MaskResponses:    opts.maskResponses,
+		MaskStreamWindow: *opts.maskWindow,
+		// Internal destinations are refused unless allowed. A parent proxy
+		// resolves names itself, so only IP literals are checked then.
+		AllowPrivateDestinations: opts.allowPrivate,
+		ParentProxy:              parentURL != nil,
+		HeaderTimeout:            opts.headerTimeout,
+		IdleTimeout:              opts.idleTimeout,
+		MaxConns:                 opts.maxConns,
 	})
 	if err != nil {
 		return err
@@ -114,7 +120,7 @@ func run() error {
 	parentDescription := describeParent(parentURL)
 	attrs := append([]any{"address", ln.Addr().String(), "hosts", opts.hosts}, values.logAttrs...)
 	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed",
-		"mask_responses", opts.maskResponses, "idle_timeout", opts.idleTimeout.String(), "max_conns", opts.maxConns)
+		"mask_responses", opts.maskResponses, "mask_stream_window", opts.maskWindow.String(), "allow_private_destinations", opts.allowPrivate, "idle_timeout", opts.idleTimeout.String(), "max_conns", opts.maxConns)
 	logger.Info("listening", attrs...)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,6 +138,14 @@ func run() error {
 	return server.Serve(ln)
 }
 
+// registerMaskStreamWindow registers -mask-stream-window on fs. An unknown
+// value fails the parse, so the proxy does not start.
+func registerMaskStreamWindow(fs *flag.FlagSet) *mask.Window {
+	w := new(mask.Window)
+	fs.TextVar(w, "mask-stream-window", mask.Fixed, "what masking holds back of a streamed response: fixed (a window of bytes, whatever they are) or minimal (only bytes that could begin a real value: lower latency, but an allowlisted host that reflects input can then reveal real values; see the README)")
+	return w
+}
+
 // describeParent names the parent proxy for logs: scheme and host only.
 // Credentials are left out entirely; a minted username can carry session
 // details, so even url.Redacted, which hides only the password, is not used.
@@ -146,9 +160,11 @@ func describeParent(u *url.URL) string {
 type options struct {
 	listen, caCert, caKey, hosts, parent string
 	resolver                             *resolverFlags
+	maskWindow                           *mask.Window
 	maskResponses, verbose, showVersion  bool
 	idleTimeout, headerTimeout           time.Duration
 	maxConns                             int
+	allowPrivate                         bool
 }
 
 // newFlagSet defines the command line. No default comes from the
@@ -167,6 +183,8 @@ func newFlagSet(name string, handling flag.ErrorHandling) (*flag.FlagSet, *optio
 	fs.DurationVar(&o.idleTimeout, "idle-timeout", 5*time.Minute, "close a connection after this long without traffic either way (0 never)")
 	fs.DurationVar(&o.headerTimeout, "header-timeout", 10*time.Second, "longest time to receive the CONNECT head, and each HTTP/1.1 request head from its first byte")
 	fs.IntVar(&o.maxConns, "max-conns", 1024, "most client connections handled at once (0 no limit)")
+	fs.BoolVar(&o.allowPrivate, "allow-private-destinations", false, "let CONNECT reach loopback, private, link-local and other internal addresses")
+	o.maskWindow = registerMaskStreamWindow(fs)
 	fs.BoolVar(&o.verbose, "v", false, "debug logging")
 	fs.BoolVar(&o.showVersion, "version", false, "print the version and exit")
 	fs.Usage = func() {
