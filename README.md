@@ -93,7 +93,7 @@ proxy's client certificate (OpenSSL 3):
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
   -subj "/CN=detokenize CA" -keyout resolver-ca.key -out resolver-ca.pem
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
-  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,DNS:host.docker.internal" \
   -CA resolver-ca.pem -CAkey resolver-ca.key \
   -keyout service.key -out service.pem
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
@@ -188,6 +188,17 @@ docker run --rm -p 8080:8080 \
 ```
 
 The image runs as UID 65532, so mounted files must be readable by that user.
+
+In `http` mode, `localhost` inside the container is the container itself,
+so the proxy cannot reach a resolver running on your machine at
+`localhost:8443`:
+
+- Docker Desktop and OrbStack: use
+  `-resolver-url https://host.docker.internal:8443/v1/detokenize`. The
+  service certificate from step 2 already lists `host.docker.internal`.
+- Linux: run the container with `--network host` (drop `-p 8080:8080` and
+  add `-listen 127.0.0.1:8080`), so `https://localhost:8443` works as in
+  step 2.
 
 ### 4. Try it locally
 
