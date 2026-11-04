@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2/hpack"
 )
 
 // Frame types the server may send that the relay drops (RFC 7838, RFC 8336,
@@ -154,4 +156,27 @@ func TestBadServerPingEndsTheConnection(t *testing.T) {
 	if err := h.result(); err == nil || !strings.Contains(err.Error(), "bad PING") {
 		t.Fatalf("relay error %v", err)
 	}
+}
+
+// A write to the server can be stuck while the server does not read (an
+// upload it stopped taking) and holds serverMu. A server PING then must not
+// stop the relay reading the server: the response after it still reaches the
+// client, and the PING's ACK goes out once the write is through.
+func TestServerPingWhileAServerWriteIsStuck(t *testing.T) {
+	eachMode(t, func(t *testing.T, mutate func(*Options)) {
+		h := newHarness(t, mutate)
+		serverID := get(h, 1)
+		h.r.serverMu.Lock() // the stuck write
+		locked := true
+		t.Cleanup(func() {
+			if locked {
+				h.r.serverMu.Unlock()
+			}
+		})
+		h.serverSend(ping(0, "srvping1"), status(h, serverID, true, hpack.HeaderField{Name: ":status", Value: "200"}))
+		h.expect(h.toClient, "client", isType(FrameHeaders))
+		locked = false
+		h.r.serverMu.Unlock()
+		h.expect(h.toServer, "server", isPing(FlagAck, "srvping1"))
+	})
 }

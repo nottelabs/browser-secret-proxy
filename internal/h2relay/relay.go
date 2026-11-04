@@ -149,12 +149,16 @@ type relay struct {
 	enc         *hpack.Encoder
 	encBuf      bytes.Buffer
 	dec         *hpack.Decoder // used by the client reader only
-	// PING (control.go). Guarded by serverMu: clientStarted is set once the
-	// client's first SETTINGS went upstream, and pingAcks holds the relay's
-	// answers to server PINGs until then. pings is the data of the client's
-	// PINGs the server has not acknowledged, oldest first (guarded by mu).
+	// PING (control.go). clientStarted (guarded by serverMu) is set once the
+	// client's first SETTINGS went upstream. pingAcks (guarded by ackMu,
+	// taken after serverMu when both are held) holds the relay's answers to
+	// server PINGs until ackLoop, or the client's first SETTINGS, sends
+	// them; ackReady wakes ackLoop. pings is the data of the client's PINGs
+	// the server has not acknowledged, oldest first (guarded by mu).
 	clientStarted bool
+	ackMu         sync.Mutex
 	pingAcks      []Frame
+	ackReady      chan struct{}
 	pings         [][8]byte
 
 	mu           sync.Mutex
@@ -310,6 +314,7 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.asyncErrs = make(chan error, 1)
+	r.ackReady = make(chan struct{}, 1)
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
@@ -334,7 +339,7 @@ var errNoServerPreface = errors.New("server sent no SETTINGS frame in time")
 var errHeldFrames = errors.New("too many frames waiting for the server's SETTINGS")
 
 func (r *relay) run() error {
-	errs := make(chan error, 3)
+	errs := make(chan error, 4)
 	timeout := make(chan error, 1)
 	timer := time.AfterFunc(r.opts.PrefaceTimeout, func() {
 		// No clientMu here: a writer stuck on a client that stopped reading
@@ -344,10 +349,10 @@ func (r *relay) run() error {
 		}
 	})
 	defer timer.Stop()
-	pending := 3
+	pending := 4
 	if r.masking {
-		errs = make(chan error, 4)
-		pending = 4
+		errs = make(chan error, 5)
+		pending = 5
 		go func() { errs <- r.serverLoopMasked() }()
 		go func() { errs <- r.clientSendLoop() }()
 	} else {
@@ -355,6 +360,7 @@ func (r *relay) run() error {
 	}
 	go func() { errs <- r.clientLoop() }()
 	go func() { errs <- r.sendLoop() }()
+	go func() { errs <- r.ackLoop() }()
 	var first error
 	select {
 	case first = <-errs:

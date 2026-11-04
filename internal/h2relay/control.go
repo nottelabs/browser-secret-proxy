@@ -2,6 +2,7 @@ package h2relay
 
 import (
 	"errors"
+	"net"
 	"slices"
 )
 
@@ -16,8 +17,8 @@ import (
 // data always comes from the client.
 
 // maxUnackedPings bounds the client PINGs remembered until the server
-// acknowledges them, and the relay's answers waiting for the client's
-// SETTINGS. A browser has one PING out at a time.
+// acknowledges them, and the relay's answers to server PINGs waiting to go
+// upstream. A browser has one PING out at a time.
 const maxUnackedPings = 64
 
 // forwardClientSettings sends a client SETTINGS frame upstream. The first
@@ -26,8 +27,11 @@ const maxUnackedPings = 64
 func (r *relay) forwardClientSettings(f Frame) error {
 	r.serverMu.Lock()
 	defer r.serverMu.Unlock()
+	r.ackMu.Lock()
 	frames := append([]Frame{f}, r.pingAcks...)
-	r.pingAcks, r.clientStarted = nil, true
+	r.pingAcks = nil
+	r.ackMu.Unlock()
+	r.clientStarted = true
 	_, err := r.server.Write(encodeFrames(frames))
 	return err
 }
@@ -57,7 +61,8 @@ func (r *relay) onServerPing(f Frame) error {
 		return errors.New("server sent a bad PING")
 	}
 	if f.Flags&FlagAck == 0 {
-		return r.answerPing(f.Payload)
+		r.answerPing(f.Payload)
+		return nil
 	}
 	r.mu.Lock()
 	i := slices.Index(r.pings, [8]byte(f.Payload))
@@ -71,19 +76,53 @@ func (r *relay) onServerPing(f Frame) error {
 	return r.writeClient(f)
 }
 
-// answerPing acknowledges a server PING (RFC 9113 6.7). Before the client's
-// SETTINGS went upstream the answer waits for them; past maxUnackedPings
-// waiting, more are not answered.
-func (r *relay) answerPing(payload []byte) error {
-	ack := Frame{Type: FramePing, Flags: FlagAck, Payload: payload}
+// answerPing acknowledges a server PING (RFC 9113 6.7). The answer is
+// queued for ackLoop, not written here: a write to a server that stopped
+// reading (an upload) can hold serverMu, and the server loop must go on
+// reading the server meanwhile, or a server that stops reading until its
+// response is read would never get it. Past maxUnackedPings waiting, more
+// are not answered.
+func (r *relay) answerPing(payload []byte) {
+	r.ackMu.Lock()
+	if len(r.pingAcks) < maxUnackedPings {
+		r.pingAcks = append(r.pingAcks, Frame{Type: FramePing, Flags: FlagAck, Payload: payload})
+	}
+	r.ackMu.Unlock()
+	select {
+	case r.ackReady <- struct{}{}:
+	default: // ackLoop is already due to run
+	}
+}
+
+// ackLoop sends the relay's answers to server PINGs upstream. Before the
+// client's SETTINGS went upstream they wait for them (forwardClientSettings
+// sends them after).
+func (r *relay) ackLoop() error {
+	for {
+		select {
+		case <-r.ctx.Done():
+			return net.ErrClosed
+		case <-r.ackReady:
+		}
+		if err := r.writeAcks(); err != nil {
+			return err
+		}
+	}
+}
+
+func (r *relay) writeAcks() error {
 	r.serverMu.Lock()
 	defer r.serverMu.Unlock()
 	if !r.clientStarted {
-		if len(r.pingAcks) < maxUnackedPings {
-			r.pingAcks = append(r.pingAcks, ack)
-		}
 		return nil
 	}
-	_, err := r.server.Write(encodeFrames([]Frame{ack}))
+	r.ackMu.Lock()
+	acks := r.pingAcks
+	r.pingAcks = nil
+	r.ackMu.Unlock()
+	if len(acks) == 0 {
+		return nil
+	}
+	_, err := r.server.Write(encodeFrames(acks))
 	return err
 }
