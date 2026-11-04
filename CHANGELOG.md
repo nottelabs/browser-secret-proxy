@@ -64,6 +64,14 @@ First release, planned as 0.1.0.
   (`gzip`, `deflate`, `br`, `zstd`) are decoded to be masked and sent
   without a content-coding; a response that cannot be masked is answered
   `502`.
+- Response masking closes gaps where a real value reached the client: every
+  `206` partial response is refused, so a client cannot rebuild a value
+  from ranges masked one by one; the HTTP/1.1 reason phrase is masked; a
+  real value in an HTTP/1.1 framing header (`Connection`, `Keep-Alive`,
+  `Trailer`, `Upgrade`, ...), an HTTP/1.1 `101` to a request that did not
+  ask to upgrade, and an HTTP/2 field name with an upper-case letter are
+  refused with `502`; content in HTTP/2 DATA on a `HEAD`, `204` or `304`
+  response resets the stream.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).
