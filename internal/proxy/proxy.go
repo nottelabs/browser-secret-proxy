@@ -37,6 +37,7 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/h1relay"
 	"github.com/nottelabs/browser-secret-proxy/internal/h2relay"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
@@ -76,7 +77,11 @@ type Config struct {
 	ResolveTimeout time.Duration
 	// MaskResponses replaces real values resolved for a connection's
 	// principal with their stand-ins in responses on allowlisted hosts.
-	MaskResponses    bool
+	MaskResponses bool
+	// MaskStreamWindow is what masking holds back of a streamed response
+	// (default mask.Fixed). mask.Minimal lets a destination that reflects
+	// input reveal real values through the framing of its responses.
+	MaskStreamWindow mask.Window
 	HandshakeTimeout time.Duration
 	Logger           *slog.Logger
 }
@@ -112,7 +117,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 30 * time.Second
 	}
-	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Mask: cfg.MaskResponses, Logger: cfg.Logger})
+	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Mask: cfg.MaskResponses, MaskWindow: cfg.MaskStreamWindow, Logger: cfg.Logger})
 	if err != nil {
 		return nil, err
 	}

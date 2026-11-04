@@ -43,6 +43,9 @@ const (
 	SettingMaxConcurrentStreams uint16 = 0x3
 	SettingInitialWindowSize    uint16 = 0x4
 	SettingMaxFrameSize         uint16 = 0x5
+	// SettingEnableConnectProtocol is RFC 8441's
+	// SETTINGS_ENABLE_CONNECT_PROTOCOL.
+	SettingEnableConnectProtocol uint16 = 0x8
 )
 
 const (
