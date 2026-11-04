@@ -24,8 +24,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"path"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +37,7 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/h2relay"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
@@ -171,7 +170,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		go func() {
 			defer s.wg.Done()
 			defer s.active.Add(-1)
-			defer s.recoverHandler(conn)
+			defer panics.Recover(s.recoverHandler(conn))
 			s.handle(conn)
 		}()
 	}
@@ -216,38 +215,16 @@ func (s *Server) shutdown() {
 	}
 }
 
-// recoverHandler stops a panic in a connection handler from ending the
-// process: the handler's deferred calls have closed its connections, and the
-// others go on. The panic value is not logged, as it could hold anything a
-// request carried; the code location is.
-func (s *Server) recoverHandler(conn net.Conn) {
-	if r := recover(); r != nil {
+// recoverHandler, deferred, stops a panic in a connection handler from
+// ending the process: the handler's deferred calls have closed its
+// connections, and the others go on. The panic value is not logged, as it
+// could hold anything a request carried; the code location is.
+func (s *Server) recoverHandler(conn net.Conn) func(*panics.Error) {
+	return func(p *panics.Error) {
 		_ = conn.Close()
 		s.cfg.Logger.Error("connection handler panicked; closed its connection",
-			"client", conn.RemoteAddr().String(), "panic_type", fmt.Sprintf("%T", r), "at", panicSite())
+			"client", conn.RemoteAddr().String(), "panic_type", p.Type, "at", p.Site)
 	}
-}
-
-// panicSite names the innermost functions of a panicking goroutine, with
-// their file and line. Called from a deferred function, it skips the frames
-// of the deferred calls and of the runtime.
-func panicSite() string {
-	pcs := make([]uintptr, 32)
-	frames := runtime.CallersFrames(pcs[:runtime.Callers(1, pcs)])
-	var sites []string
-	panicking := false
-	for len(sites) < 4 {
-		frame, more := frames.Next()
-		if frame.Function == "runtime.gopanic" {
-			panicking = true
-		} else if panicking && !strings.HasPrefix(frame.Function, "runtime.") {
-			sites = append(sites, fmt.Sprintf("%s (%s:%d)", frame.Function, path.Base(frame.File), frame.Line))
-		}
-		if !more {
-			break
-		}
-	}
-	return strings.Join(sites, " < ")
 }
 
 func (s *Server) handle(conn net.Conn) {
@@ -328,7 +305,7 @@ func (s *Server) handle(conn net.Conn) {
 		log.Info("tunneling without decryption", "principal", principal.ID)
 		_ = conn.SetDeadline(time.Time{})
 		idle.start(log, conn, upConn)
-		tunnel(&readerConn{Conn: conn, r: br}, upConn)
+		tunnel(log, &readerConn{Conn: conn, r: br}, upConn)
 		return
 	}
 	s.intercept(ctx, log, conn, br, upConn, idle, host, s.scope.Session(principal, host))
@@ -528,12 +505,10 @@ const (
 // completes the handshake with the destination. uTLS checks some of its
 // invariants with panics, which replay turns into a ReplayError.
 func (s *Server) replay(ctx context.Context, log *slog.Logger, upConn net.Conn, host string, recordVersion uint16, message []byte, original *clienthello.Hello) (uconn *utls.UConn, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error("uTLS panicked on the client's ClientHello", "panic_type", fmt.Sprintf("%T", r), "at", panicSite())
-			uconn, err = nil, &ReplayError{Reason: "uTLS failed on it unexpectedly"}
-		}
-	}()
+	defer panics.Recover(func(p *panics.Error) {
+		log.Error("uTLS panicked on the client's ClientHello", "panic_type", p.Type, "at", p.Site)
+		uconn, err = nil, &ReplayError{Reason: "uTLS failed on it unexpectedly"}
+	})
 	uconn, err = rebuild(upConn, host, recordVersion, message, original, s.cfg.RootCAs)
 	if err != nil {
 		return nil, err
@@ -639,16 +614,23 @@ type readerConn struct {
 
 func (c *readerConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
-func tunnel(a, b net.Conn) {
+// tunnel copies between a and b in both directions until both have ended.
+// A panic in either copy closes both connections, which ends the other.
+func tunnel(log *slog.Logger, a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
+		defer func() { done <- struct{}{} }()
+		defer panics.Recover(func(p *panics.Error) {
+			_ = a.Close()
+			_ = b.Close()
+			log.Error("tunnel panicked; closed the connection", "panic_type", p.Type, "at", p.Site)
+		})
 		_, _ = io.Copy(dst, src)
 		if tc, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = tc.CloseWrite()
 		} else {
 			_ = dst.Close()
 		}
-		done <- struct{}{}
 	}
 	go cp(a, b)
 	go cp(b, a)

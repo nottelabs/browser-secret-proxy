@@ -619,6 +619,13 @@ host.
   principal: the `http` cache is keyed by principal, host and stand-in, and
   the `sealed` cache by the token itself, which only its holder can present.
   The `file` mode has one map for every principal by design.
+- **A bug ends one connection, not the proxy.** A panic anywhere in a
+  connection's work (its handler, either relay and the goroutines and timers
+  they start, a tunnel's copies, or its idle timer) closes both sides of that
+  connection and no other. The log names the panic's type and where it
+  happened, never its value, which could hold a real value. A panic that leaves an HTTP/2
+  relay's lock held can leave a few of that connection's goroutines behind;
+  the relay stops waiting for them after 5 seconds.
 
 ### What it does not guarantee
 

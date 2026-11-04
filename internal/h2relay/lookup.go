@@ -7,6 +7,7 @@ import (
 
 	"golang.org/x/net/http2/hpack"
 
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -105,6 +106,7 @@ func (r *relay) dropLookupsLocked(s *stream) {
 
 func (r *relay) runLookup(ctx context.Context, p pendingLookup) {
 	defer r.lookups.Done()
+	defer panics.Recover(r.contain)
 	swapper, err := p.lookup.Swapper(ctx)
 	r.mu.Lock()
 	r.lookupsRunning--

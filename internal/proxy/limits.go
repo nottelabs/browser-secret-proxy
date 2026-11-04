@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 )
 
 // idleTimer closes a client connection and its destination connection once
@@ -42,6 +44,10 @@ func (t *idleTimer) start(log *slog.Logger, conns ...net.Conn) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	check := func() {
+		defer panics.Recover(func(p *panics.Error) {
+			log.Error("idle timer panicked; closing the connection", "panic_type", p.Type, "at", p.Site)
+			panics.Abort(conns...)
+		})
 		idle := time.Since(time.Unix(0, t.last.Load()))
 		if idle < t.timeout {
 			t.mu.Lock()
