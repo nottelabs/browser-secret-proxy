@@ -10,6 +10,9 @@ First release, planned as 0.1.0.
 
 ### Added
 
+- A masked `br` response body cut off in transit fails the response, as the
+  other codings do, rather than reaching the client as a shorter body that
+  looks complete (brotli v1.2.7).
 - Forward proxy that decrypts traffic to allowlisted hosts with a CA you
   provide and replaces stand-in values with real ones in request headers,
   query strings and bodies.
@@ -30,6 +33,10 @@ First release, planned as 0.1.0.
   `CONNECT` destination, and a request naming another host is refused. A
   request that breaks a scope, or whose lookup fails, is answered `502` and
   not sent.
+- Releases are published only after fmt, vet, lint, the race tests and
+  govulncheck pass on the tagged commit, in a job without write or signing
+  permissions. The README verifies signatures against the exact identity of
+  `release.yml` on the release's tag, not any workflow of the repository.
 - Requests that name their host ambiguously are answered `502` and not sent:
   more than one `Host`, `:authority` or `host`, a `host` or absolute-form
   target that differs from the request's other authority, an authority with
