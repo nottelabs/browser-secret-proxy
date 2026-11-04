@@ -27,7 +27,7 @@ jobs:
   # Runs in its own job, with no write token and no OIDC token, so the code
   # under test never runs next to the release credentials.
   check:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON('{"github":"ubuntu-24.04","blacksmith":"blacksmith-2vcpu-ubuntu-2404"}')[vars.CI_RUNNER_PROVIDER || 'blacksmith'] }}
     permissions:
       contents: read
     steps:
@@ -43,7 +43,7 @@ jobs:
 
   release:
     needs: check
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON('{"github":"ubuntu-24.04","blacksmith":"blacksmith-2vcpu-ubuntu-2404"}')[vars.CI_RUNNER_PROVIDER || 'blacksmith'] }}
     permissions:
       contents: write # create the GitHub release and upload assets
       packages: write # push the image to GHCR
