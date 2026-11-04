@@ -22,7 +22,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
   -subj '/CN=BSP synthetic shopping test CA' -addext 'basicConstraints=critical,CA:TRUE' \
   -addext 'keyUsage=critical,keyCertSign' -keyout "$work/ca.key" -out "$work/ca.pem" 2>/dev/null
 cat > "$work/swaps.json" <<'JSON'
-{"299":{"real":"200","hosts":["postman-echo.com"]},"tok_bsp_shopping_probe":{"real":"dummy_bsp_shopping_replacement","hosts":["postman-echo.com"]},"4111111111111111":{"real":"4242424242424242","hosts":["www.birkenstock.com","checkoutshopper-live.adyen.com","live.adyen.com","secure.booking.com"]}}
+{"/status/299":"/status/200","tok_bsp_shopping_probe":"dummy_bsp_shopping_replacement","4111111111111111":"4242424242424242"}
 JSON
 chmod 644 "$work/ca.key" "$work/ca.pem" "$work/swaps.json"
 docker run -d --name "$container" -p 127.0.0.1:18380:8080 \
@@ -31,6 +31,17 @@ docker run -d --name "$container" -p 127.0.0.1:18380:8080 \
   -e SECRET_PROXY_USERNAME -e SECRET_PROXY_PASSWORD \
   browser-secret-proxy:dev -ca-cert /etc/bsp/ca.pem -ca-key /etc/bsp/ca.key \
   -swaps /etc/bsp/swaps.json -hosts 'postman-echo.com,www.birkenstock.com,checkoutshopper-live.adyen.com,live.adyen.com,www.booking.com,secure.booking.com' >/dev/null
+ready=""
+for _ in $(seq 1 20); do
+  status=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 http://127.0.0.1:18380/ || true)
+  if [ "$status" = 407 ]; then ready=1; break; fi
+  if [ "$(docker inspect -f '{{.State.Running}}' "$container")" != true ]; then
+    echo 'Proxy exited before readiness; no browser will be allocated' >&2
+    exit 1
+  fi
+  sleep 0.5
+done
+test -n "$ready"
 printf 'version: "3"\nagent:\n  web_addr: false\n' > "$work/ngrok.yml"
 ngrok tcp 18380 --config "$work/ngrok.yml" --log stdout --log-format logfmt > "$work/ngrok.log" 2>&1 &
 tunnel_pid=$!
