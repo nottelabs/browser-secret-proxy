@@ -5,7 +5,7 @@
 version: 2
 
 # The single name setting: binaries, archives and the image follow it.
-project_name: secret-proxy
+project_name: browser-secret-proxy
 
 before:
   hooks:
@@ -53,7 +53,7 @@ sboms:
 # Keyless signing: in GitHub Actions cosign uses the workflow's OIDC token, and
 # the signature bundle records the workflow identity. Verify with
 #   cosign verify-blob --bundle checksums.txt.sigstore.json \
-#     --certificate-identity-regexp '^https://github.com/nottelabs/secret-proxy/' \
+#     --certificate-identity-regexp '^https://github.com/nottelabs/browser-secret-proxy/' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
 signs:
   - id: checksums
@@ -101,7 +101,9 @@ docker_signs:
       - --yes
 
 changelog:
-  # Release notes come from CHANGELOG.md, not from commit messages.
+  # Release notes come from CHANGELOG.md, not from commit messages:
+  # release.yml passes the tag's section with --release-notes
+  # (scripts/release-notes.sh).
   disable: true
 
 release:

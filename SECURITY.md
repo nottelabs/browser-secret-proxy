@@ -1,7 +1,7 @@
 # Security policy
 
-secret-proxy handles real secrets and a CA private key, so we treat security
-reports as a priority.
+browser-secret-proxy handles real secrets and a CA private key, so we treat
+security reports as a priority.
 
 ## Reporting a vulnerability
 

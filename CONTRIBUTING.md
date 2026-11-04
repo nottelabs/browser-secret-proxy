@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for your interest in secret-proxy. Bug reports, fixes and focused
-improvements are welcome.
+Thanks for your interest in browser-secret-proxy. Bug reports, fixes and
+focused improvements are welcome.
 
 For a security issue, follow [SECURITY.md](SECURITY.md) instead of opening an
 issue.
@@ -16,13 +16,15 @@ You need:
 - Docker, for `make docker` and `make snapshot` only.
 
 The other tools (golangci-lint, govulncheck, GoReleaser) run through `go run`
-at the versions pinned in the `Makefile`, so there is nothing else to install.
+at the versions pinned in the `Makefile`, and `make snapshot` installs the
+pinned syft (for SBOMs) under `bin/tools`, so there is nothing else to
+install.
 To use a binary you already have, override its variable, for example
 `make lint GOLANGCI_LINT=golangci-lint`.
 
 ```sh
-git clone https://github.com/nottelabs/secret-proxy
-cd secret-proxy
+git clone https://github.com/nottelabs/browser-secret-proxy
+cd browser-secret-proxy
 make build test
 ```
 
@@ -30,7 +32,7 @@ make build test
 
 | Target | What it does |
 | --- | --- |
-| `make build` | Static binary in `bin/secret-proxy` (`CGO_ENABLED=0`). |
+| `make build` | Static binary in `bin/browser-secret-proxy` (`CGO_ENABLED=0`). |
 | `make test` | `go test ./...` |
 | `make race` | `go test -race ./...` (needs cgo, so a C compiler). |
 | `make vet` | `go vet ./...` |
@@ -38,9 +40,10 @@ make build test
 | `make vuln` | govulncheck against the Go vulnerability database. |
 | `make fmt` / `make fmt-check` | Format the code / fail if it is not formatted. |
 | `make check` | `fmt-check`, `vet`, `lint`, `race` and `vuln`, as CI runs them. |
-| `make docker` | Build the container image `secret-proxy:dev`. |
+| `make docker` | Build the container image `browser-secret-proxy:dev`. |
 | `make cross` | Binaries for linux and darwin, amd64 and arm64, in `bin/`. |
 | `make snapshot` | Local GoReleaser build of every release artifact, unsigned and unpublished, in `dist/`. |
+| `make release-notes RELEASE_VERSION=X.Y.Z` | Print the `CHANGELOG.md` section a release uses as its notes. |
 | `make clean` | Remove `bin/` and `dist/`. |
 
 Run `make check` before opening a pull request.
@@ -75,9 +78,13 @@ obvious. Pull requests are squash-merged, so the title becomes the commit on
 
 ## Releases
 
-Maintainers tag `vX.Y.Z` on `main`. The release workflow then builds the
-binaries and container images with GoReleaser, generates SBOMs, signs the
-checksums and images with cosign (keyless) and publishes the GitHub release.
+Before tagging, a maintainer moves the `Unreleased` entries of `CHANGELOG.md`
+under a `## [X.Y.Z] - YYYY-MM-DD` heading (`make release-notes
+RELEASE_VERSION=X.Y.Z` prints what the release will say), merges that, and
+tags `vX.Y.Z` on `main`. The release workflow then builds the binaries and
+container images with GoReleaser, generates SBOMs, signs the checksums and
+images with cosign (keyless) and publishes the GitHub release with that
+section as its notes. It fails if the section is missing.
 
 ## License
 

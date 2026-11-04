@@ -1,4 +1,4 @@
-# secret-proxy
+# browser-secret-proxy
 
 A forward proxy that fills in secrets on the way out. A browser, or an AI agent
 driving it, only ever handles stand-in values. The proxy decrypts traffic to
@@ -41,7 +41,7 @@ impersonate any host to a client that trusts the certificate.
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
-  -subj "/CN=secret-proxy CA" -addext "basicConstraints=critical,CA:TRUE" \
+  -subj "/CN=browser-secret-proxy CA" -addext "basicConstraints=critical,CA:TRUE" \
   -addext "keyUsage=critical,keyCertSign" -keyout ca.key -out ca.pem
 chmod 600 ca.key
 ```
@@ -70,7 +70,7 @@ From source:
 
 ```sh
 make build
-./bin/secret-proxy \
+./bin/browser-secret-proxy \
   -listen 127.0.0.1:8080 \
   -ca-cert ca.pem -ca-key ca.key \
   -hosts 'api.example.com,*.payments.example' \
@@ -82,13 +82,14 @@ With Docker (the image listens on `:8080` and runs as a non-root user):
 ```sh
 make docker
 docker run --rm -p 8080:8080 \
-  -v "$PWD/ca.pem:/etc/secret-proxy/ca.pem:ro" \
-  -v "$PWD/ca.key:/etc/secret-proxy/ca.key:ro" \
-  -v "$PWD/swaps.json:/etc/secret-proxy/swaps.json:ro" \
+  -v "$PWD/ca.pem:/etc/browser-secret-proxy/ca.pem:ro" \
+  -v "$PWD/ca.key:/etc/browser-secret-proxy/ca.key:ro" \
+  -v "$PWD/swaps.json:/etc/browser-secret-proxy/swaps.json:ro" \
   -e SECRET_PROXY_USERNAME=proxy-user -e SECRET_PROXY_PASSWORD=change-me \
-  secret-proxy:dev \
-  -ca-cert /etc/secret-proxy/ca.pem -ca-key /etc/secret-proxy/ca.key \
-  -swaps /etc/secret-proxy/swaps.json -hosts 'api.example.com'
+  browser-secret-proxy:dev \
+  -ca-cert /etc/browser-secret-proxy/ca.pem \
+  -ca-key /etc/browser-secret-proxy/ca.key \
+  -swaps /etc/browser-secret-proxy/swaps.json -hosts 'api.example.com'
 ```
 
 The image runs as UID 65532, so mounted files must be readable by that user.
@@ -100,7 +101,7 @@ Point a Chromium-based browser at the proxy, for example
 On Linux, add it to the NSS database:
 
 ```sh
-certutil -d sql:$HOME/.pki/nssdb -A -t C,, -n secret-proxy -i ca.pem
+certutil -d sql:$HOME/.pki/nssdb -A -t C,, -n browser-secret-proxy -i ca.pem
 ```
 
 Or check a single request with curl:
@@ -150,7 +151,7 @@ in the entry go through your proxy; every other host keeps using the exit.
     { "type": "notte", "country": "us" },
     {
       "type": "secret",
-      "server": "https://secret-proxy.example.com:8443",
+      "server": "https://browser-secret-proxy.example.com:8443",
       "username": "proxy-user",
       "password": "<the SECRET_PROXY_PASSWORD value>",
       "hosts": ["api.example.com", "*.payments.example"],
@@ -240,17 +241,17 @@ what they return before relying on them.
 Each release publishes binaries for linux and darwin (amd64, arm64), a
 `checksums.txt` signed with [cosign](https://github.com/sigstore/cosign)
 keyless signing, an SPDX SBOM per archive, and a signed multi-arch image,
-`ghcr.io/nottelabs/secret-proxy`.
+`ghcr.io/nottelabs/browser-secret-proxy`.
 
 ```sh
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/nottelabs/secret-proxy/' \
+  --certificate-identity-regexp '^https://github.com/nottelabs/browser-secret-proxy/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum --ignore-missing -c checksums.txt
 
-cosign verify ghcr.io/nottelabs/secret-proxy:<version> \
-  --certificate-identity-regexp '^https://github.com/nottelabs/secret-proxy/' \
+cosign verify ghcr.io/nottelabs/browser-secret-proxy:<version> \
+  --certificate-identity-regexp '^https://github.com/nottelabs/browser-secret-proxy/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 

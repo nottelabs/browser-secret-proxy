@@ -1,8 +1,9 @@
-# secret-proxy build, test and release targets. Run `make help` for a list.
+# browser-secret-proxy build, test and release targets.
+# Run `make help` for a list.
 
 # Project name: the binary and the local image are named after it. GoReleaser
 # has the same single setting, project_name in .goreleaser.yaml.
-NAME    ?= secret-proxy
+NAME    ?= browser-secret-proxy
 BINARY  := $(NAME)
 PKG     := ./cmd/secret-proxy
 BIN_DIR := bin
@@ -19,6 +20,7 @@ GOFLAGS_BUILD := -trimpath -ldflags "$(LDFLAGS)"
 GOLANGCI_LINT_VERSION := v2.15.0
 GOVULNCHECK_VERSION   := v1.9.0
 GORELEASER_VERSION    := v2.19.0
+SYFT_VERSION          := v1.56.0
 GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 GOVULNCHECK   ?= go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 GORELEASER    ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
@@ -26,7 +28,7 @@ GORELEASER    ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 .DEFAULT_GOAL := build
-.PHONY: help build test race vet lint vuln fmt fmt-check check docker cross snapshot release-check clean
+.PHONY: help build test race vet lint vuln fmt fmt-check check docker cross snapshot release-notes release-check clean
 
 help: ## List targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -69,8 +71,18 @@ cross: ## Build static binaries for linux and darwin, amd64 and arm64
 	    -o $(BIN_DIR)/$(BINARY)-$$os-$$arch $(PKG) || exit 1; \
 	done
 
-snapshot: ## Build every release artifact locally, unsigned and unpublished, in dist/
-	$(GORELEASER) release --snapshot --clean --skip=sign
+# GoReleaser runs syft from PATH to write the SBOMs, so the snapshot installs
+# the pinned version under bin/tools first.
+SYFT_DIR := $(abspath $(BIN_DIR))/tools/syft-$(SYFT_VERSION)
+
+$(SYFT_DIR)/syft:
+	GOBIN=$(SYFT_DIR) go install github.com/anchore/syft/cmd/syft@$(SYFT_VERSION)
+
+snapshot: $(SYFT_DIR)/syft ## Build every release artifact locally, unsigned and unpublished, in dist/
+	PATH="$(SYFT_DIR):$$PATH" $(GORELEASER) release --snapshot --clean --skip=sign
+
+release-notes: ## Print the CHANGELOG.md section of RELEASE_VERSION (for example 0.1.0)
+	@./scripts/release-notes.sh "$(RELEASE_VERSION)"
 
 release-check: ## Validate .goreleaser.yaml
 	$(GORELEASER) check
