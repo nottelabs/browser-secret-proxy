@@ -12,14 +12,19 @@
 // found in, as the request side escapes real values: a stand-in with a quote
 // goes into a JSON body JSON-escaped, into a Location header query-escaped.
 //
-// A Writer masks a stream with a bounded window: it holds back at most the
-// length of the longest form minus one byte, and only while those bytes
-// could still begin a real value.
+// A Writer masks a stream with a bounded window. By default the window is
+// Fixed: it always holds back the last bytes it was given, as many as the
+// longest form minus one, whether or not they could begin a real value.
+// When it passes text on, and how much, then depends only on how much was
+// written and on whole forms replaced, never on how much of a real value the
+// end of the text matched. A Minimal window holds back only bytes that could
+// begin a real value, so streams keep flowing, but gives up that guarantee.
 package mask
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -107,6 +112,50 @@ func HeaderContext(name string) Context {
 	return Text
 }
 
+// Window is what a Writer holds back at the end of the text written so far.
+// The zero Window is Fixed.
+type Window int
+
+// Windows.
+const (
+	// Fixed holds back the last MaxLength-1 bytes, whatever they are. A
+	// stream runs that many bytes behind until it ends.
+	Fixed Window = iota
+	// Minimal holds back only bytes that could begin a form, so a stream
+	// keeps flowing. A client that has a destination reflect its guesses
+	// can then tell, from the size or timing of what it gets, how much of
+	// a real value each guess matched.
+	Minimal
+)
+
+var windowNames = [...]string{Fixed: "fixed", Minimal: "minimal"}
+
+func (w Window) String() string {
+	if w < 0 || int(w) >= len(windowNames) {
+		return fmt.Sprintf("Window(%d)", int(w))
+	}
+	return windowNames[w]
+}
+
+// MarshalText returns the name of w: fixed or minimal.
+func (w Window) MarshalText() ([]byte, error) {
+	if w < 0 || int(w) >= len(windowNames) {
+		return nil, fmt.Errorf("unknown window %d", int(w))
+	}
+	return []byte(windowNames[w]), nil
+}
+
+// UnmarshalText sets w from its name: fixed or minimal.
+func (w *Window) UnmarshalText(text []byte) error {
+	for i, name := range windowNames {
+		if string(text) == name {
+			*w = Window(i)
+			return nil
+		}
+	}
+	return errors.New("want fixed or minimal")
+}
+
 // form is one way a real value can appear, and what replaces it in each
 // context.
 type form struct {
@@ -120,6 +169,7 @@ type Masker struct {
 	maxLen     int
 	sameLength [numContexts]bool
 	forms      int
+	window     Window
 }
 
 // New builds a Masker for pairs. Values shorter than MinLength are skipped.
@@ -175,8 +225,17 @@ func (f form) unchanged() bool {
 // length. Masked content can then keep its Content-Length.
 func (m *Masker) SameLength(c Context) bool { return m == nil || m.sameLength[c] }
 
-// MaxLength is the length of the longest form, which bounds what a Writer
-// holds back.
+// WithWindow sets the window of m's Writers, and returns m. Set it before m
+// is shared.
+func (m *Masker) WithWindow(w Window) *Masker {
+	if m != nil {
+		m.window = w
+	}
+	return m
+}
+
+// MaxLength is the length of the longest form. A Writer holds back one byte
+// less.
 func (m *Masker) MaxLength() int {
 	if m == nil {
 		return 0
@@ -189,23 +248,21 @@ func (m *Masker) String(c Context, s string) string {
 	if m == nil {
 		return s
 	}
-	out, _ := m.scan(nil, []byte(s), c, true)
+	out, _ := m.scan(nil, []byte(s), c, len(s), true)
 	return string(out)
 }
 
-// scan appends the masked form of buf to out. Unless final, it stops at the
-// first position where a form might begin but buf ends first, and returns
-// that position: those bytes need more input to decide.
-func (m *Masker) scan(out, buf []byte, c Context, final bool) ([]byte, int) {
+// scan appends the masked form of buf to out, for the forms that begin
+// before end, and returns where it stopped: end, or past it when a form that
+// begins before end runs over it. A form is only matched whole. Unless
+// final, scan also stops at the first position where a form might begin but
+// buf ends first: those bytes need more input to decide. With a Fixed
+// window, buf holds a form's length past end, so that never happens.
+func (m *Masker) scan(out, buf []byte, c Context, end int, final bool) ([]byte, int) {
 	i, last := 0, 0
-	for i < len(buf) {
-		candidates := m.byFirst[buf[i]]
-		if len(candidates) == 0 {
-			i++
-			continue
-		}
-		matched, hold := false, false
-		for _, f := range candidates {
+	for i < end {
+		matched := false
+		for _, f := range m.byFirst[buf[i]] {
 			if len(buf)-i >= len(f.from) {
 				if bytes.Equal(buf[i:i+len(f.from)], f.from) {
 					out = append(out, buf[last:i]...)
@@ -217,12 +274,8 @@ func (m *Masker) scan(out, buf []byte, c Context, final bool) ([]byte, int) {
 				}
 			} else if !final && bytes.HasPrefix(f.from, buf[i:]) {
 				// A longer form may still match; it wins over shorter ones.
-				hold = true
-				break
+				return append(out, buf[last:i]...), i
 			}
-		}
-		if hold {
-			break
 		}
 		if !matched {
 			i++
@@ -236,7 +289,7 @@ type Writer struct {
 	m       *Masker
 	c       Context
 	w       io.Writer
-	pending []byte // bytes that may begin a real value, at most MaxLength-1
+	pending []byte // held back, at most MaxLength-1
 }
 
 // NewWriter returns a Writer to w, for text in context c. w may keep the
@@ -245,8 +298,12 @@ func (m *Masker) NewWriter(w io.Writer, c Context) *Writer {
 	return &Writer{m: m, c: c, w: w}
 }
 
-// Write masks p. Bytes that could begin a real value are held back until the
-// next Write or Close decides them.
+// Write masks p. With a Fixed window, the last MaxLength-1 bytes written are
+// held back until the next Write or Close, whatever they are: holding back
+// only bytes that could begin a real value, as a Minimal window does, lets a
+// client that reflects its guesses learn, from the size or the delay of what
+// it gets, how much of a value each guess matched. A form that ends in the
+// held bytes but begins before them is replaced at once.
 func (w *Writer) Write(p []byte) (int, error) {
 	if w.m == nil {
 		return w.w.Write(p)
@@ -255,7 +312,15 @@ func (w *Writer) Write(p []byte) (int, error) {
 	if len(w.pending) > 0 {
 		buf = append(w.pending, p...)
 	}
-	out, done := w.m.scan(nil, buf, w.c, false)
+	end := len(buf)
+	if w.m.window != Minimal { // anything else holds back the Fixed window
+		end -= w.m.maxLen - 1
+	}
+	if end <= 0 {
+		w.pending = append([]byte(nil), buf...)
+		return len(p), nil
+	}
+	out, done := w.m.scan(nil, buf, w.c, end, false)
 	w.pending = append([]byte(nil), buf[done:]...)
 	if len(out) > 0 {
 		if _, err := w.w.Write(out); err != nil {
@@ -273,7 +338,7 @@ func (w *Writer) Close() error {
 	if w.m == nil || len(w.pending) == 0 {
 		return nil
 	}
-	out, _ := w.m.scan(nil, w.pending, w.c, true)
+	out, _ := w.m.scan(nil, w.pending, w.c, len(w.pending), true)
 	w.pending = nil
 	_, err := w.w.Write(out)
 	return err

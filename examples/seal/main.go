@@ -9,6 +9,9 @@
 //
 //	{"values": {"tok_standin_123": "<real API token>"}, "hosts": ["api.example.com"], "sub": "session-42"}
 //
+// The file is read as the proxy reads the claims: an unknown member, a member
+// named twice or a claim spelled in another case ("HOSTS") is refused.
+//
 // aud is set to -audience, iat to now, and exp to now plus -ttl unless the
 // file has one. The token holds real values: treat it like them.
 package main
@@ -69,6 +72,11 @@ func run(args []string, stdout io.Writer) error {
 	data, err := os.ReadFile(flags.Arg(0))
 	if err != nil {
 		return err
+	}
+	// Read the file one way, as the proxy reads the claims: encoding/json
+	// alone would take "HOSTS" for hosts and keep the last of two members.
+	if err := resolve.CheckSealedClaims(data); err != nil {
+		return fmt.Errorf("%s: %w", flags.Arg(0), err)
 	}
 	var payload resolve.SealedPayload
 	// A misspelled field would be dropped silently: "host" for "hosts" would

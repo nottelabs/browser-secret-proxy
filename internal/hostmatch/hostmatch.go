@@ -86,6 +86,12 @@ func SameHost(a, b string) bool {
 	return x != "" && x == y
 }
 
+// Host returns the host of an authority as Match and SameHost compare it:
+// without its port or the brackets of an IPv6 address, in lower case and
+// without a trailing dot. It returns "" for an empty name and for an
+// authority that is not a plain host and port (see SameHost).
+func Host(authority string) string { return hostOf(authority) }
+
 func canonical(s string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s)), ".")
 }

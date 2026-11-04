@@ -248,9 +248,14 @@ real value in the echo.
 | `-standin-pattern` | Regular expression (RE2) matching stand-ins. Repeatable. See [Finding stand-ins](#finding-stand-ins). |
 | `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
 | `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
-| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. Nothing but an optional `/` may follow the port; percent-encode special characters in the user and password. The flag wins over the variable. |
+| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. Nothing but an optional `/` may follow the port; percent-encode special characters in the user and password. The flag wins over the variable. The parent resolves destination names, so only IP-literal destinations are checked against internal addresses. |
+| `-allow-private-destinations` | Let `CONNECT` reach loopback, private, link-local and other internal addresses (default `false`: they are refused with `403`). See [Security model](#security-model). |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty; a `SECRET_PROXY_PASSWORD` without it is refused at start. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
+| `-idle-timeout` | Close a connection, tunneled or decrypted, once no bytes have moved either way for this long (default `5m`, `0` never). See [Limits and known gaps](#limits-and-known-gaps). |
+| `-header-timeout` | Longest wait for the CONNECT request head, and for each HTTP/1.1 request head on a decrypted connection from its first byte (default `10s`). |
+| `-max-conns` | Most client connections handled at once (default `1024`, `0` no limit). A connection past it is answered `503` and closed. |
+| `-mask-stream-window` | What masking holds back at the end of a streamed response: `fixed` (default), a window of bytes whatever they are, or `minimal`, only bytes that could begin a real value. `minimal` lowers streaming latency, but lets any allowlisted endpoint that reflects input reveal real values. Any other value is refused at start. See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
 | `-version` | Print the version and exit. |
 
@@ -338,12 +343,23 @@ Your service answers `200` with the values it releases:
 {"values": {"tok_1": {"real": "<real value>", "hosts": ["api.example.com"], "expires_at": "2026-01-02T15:04:05Z"}}}
 ```
 
+- `host` is the `CONNECT` host as `-hosts` matches it: in lower case,
+  without the port or a trailing dot. `API.Example.COM.:443` is sent as
+  `api.example.com`.
 - `principal_id` is the proxy username of the connection
   (`SECRET_PROXY_USERNAME`), empty when authentication is off. The proxy
   password is never sent.
 - `hosts` (optional) restricts the value to those hosts, in the `-hosts`
-  syntax. Without it the value may go to any host in `-hosts`.
+  syntax. Without it, or with `null`, the value may go to any host in
+  `-hosts`. An empty list (`"hosts": []`) is not the same: like any invalid
+  list, it refuses the request.
 - `expires_at` (optional) is when the value stops being used.
+- The answer is read as written. One that names a member twice, at any
+  depth (a stand-in, or `hosts` within one value), or spells `values`,
+  `real`, `hosts` or `expires_at` in another case (`"HOSTS"`,
+  `"Expires_At"`) is malformed: a JSON parser that keeps the last
+  duplicate, or ignores case, would read another scope than your service
+  meant. Other members are ignored.
 - Leave out any stand-in you do not release for this host or principal. The
   request is then refused, as it is for any other status, a malformed answer,
   a redirect or a timeout (`-resolver-timeout`, 2 seconds by default).
@@ -355,7 +371,8 @@ Your service answers `200` with the values it releases:
   client certificate.
 
 [`examples/http-resolver`](examples/http-resolver) is a small reference
-service that answers from a JSON file and requires a client certificate:
+service that answers from a JSON file and requires a client certificate. It
+reads the file and each request as strictly as the proxy reads its answer:
 
 ```sh
 go run ./examples/http-resolver -cert server.pem -key server.key \
@@ -399,6 +416,9 @@ The signed claims carry the values:
 - `nbf` and `iat` (optional, Unix seconds): a token is refused before
   `nbf`, or when `iat` is in the future, beyond 30 seconds of clock skew.
 - `hosts` (optional) restricts every value of the token to those hosts.
+  Without it the values may go to any host in `-hosts`. An empty list
+  refuses every request that carries one of them, and `examples/seal`
+  refuses to seal one.
 - `sub` (optional) names the principal in logs; the username is used when it
   is empty. Neither changes what the token gives: the principal is the token
   itself, so its values are masked on all of its connections, whatever
@@ -412,7 +432,11 @@ key, is not signed by a configured issuer key, was altered, is for another
 audience, or has expired gets `407`. So does a token in the earlier
 encrypt-only format, and a token that is not in its canonical compact form
 (five segments of unpadded base64url, without line breaks or non-zero
-unused bits), so a token cannot be presented as several passwords. A
+unused bits), so a token cannot be presented as several passwords. So
+does a token whose claims name a member twice, at any depth, or spell a
+claim above in another case (`"HOSTS"`, `"Exp"`): a JSON parser that keeps
+the last duplicate, or ignores case, would read other claims than the
+issuer checked. Other members are allowed. A
 connection whose token expires while it is open gets `502` for every later
 request to an allowlisted host, whether or not the request holds a
 stand-in.
@@ -450,7 +474,8 @@ Key rotation:
   key once the tokens encrypted to it have expired.
 
 For testing, [`examples/seal`](examples/seal) signs and seals a payload
-file:
+file. It refuses a file with a member it does not know, or one the proxy
+would refuse in the claims:
 
 ```sh
 go run ./examples/seal -public-key sealed-public.pem -issuer-key issuer.key \
@@ -532,8 +557,9 @@ host.
   tunneled without decryption, so no swap can happen there.
 - **Each value only goes where it is allowed.** A value can carry its own
   host list (the same syntax as `-hosts`); without one, the `-hosts`
-  allowlist applies. It is checked against the host of the `CONNECT`, which
-  is where the request really goes, never against the request's own `Host`
+  allowlist applies (an empty list refuses the request). It is checked
+  against the host of the `CONNECT`, which is where the request really goes,
+  never against the request's own `Host`
   or `:authority`: a request naming another host than its `CONNECT` is
   answered `502`, with or without stand-ins. So is a request a server could
   read as naming another host: one with more than one `Host` (HTTP/1.1), or
@@ -541,7 +567,9 @@ host.
   `:authority`, or an absolute-form target (`GET https://host/`) that
   differs from `Host`; an authority with userinfo (`user@host`), a path,
   query, fragment or whitespace, or a port that is not a number. Over
-  HTTP/2, a header name with uppercase letters is refused the same way.
+  HTTP/2, a header name with uppercase letters is refused the same way, and
+  so is a pseudo-header that is repeated (two `:method` fields), unknown, or
+  after a regular field.
   Over HTTP/1.1, so is a request whose body a server could frame
   differently, or whose head it could split into other lines (RFC 9112):
   `Transfer-Encoding` with `Content-Length`, a `Transfer-Encoding` other
@@ -562,6 +590,19 @@ host.
   `502`, with or without stand-ins. Neither the client nor the log sees the
   real value or the resolver's error text; the log names only its kind
   (timeout, refused credential, error).
+- **Internal addresses are not reached.** A `CONNECT`, tunneled or
+  decrypted, to an internal address is answered `403` and nothing is
+  dialed. Internal means loopback, private (RFC 1918, `fc00::/7`),
+  link-local (`169.254.0.0/16`, where cloud metadata services live, and
+  `fe80::/10`), unspecified (`0.0.0.0/8`, `::`), multicast and shared
+  (`100.64.0.0/10`), also in IPv4-mapped (`::ffff:127.0.0.1`) or
+  IPv4-compatible (`::127.0.0.1`) form. The proxy resolves a name once,
+  refuses it when any of its addresses is internal, and connects to the
+  addresses it checked, never to the name, so a second DNS answer cannot
+  redirect the connection. The name still goes in SNI and `Host`. A host
+  that ends in a number but is not a standard IP address (`127.1`,
+  `2130706433`) is refused too. `-allow-private-destinations` turns this
+  check off.
 - **One version per request.** A resolver whose values change (a reloaded
   file) gives each request one version, for finding its stand-ins and for
   looking them up.
@@ -585,7 +626,27 @@ host.
   resolver that issues it.
 - **Responses** are masked for known forms of the values only: see
   [what masking misses](#what-masking-misses).
-- **WebSockets** and other upgraded connections get no swaps once upgraded.
+- **WebSockets** get no swaps and no masking once upgraded. They are the
+  only tunnel the proxy opens inside an intercepted connection, and only
+  over HTTP/1.1: an `Upgrade: websocket` that the destination answers with
+  a `101`, which a handler that is not a WebSocket endpoint does not send.
+  The handshake request is swapped like any other and the head of its
+  answer is masked, but after the `101` the frames pass through untouched
+  both ways. A WebSocket endpoint that echoes a value from its handshake
+  (`wss://host/ws?token=...`) returns it unmasked. Over HTTP/2 the proxy
+  never tells the browser that the destination supports WebSockets (it
+  drops `SETTINGS_ENABLE_CONNECT_PROTOCOL` from the destination's
+  settings), so the browser opens them over HTTP/1.1. Every other tunnel is
+  answered `502` and not sent: a `CONNECT` inside an intercepted connection
+  (HTTP/1.1, or HTTP/2 with or without `:protocol`, a WebSocket included)
+  and an HTTP/1.1 upgrade to another protocol, such as `h2c`.
+- **Which public hosts are reached.** The allowlist decides what is
+  decrypted, not where a client may connect: a client that passes
+  authentication can tunnel to any public host and port.
+- **Internal addresses behind a parent proxy.** With `-upstream-proxy`, the
+  parent resolves destination names, so the proxy checks only destinations
+  given as IP addresses. A name that resolves to an internal address is
+  passed on: restrict what the parent can reach.
 
 ## Exposing the proxy
 
@@ -599,6 +660,13 @@ host.
   balancer, stunnel, or a reverse proxy in TCP mode) and give clients the
   `https://` address.
 - **Network.** Restrict inbound access to the clients that need it.
+- **Egress.** Whoever holds the proxy credential, a Notte session included,
+  can open tunnels from your network to any public host and port. Internal
+  addresses are refused (see [Security model](#security-model)). Set
+  `-allow-private-destinations` only when an allowlisted host is internal,
+  and then firewall what the proxy host can reach. Every tunnel is logged at
+  info level with its host, port and principal, and every refusal at warn
+  level.
 
 ## Response masking
 
@@ -611,7 +679,9 @@ connections. To keep real values in memory no longer than needed, a value
 is masked for 15 minutes after its last lookup, or until it expires if that
 is sooner, and no longer once the principal's credential is reported
 invalid (at most 1,024 values per principal, the least recently looked up
-dropped first). Values are kept for at most 4,096 principals: when one more
+dropped first, but never those of the request that looks them up; a
+request that alone carries more than 1,024 values is answered `502` and
+not sent). Values are kept for at most 4,096 principals: when one more
 principal looks a value up, the least recently active principal's values are
 dropped, and its responses are not masked until it looks values up again.
 Expired values leave memory within 5 seconds, whether or not more requests
@@ -635,9 +705,13 @@ What is masked:
   JSON-escaped in JSON and JavaScript bodies, query-escaped in form bodies
   and in `Location`, `Content-Location`, `Link`, `Refresh` and `Set-Cookie`,
   HTML-escaped in HTML and XML bodies, as is elsewhere;
-- values split across HTTP/1.1 chunks or HTTP/2 DATA frames. The proxy holds
-  back at most the length of the longest form, and only bytes that could
-  begin a value, so streamed responses keep flowing.
+- values split across HTTP/1.1 chunks or HTTP/2 DATA frames. By default
+  (`-mask-stream-window=fixed`) the proxy holds back a window of the last
+  bytes of a body it has received: one byte fewer than the longest form of a
+  value on record, so about six bytes per character of the longest value,
+  since a character reference (`&#x73;`) takes up to six (149 bytes for a
+  25-character token). See below for what this does to streams, and for
+  `-mask-stream-window=minimal`.
 
 How a masked response changes:
 
@@ -667,16 +741,34 @@ How a masked response changes:
   put it back together, even with a stand-in of the same length.
 - Also refused with a `502`: a real value in a header that frames the
   HTTP/1.1 message or connection (`Content-Length`, `Transfer-Encoding`,
-  `Content-Encoding`, `Connection`, `Keep-Alive`, `Trailer`, `Upgrade`),
-  which are kept as they are; a real value in the HTTP/1.1 status line
+  `Content-Encoding`, `Connection`, `Keep-Alive`, `Trailer`, `Upgrade`), or
+  in an HTTP/2 `content-length`, which are kept as they are; a real value in the HTTP/1.1 status line
   outside its reason phrase; and, over HTTP/2, a field name with an
   upper-case letter (malformed, RFC 9113 8.2.1). An HTTP/1.1 `101` to a
   request that did not ask to upgrade is refused the same way, with masking
   on or off: it would turn the rest of the connection into a raw stream,
   neither swapped nor masked.
-- Over HTTP/2, content in DATA on a response that cannot have any (to a
-  `HEAD`, or a `204` or `304`) is malformed (RFC 9113 8.1.1): the stream is
+- Over HTTP/2, DATA before the final response head (none yet, or only a
+  `1xx`), and content in DATA on a response that cannot have any (to a
+  `HEAD`, or a `204` or `304`), are malformed (RFC 9113 8.1): the stream is
   reset and the content is not passed on.
+- A streamed body runs behind by the window, whatever the bytes are: each
+  byte is passed on once a window's worth of bytes after it has arrived, or
+  when the body ends. So the end of a server-sent event waits for more
+  events (a short keep-alive comment passes on only as many bytes as it
+  has), and an application that waits for the browser to act on an event
+  before it sends more stalls. A response that ends, such as a long poll,
+  is complete when it ends.
+- `-mask-stream-window=minimal` holds back only bytes that could begin a
+  value, at most the length of the longest form, so streams keep flowing.
+  But it reopens a prefix oracle against every allowlisted endpoint that
+  reflects input: a client that has the destination echo its guesses (a
+  search page, an error message that quotes a parameter) can tell, from the
+  size and timing of the HTTP/1.1 chunks, HTTP/2 DATA frames or TLS records
+  it gets, how much of a value each guess matched, and rebuild the value
+  byte by byte without ever receiving it. Use it only when you trust every
+  allowlisted host not to reflect what a client sends, and streaming
+  latency matters more to you than that.
 - Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
   the proxy is the flow-control endpoint for a masked stream, and keeps every
   other stream within the browser's windows. The request direction, and so
@@ -704,7 +796,8 @@ How a masked response changes:
   with `%20` for a space (Python's `urllib.parse.quote`).
 - A value first recorded while a response is already open, such as a
   server-sent events stream or another long response: which values are
-  masked is decided when the response head arrives, so a value the
+  masked, in the body and the trailers, is decided when the response head
+  arrives, so a value the
   principal sends afterwards, on any connection, is masked only in later
   responses.
 - Values that overlap: when the end of one real value is the start of
@@ -718,9 +811,16 @@ How a masked response changes:
   destination already had on file before the principal sent its stand-in,
   is not masked. Values looked up for another principal
   are not masked on this one's connections.
-- WebSockets and other tunnels (an HTTP/1.1 upgrade or an accepted HTTP/2
-  `CONNECT`), whose frames pass through untouched, and responses on hosts
-  that are not allowlisted (they are never decrypted).
+- WebSocket frames (after a `101` to an HTTP/1.1 upgrade), which pass
+  through untouched, even a value the destination echoes from the swapped
+  handshake. Other tunnels, HTTP/2 WebSockets included, are refused: see
+  [what it does not guarantee](#what-it-does-not-guarantee).
+- Responses on hosts that are not allowlisted (they are never decrypted).
+
+Over HTTP/2, what the destination sends outside header blocks and DATA
+reaches the browser only as numbers (settings, window sizes, error codes),
+with masking on or off: the proxy drops GOAWAY debug data and frames of
+extension or unknown types, and answers the destination's PINGs itself.
 
 Allowlist only the endpoints that need the values, and check what they
 return.
@@ -729,6 +829,22 @@ return.
 
 - CONNECT only: plain `http://` proxy requests get `405`. The CONNECT request
   head is capped at 64 KiB (`431` beyond it), before authentication.
+- The proxy handles at most `-max-conns` client connections at once (1024 by
+  default); a new one past that is answered `503` and closed. The cap is
+  global: there is no cap per principal, and failed authentications are not
+  rate limited.
+- The CONNECT head must arrive within `-header-timeout` (10 seconds by
+  default), and the head, the destination dial and both TLS handshakes within
+  30 seconds. On a decrypted HTTP/1.1 connection, each request head must
+  arrive within `-header-timeout` of the first byte of the TLS record that
+  carries it, however slowly that record comes. HTTP/2 heads have no time
+  limit of their own: an HTTP/2 connection is bounded by the idle timeout
+  below and by its buffer caps.
+- A connection with no bytes moving either way for `-idle-timeout` (5 minutes
+  by default) is closed, tunnels included. Traffic in one direction keeps it
+  open, so a WebSocket or event stream that sends something more often stays
+  up; one that stays silent longer is cut. A peer that stops reading stalls
+  the connection, so it is cut too.
 - TLS session resumption is not supported. A ClientHello that offers
   `pre_shared_key` or early data on an allowlisted host is refused, and every
   connection to an allowlisted host performs a full handshake.
@@ -746,8 +862,12 @@ return.
   (HTTP/2) or its connection closed (HTTP/1.1) before anything is sent.
 - `Expect: 100-continue` is answered by the proxy, which needs the whole body
   before forwarding the request.
-- WebSockets (extended CONNECT over HTTP/2, HTTP/1.1 upgrades) are streamed
-  without swaps once the destination accepts them.
+- WebSockets go over HTTP/1.1: the proxy does not pass on the destination's
+  HTTP/2 support for them (`SETTINGS_ENABLE_CONNECT_PROTOCOL`), so browsers
+  open them on an HTTP/1.1 connection of their own. Their frames are
+  streamed without swaps or masking after the destination's `101`. Other
+  tunnels inside an intercepted connection (`CONNECT` over HTTP/1.1 or
+  HTTP/2, an HTTP/2 WebSocket, an upgrade to `h2c`) get `502`.
 - Text formats other than JSON and forms (XML, multipart) get real values as
   is; a value that needs escaping in such a body is not escaped.
 - HTTP/2 clients must respect flow control: a client that sends past its
@@ -771,8 +891,16 @@ return.
   destination. A `PRIORITY_UPDATE` value over 1 KiB ends it with
   `PROTOCOL_ERROR`.
 - When the destination sends GOAWAY, requests it will not process are refused
-  with `REFUSED_STREAM`.
+  with `REFUSED_STREAM`. The browser gets the GOAWAY without its debug data.
 - Server push is not supported.
+- HTTP/2 frames of a type the proxy does not know go to the destination on
+  the stream they belong to there, or are dropped when that stream is not
+  open upstream (its request still buffered, or ended). From the destination
+  they are dropped, and so are `ALTSVC`, `ORIGIN` and `PRIORITY_UPDATE`
+  frames: the destination cannot point the browser at other origins or
+  services through the proxy's connection.
+- The proxy answers the destination's HTTP/2 PINGs itself. The browser's
+  PINGs go to the destination, and only its ACKs of them come back.
 - Response masking has limits of its own: see
   [What masking misses](#what-masking-misses).
 - The CA, the `http` mode's client certificate and the `sealed` key are

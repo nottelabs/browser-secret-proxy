@@ -29,6 +29,13 @@ First release, planned as 0.1.0.
   forwarded next to the swapped, re-chunked body, so a server that framed
   by it could read part of the body as another request.
 - HTTP/2 and HTTP/1.1 relays.
+- Idle and header timeouts and a connection cap. A connection with no
+  traffic either way for `-idle-timeout` (default `5m`) is closed, the
+  CONNECT head and each HTTP/1.1 request head must arrive within
+  `-header-timeout` (default `10s`), and past `-max-conns` (default `1024`)
+  connections a new one is answered `503`. An HTTP/1.1 request body takes
+  memory as it arrives instead of all at once when its head declares its
+  length.
 - On allowlisted hosts, a ClientHello that repeats an extension type
   (RFC 8446 forbids it) is refused with a `decode_error` alert, as is any
   ClientHello the proxy cannot parse. Before, two `session_ticket`
@@ -51,6 +58,19 @@ First release, planned as 0.1.0.
   `CONNECT` destination, and a request naming another host is refused. A
   request that breaks a scope, or whose lookup fails, is answered `502` and
   not sent.
+- Values' scopes are checked more strictly. An empty `hosts` list from the
+  `http` resolver or in a sealed token refuses the request instead of
+  allowing every host in `-hosts`, and `examples/seal` refuses to seal one.
+  The `http` resolver is sent, and caches by, the `CONNECT` host in lower
+  case without its port or trailing dot. A sealed token whose claims repeat
+  a member or spell a claim in another case (`"HOSTS"`) gets `407`. With
+  masking on, a request carrying more than 1,024 values is refused instead
+  of evicting some of its own values from the masking record.
+- The `http` resolver's answer is read as the service wrote it, like sealed
+  claims: an answer that names a member twice, at any depth, or spells
+  `values`, `real`, `hosts` or `expires_at` in another case (`"HOSTS"`) is
+  malformed, and the request is refused. `examples/seal` refuses such a
+  payload file, and `examples/http-resolver` such a values file or request.
 - Releases are published only after fmt, vet, lint, the race tests and
   govulncheck pass on the tagged commit, in a job without write or signing
   permissions. The README verifies signatures against the exact identity of
@@ -97,6 +117,25 @@ First release, planned as 0.1.0.
   ask to upgrade, and an HTTP/2 field name with an upper-case letter are
   refused with `502`; content in HTTP/2 DATA on a `HEAD`, `204` or `304`
   response resets the stream.
+- Response masking holds back the same number of bytes at the end of a
+  body received so far, whether or not they could begin a real value. It
+  held back only possible beginnings, so a client that had a destination
+  echo its guesses could rebuild a value from the size and timing of the
+  HTTP/1.1 chunks or HTTP/2 DATA frames it got. A streamed body now runs
+  that many bytes behind until it ends. `-mask-stream-window=minimal`
+  restores the old behavior, and the oracle with it, for deployments that
+  trust every allowlisted host not to reflect input.
+- Responses no longer escape masking through a tunnel opened inside an
+  intercepted connection: a `CONNECT` (HTTP/1.1, or HTTP/2 with or without
+  `:protocol`, an extended `CONNECT` for `websocket` included) and an
+  HTTP/1.1 upgrade to another protocol than `websocket` (such as `h2c`)
+  are answered `502` and not sent. Before, any `2xx` to a `CONNECT`, or a
+  `101` to an `h2c` upgrade, passed the rest of the connection to the
+  client unmasked, with the real values swapped into the request that
+  opened it. The HTTP/2 relay no longer passes on the destination's
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so browsers open WebSockets over
+  HTTP/1.1, where only a `101` opens one; their frames still pass through
+  unmasked.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).
@@ -132,8 +171,34 @@ First release, planned as 0.1.0.
   memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value
   over 1 KiB ends the connection with `PROTOCOL_ERROR`. Before, one client
   could make the relay hold gigabytes on one connection.
+- Over HTTP/2, malformed messages no longer get past swapping or masking: a
+  request with a repeated, unknown or misplaced pseudo-header (two
+  `:method` fields made a `POST` look like a `CONNECT`, whose response is
+  not masked) is answered `502`; with masking on, response DATA before the
+  final head resets the stream, a real value in `content-length` is refused
+  with `502`, and trailers are masked with the values chosen at the head.
+  Client frames of unknown types go upstream under their stream's server
+  ID, or are dropped.
+- Over HTTP/2, the destination's control frames no longer carry its data to
+  the browser: GOAWAY debug data, which can echo a real value, is dropped;
+  the proxy answers the destination's PINGs itself and passes on only ACKs
+  of the browser's own PINGs; and `ALTSVC`, `ORIGIN`, `PRIORITY_UPDATE` and
+  frames of unknown types from the destination are dropped instead of
+  reaching the browser unmasked, some on the destination's stream IDs.
 - Real values with a line break or NUL are refused in every header, also
   when the client's header already holds such a byte (a NUL after a
   stand-in let a multi-line value through). Over HTTP/2, a request whose
   field values hold a NUL, CR or LF, or start or end with a space or tab
   (malformed, RFC 9113 8.2.1), is answered `502` and not sent.
+
+### Changed
+
+- Behavior change: a `CONNECT` to an internal address is refused with `403`,
+  for tunneled and decrypted hosts alike. Internal means loopback, private,
+  link-local (`169.254.169.254` included), unspecified, multicast and
+  `100.64.0.0/10`, also in IPv4-mapped or IPv4-compatible form. The proxy
+  resolves a name once, refuses it when any of its addresses is internal,
+  and dials the addresses it checked. Through `-upstream-proxy`, only
+  IP-literal destinations are checked. `-allow-private-destinations` turns
+  the check off. Tunnels without decryption are logged at info level, with
+  their host, port and principal.
