@@ -7,7 +7,10 @@
 // path-escaped, HTML-escaped, as decimal or hexadecimal character
 // references, and, for card numbers, grouped by spaces or dashes. Each form
 // is replaced by the same form of the stand-in, so the response stays valid
-// JSON, URL or HTML.
+// JSON, URL or HTML. Where several forms are the same text (a value with no
+// character to escape), the replacement is escaped for the Context it is
+// found in, as the request side escapes real values: a stand-in with a quote
+// goes into a JSON body JSON-escaped, into a Location header query-escaped.
 //
 // A Writer masks a stream with a bounded window: it holds back at most the
 // length of the longest form minus one byte, and only while those bytes
@@ -35,16 +38,87 @@ type Pair struct {
 	Real, StandIn string
 }
 
-// form is one way a real value can appear, and what replaces it.
+// Context is where masked text sits, which decides how a replacement that
+// could be any of several forms is escaped.
+type Context int
+
+// Contexts.
+const (
+	Text Context = iota // plain bodies, header values, trailers: as is
+	JSON                // JSON and JavaScript: JSON-escaped
+	URL                 // URLs, form bodies and cookies: query-escaped
+	HTML                // HTML and XML: HTML-escaped
+	numContexts
+)
+
+// encoding indexes, in the order forms tries them.
+const (
+	encIdentity = iota
+	encJSON
+	encJSONHTML
+	encQuery
+	encPath
+	encHTML
+	encDecimal
+	encHex
+	encHexUpper
+	numEncodings
+)
+
+// preferred is the encoding each context uses for an ambiguous form.
+var preferred = [numContexts]int{Text: encIdentity, JSON: encJSON, URL: encQuery, HTML: encHTML}
+
+var encodings = [numEncodings]func(string) string{
+	encIdentity: func(s string) string { return s },
+	encJSON:     func(s string) string { return jsonEscape(s, false) },
+	encJSONHTML: func(s string) string { return jsonEscape(s, true) },
+	encQuery:    url.QueryEscape,
+	encPath:     url.PathEscape,
+	encHTML:     html.EscapeString,
+	encDecimal:  func(s string) string { return references(s, "&#%d;") },
+	encHex:      func(s string) string { return references(s, "&#x%x;") },
+	encHexUpper: func(s string) string { return references(s, "&#X%X;") },
+}
+
+// ContextOf is the context of a body with this Content-Type.
+func ContextOf(contentType string) Context {
+	mediaType, _, _ := strings.Cut(contentType, ";")
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	switch {
+	case mediaType == "application/json", mediaType == "text/json", mediaType == "application/x-ndjson",
+		strings.HasSuffix(mediaType, "+json"), strings.HasSuffix(mediaType, "javascript"), strings.HasSuffix(mediaType, "ecmascript"):
+		return JSON
+	case mediaType == "application/x-www-form-urlencoded":
+		return URL
+	case mediaType == "text/html", mediaType == "application/xhtml+xml", mediaType == "text/xml",
+		mediaType == "application/xml", strings.HasSuffix(mediaType, "+xml"):
+		return HTML
+	}
+	return Text
+}
+
+// HeaderContext is the context of a header's value: URLs and cookies are
+// query-escaped, so a stand-in cannot add a parameter or attribute.
+func HeaderContext(name string) Context {
+	switch strings.ToLower(name) {
+	case "location", "content-location", "link", "refresh", "set-cookie":
+		return URL
+	}
+	return Text
+}
+
+// form is one way a real value can appear, and what replaces it in each
+// context.
 type form struct {
-	from, to []byte
+	from []byte
+	to   [numContexts][]byte
 }
 
 // Masker replaces real values with stand-ins. A nil Masker masks nothing.
 type Masker struct {
 	byFirst    [256][]form // by first byte, longest first
 	maxLen     int
-	sameLength bool
+	sameLength [numContexts]bool
 	forms      int
 }
 
@@ -58,20 +132,22 @@ func New(pairs []Pair) *Masker {
 		}
 		return sorted[i].StandIn < sorted[j].StandIn
 	})
-	m := &Masker{sameLength: true}
+	m := &Masker{sameLength: [numContexts]bool{true, true, true, true}}
 	seen := map[string]bool{}
 	for _, p := range sorted {
 		if len(p.Real) < MinLength || p.Real == p.StandIn {
 			continue
 		}
 		for _, f := range forms(p.Real, p.StandIn) {
-			if seen[string(f.from)] || bytes.Equal(f.from, f.to) {
+			if seen[string(f.from)] || f.unchanged() {
 				continue
 			}
 			seen[string(f.from)] = true
 			m.byFirst[f.from[0]] = append(m.byFirst[f.from[0]], f)
 			m.maxLen = max(m.maxLen, len(f.from))
-			m.sameLength = m.sameLength && len(f.from) == len(f.to)
+			for c := range f.to {
+				m.sameLength[c] = m.sameLength[c] && len(f.from) == len(f.to[c])
+			}
 			m.forms++
 		}
 	}
@@ -85,10 +161,19 @@ func New(pairs []Pair) *Masker {
 	return m
 }
 
-// SameLength reports whether masking never changes the length of the text:
-// every form of every real value has a stand-in of the same length. Masked
-// content can then keep its Content-Length.
-func (m *Masker) SameLength() bool { return m == nil || m.sameLength }
+func (f form) unchanged() bool {
+	for _, to := range f.to {
+		if !bytes.Equal(f.from, to) {
+			return false
+		}
+	}
+	return true
+}
+
+// SameLength reports whether masking in context c never changes the length
+// of the text: every form of every real value has a stand-in of the same
+// length. Masked content can then keep its Content-Length.
+func (m *Masker) SameLength(c Context) bool { return m == nil || m.sameLength[c] }
 
 // MaxLength is the length of the longest form, which bounds what a Writer
 // holds back.
@@ -99,28 +184,19 @@ func (m *Masker) MaxLength() int {
 	return m.maxLen
 }
 
-// String masks s.
-func (m *Masker) String(s string) string {
+// String masks s, which sits in context c.
+func (m *Masker) String(c Context, s string) string {
 	if m == nil {
 		return s
 	}
-	out, _ := m.scan(nil, []byte(s), true)
+	out, _ := m.scan(nil, []byte(s), c, true)
 	return string(out)
-}
-
-// Bytes masks b. The result may share no memory with b.
-func (m *Masker) Bytes(b []byte) []byte {
-	if m == nil {
-		return b
-	}
-	out, _ := m.scan(nil, b, true)
-	return out
 }
 
 // scan appends the masked form of buf to out. Unless final, it stops at the
 // first position where a form might begin but buf ends first, and returns
 // that position: those bytes need more input to decide.
-func (m *Masker) scan(out, buf []byte, final bool) ([]byte, int) {
+func (m *Masker) scan(out, buf []byte, c Context, final bool) ([]byte, int) {
 	i, last := 0, 0
 	for i < len(buf) {
 		candidates := m.byFirst[buf[i]]
@@ -133,7 +209,7 @@ func (m *Masker) scan(out, buf []byte, final bool) ([]byte, int) {
 			if len(buf)-i >= len(f.from) {
 				if bytes.Equal(buf[i:i+len(f.from)], f.from) {
 					out = append(out, buf[last:i]...)
-					out = append(out, f.to...)
+					out = append(out, f.to[c]...)
 					i += len(f.from)
 					last = i
 					matched = true
@@ -158,14 +234,15 @@ func (m *Masker) scan(out, buf []byte, final bool) ([]byte, int) {
 // Writer masks a stream written to it and passes the result on to w.
 type Writer struct {
 	m       *Masker
+	c       Context
 	w       io.Writer
 	pending []byte // bytes that may begin a real value, at most MaxLength-1
 }
 
-// NewWriter returns a Writer to w, which may keep the slices it is given.
-// Close flushes what it holds back.
-func (m *Masker) NewWriter(w io.Writer) *Writer {
-	return &Writer{m: m, w: w}
+// NewWriter returns a Writer to w, for text in context c. w may keep the
+// slices it is given. Close flushes what it holds back.
+func (m *Masker) NewWriter(w io.Writer, c Context) *Writer {
+	return &Writer{m: m, c: c, w: w}
 }
 
 // Write masks p. Bytes that could begin a real value are held back until the
@@ -178,7 +255,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 	if len(w.pending) > 0 {
 		buf = append(w.pending, p...)
 	}
-	out, done := w.m.scan(nil, buf, false)
+	out, done := w.m.scan(nil, buf, w.c, false)
 	w.pending = append([]byte(nil), buf[done:]...)
 	if len(out) > 0 {
 		if _, err := w.w.Write(out); err != nil {
@@ -196,7 +273,7 @@ func (w *Writer) Close() error {
 	if w.m == nil || len(w.pending) == 0 {
 		return nil
 	}
-	out, _ := w.m.scan(nil, w.pending, true)
+	out, _ := w.m.scan(nil, w.pending, w.c, true)
 	w.pending = nil
 	_, err := w.w.Write(out)
 	return err
@@ -215,24 +292,36 @@ func forms(real, standIn string) []form {
 			variants = append(variants, variant{group(real, g, sep), to})
 		}
 	}
-	encodings := []func(string) string{
-		func(s string) string { return s },
-		func(s string) string { return jsonEscape(s, false) },
-		func(s string) string { return jsonEscape(s, true) },
-		url.QueryEscape,
-		url.PathEscape,
-		html.EscapeString,
-		func(s string) string { return references(s, "&#%d;") },
-		func(s string) string { return references(s, "&#x%x;") },
-		func(s string) string { return references(s, "&#X%X;") },
-	}
 	var out []form
 	for _, v := range variants {
-		for _, encode := range encodings {
+		// The encodings that write this variant as each distinct text, in
+		// order: a text several encodings share is ambiguous, and takes the
+		// replacement of its context's encoding when that is one of them.
+		var texts []string
+		byText := map[string][]int{}
+		for e, encode := range encodings {
 			from := encode(v.from)
-			if from != "" {
-				out = append(out, form{from: []byte(from), to: []byte(encode(v.to))})
+			if from == "" {
+				continue
 			}
+			if _, ok := byText[from]; !ok {
+				texts = append(texts, from)
+			}
+			byText[from] = append(byText[from], e)
+		}
+		for _, from := range texts {
+			encs := byText[from]
+			f := form{from: []byte(from)}
+			for c := range f.to {
+				e := encs[0]
+				for _, candidate := range encs {
+					if candidate == preferred[c] {
+						e = candidate
+					}
+				}
+				f.to[c] = []byte(encodings[e](v.to))
+			}
+			out = append(out, f)
 		}
 	}
 	return out

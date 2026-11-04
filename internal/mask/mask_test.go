@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -49,14 +50,14 @@ func TestForms(t *testing.T) {
 		"no secret":            "no secret",
 	}
 	for in, want := range cases {
-		if got := m.String(in); got != want {
+		if got := m.String(Text, in); got != want {
 			t.Errorf("String(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if m.SameLength() {
+	if m.SameLength(Text) {
 		t.Error("the token's stand-in has another length")
 	}
-	if !New([]Pair{{Real: card, StandIn: cardSIn}}).SameLength() {
+	if !New([]Pair{{Real: card, StandIn: cardSIn}}).SameLength(Text) {
 		t.Error("a format-preserving card stand-in keeps every length")
 	}
 	if New([]Pair{{Real: "short", StandIn: "x"}}) != nil {
@@ -66,21 +67,21 @@ func TestForms(t *testing.T) {
 
 func TestAmexGrouping(t *testing.T) {
 	m := New([]Pair{{Real: "378282246310005", StandIn: "371449635398431"}})
-	if got := m.String("3782 822463 10005"); got != "3714 496353 98431" {
+	if got := m.String(Text, "3782 822463 10005"); got != "3714 496353 98431" {
 		t.Fatalf("got %q", got)
 	}
 }
 
 func TestNonDigitStandInReplacesGroupedCard(t *testing.T) {
 	m := New([]Pair{{Real: card, StandIn: "tok_card"}})
-	if got := m.String("4111 1111 1111 1111"); got != "tok_card" {
+	if got := m.String(Text, "4111 1111 1111 1111"); got != "tok_card" {
 		t.Fatalf("got %q", got)
 	}
 }
 
 func TestLongestFormWins(t *testing.T) {
 	m := New([]Pair{{Real: "abcdefgh", StandIn: "SHORT___"}, {Real: "abcdefghij", StandIn: "LONG______"}})
-	if got := m.String("abcdefghij abcdefgh"); got != "LONG______ SHORT___" {
+	if got := m.String(Text, "abcdefghij abcdefgh"); got != "LONG______ SHORT___" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -90,11 +91,11 @@ func TestLongestFormWins(t *testing.T) {
 func TestWriterSplitsAnywhere(t *testing.T) {
 	m := testMasker(t)
 	text := "a " + card + " b 4111 1111 1111 1111 c " + `"sk_live_a\u0026b\u003cc\u003e\"d"` + " d sk_live_a&b<c>\"d" + card
-	want := m.String(text)
+	want := m.String(Text, text)
 	for split := 0; split <= len(text); split++ {
 		for split2 := split; split2 <= len(text); split2 += 7 {
 			var out bytes.Buffer
-			w := m.NewWriter(&out)
+			w := m.NewWriter(&out, Text)
 			for _, part := range []string{text[:split], text[split:split2], text[split2:]} {
 				if _, err := w.Write([]byte(part)); err != nil {
 					t.Fatal(err)
@@ -113,7 +114,7 @@ func TestWriterSplitsAnywhere(t *testing.T) {
 	}
 	// Byte by byte.
 	var out bytes.Buffer
-	w := m.NewWriter(&out)
+	w := m.NewWriter(&out, Text)
 	for i := 0; i < len(text); i++ {
 		_, _ = w.Write([]byte{text[i]})
 	}
@@ -128,7 +129,7 @@ func TestWriterSplitsAnywhere(t *testing.T) {
 func TestWriterHoldsBackOnlyPossibleBeginnings(t *testing.T) {
 	m := testMasker(t)
 	var out bytes.Buffer
-	w := m.NewWriter(&out)
+	w := m.NewWriter(&out, Text)
 	_, _ = w.Write([]byte("data: {\"x\":1}\n\n"))
 	if out.String() != "data: {\"x\":1}\n\n" || w.Pending() != 0 {
 		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
@@ -211,5 +212,50 @@ func TestDecoder(t *testing.T) {
 				t.Fatalf("over the limit: %v", err)
 			}
 		})
+	}
+}
+
+// A stand-in that needs escaping is escaped for the context the value is
+// found in, so the response keeps its meaning: JSON stays valid, a URL keeps
+// its parameters, HTML its attributes.
+func TestReplacementsAreEscapedForTheirContext(t *testing.T) {
+	m := New([]Pair{{Real: "abcdefgh", StandIn: `q"x&y=1 <z>`}})
+	cases := []struct {
+		c        Context
+		in, want string
+	}{
+		{JSON, `{"token":"abcdefgh"}`, `{"token":"q\"x&y=1 <z>"}`},
+		{URL, `/done?t=abcdefgh&n=1`, `/done?t=q%22x%26y%3D1+%3Cz%3E&n=1`},
+		{HTML, `<input value="abcdefgh">`, `<input value="q&#34;x&amp;y=1 &lt;z&gt;">`},
+		{Text, `token abcdefgh`, `token q"x&y=1 <z>`},
+	}
+	for _, c := range cases {
+		if got := m.String(c.c, c.in); got != c.want {
+			t.Errorf("context %d: %q, want %q", c.c, got, c.want)
+		}
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(m.String(JSON, `{"token":"abcdefgh"}`)), &decoded); err != nil || decoded["token"] != `q"x&y=1 <z>` {
+		t.Fatalf("masked JSON: %v %q", err, decoded)
+	}
+	// A form that is unambiguous keeps its own encoding in every context.
+	m = New([]Pair{{Real: "a&bcdefgh", StandIn: "q&x"}})
+	if got := m.String(Text, "t=a%26bcdefgh"); got != "t=q%26x" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestContextOf(t *testing.T) {
+	for ct, want := range map[string]Context{
+		"application/json; charset=utf-8": JSON, "application/problem+json": JSON, "text/javascript": JSON,
+		"application/x-www-form-urlencoded": URL, "text/html; charset=utf-8": HTML, "application/xml": HTML,
+		"image/svg+xml": HTML, "text/plain": Text, "": Text,
+	} {
+		if got := ContextOf(ct); got != want {
+			t.Errorf("ContextOf(%q) = %d, want %d", ct, got, want)
+		}
+	}
+	if HeaderContext("Location") != URL || HeaderContext("Set-Cookie") != URL || HeaderContext("X-Token") != Text {
+		t.Error("header contexts")
 	}
 }
