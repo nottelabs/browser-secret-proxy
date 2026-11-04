@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -331,6 +332,100 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 	s, _ := testSealed(t, key)
 	if _, err := s.Authenticate("u", token); err != nil {
 		t.Fatalf("a token Seal accepted was refused: %v", err)
+	}
+	// An empty host list would be left out of the claims, and the values
+	// could then go to any host in -hosts.
+	p.Hosts = []string{}
+	if _, err := Seal(&key.PublicKey, testIssuer, p); err == nil {
+		t.Fatal("a token with an empty host list was sealed")
+	}
+}
+
+// sealClaims signs claims exactly as given, then seals them to key.
+func sealClaims(t *testing.T, key *ecdsa.PrivateKey, claims string) string {
+	t.Helper()
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: testIssuer}, (&jose.SignerOptions{}).WithType("JWT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := signer.Sign([]byte(claims))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws, err := obj.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encryptAsJWT(t, key, []byte(jws), true)
+}
+
+// The claims are read as the issuer wrote them. encoding/json alone would
+// take a member in any case and let the last of two win, so "HOSTS": []
+// or a second "exp" after the ones the issuer checked would lift the host
+// restriction or extend the token: such claims are refused. Members the
+// proxy does not use are still allowed.
+func TestSealedClaimsAreDecodedStrictly(t *testing.T) {
+	key := ecKey(t)
+	s, _ := testSealed(t, key)
+	exp := time.Now().Add(time.Hour).Unix()
+	later := exp + 10*365*24*3600
+	claims := func(values, extra string) string {
+		return fmt.Sprintf(`{"values":%s,"hosts":["api.test"],"aud":%q,"exp":%d%s}`, values, testAudience, exp, extra)
+	}
+	const values = `{"tok_a":"real-secret-a"}`
+	for name, c := range map[string]string{
+		"as signed":         claims(values, ""),
+		"unknown members":   claims(values, `,"jti":"j1","iss":"issuer","nested":{"a":1,"A":2}`),
+		"stand-ins by case": claims(`{"tok_a":"real-secret-a","TOK_A":"real-secret-b"}`, ""),
+	} {
+		p, err := s.Authenticate("u", sealClaims(t, key, c))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		res, err := s.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Principal: p})
+		if v := res.Values["tok_a"]; err != nil || v.Real != "real-secret-a" || strings.Join(v.Hosts, ",") != "api.test" || !v.ExpiresAt.Equal(time.Unix(exp, 0)) {
+			t.Errorf("%s: resolved %v, hosts %q, expiry %v, err %v", name, v.Real == "real-secret-a", v.Hosts, v.ExpiresAt, err)
+		}
+	}
+	for name, c := range map[string]string{
+		"hosts in upper case":    claims(values, `,"HOSTS":[]`),
+		"hosts with a long s":    claims(values, `,"hoſts":[]`),
+		"hosts twice":            claims(values, `,"hosts":[]`),
+		"exp in upper case":      claims(values, fmt.Sprintf(`,"EXP":%d`, later)),
+		"exp twice":              claims(values, fmt.Sprintf(`,"exp":%d`, later)),
+		"aud in another case":    claims(values, `,"Aud":"proxy-other"`),
+		"values in another case": claims(values, `,"Values":{"tok_b":"real-secret-b"}`),
+		"a stand-in twice":       claims(`{"tok_a":"real-secret-a","tok_a":"real-secret-b"}`, ""),
+		"a nested member twice":  claims(values, `,"extra":{"a":1,"a":2}`),
+	} {
+		_, err := s.Authenticate("u", sealClaims(t, key, c))
+		if !errors.Is(err, ErrUnauthenticated) {
+			t.Errorf("%s: err = %v, want ErrUnauthenticated", name, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "real-secret") || strings.Contains(err.Error(), "tok_") {
+			t.Errorf("%s: the error quotes the claims: %v", name, err)
+		}
+	}
+}
+
+// An empty host list in a token is not the same as none: the values may go
+// nowhere (the scope refuses them), not wherever -hosts allows.
+func TestSealedKeepsAnEmptyHostList(t *testing.T) {
+	key := ecKey(t)
+	s, _ := testSealed(t, key)
+	exp := time.Now().Add(time.Hour).Unix()
+	for hosts, want := range map[string][]string{`,"hosts":[]`: {}, `,"hosts":null`: nil, ``: nil} {
+		token := sealClaims(t, key, fmt.Sprintf(`{"values":{"tok_a":"real-secret-a"},"aud":%q,"exp":%d%s}`, testAudience, exp, hosts))
+		p, err := s.Authenticate("u", token)
+		if err != nil {
+			t.Fatalf("%q: %v", hosts, err)
+		}
+		res, err := s.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Principal: p})
+		if got := res.Values["tok_a"].Hosts; err != nil || (got == nil) != (want == nil) || len(got) != 0 {
+			t.Errorf("%q: hosts %#v, err %v", hosts, got, err)
+		}
 	}
 }
 

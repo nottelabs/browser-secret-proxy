@@ -129,7 +129,7 @@ func otherConnectionWorks(t *testing.T) {
 	}
 }
 
-var ping = Frame{Type: FramePing, Payload: make([]byte, 8)}
+var panicPing = Frame{Type: FramePing, Payload: make([]byte, 8)}
 
 // A panic on any goroutine the relay starts ends that connection only.
 func TestGoroutinePanicEndsOnlyItsConnection(t *testing.T) {
@@ -151,22 +151,33 @@ func TestGoroutinePanicEndsOnlyItsConnection(t *testing.T) {
 	}{
 		{"server loop", nil, func(p *panicking) {
 			p.server.onRead.Store(true)
-			writeAsync(p.harness.server, ping)
+			writeAsync(p.harness.server, panicPing)
 		}, "(*relay).serverLoop"},
 		{"client loop", nil, func(p *panicking) {
 			p.client.onRead.Store(true)
-			writeAsync(p.harness.client, ping)
+			writeAsync(p.harness.client, panicPing)
 		}, "(*relay).clientLoop"},
-		{"send loop", nil, func(p *panicking) {
+		{"send loop", streaming, func(p *panicking) {
 			// A streamed request goes out at once; its body from sendLoop.
-			p.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: p.clientBlock(otherRequest("POST")...)})
+			p.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: p.clientBlock(request("POST")...)})
 			p.expect(p.toServer, "server", isType(FrameHeaders))
 			p.server.onWrite.Store(true)
 			writeAsync(p.harness.client, data(1, "body", true))
 		}, "(*relay).sendLoop"},
+		{"PING ACK loop", nil, func(p *panicking) {
+			p.server.onWrite.Store(true)
+			writeAsync(p.harness.server, panicPing)
+		}, "(*relay).ackLoop"},
+		{"SETTINGS timeout GOAWAY", func(o *Options) { o.SettingsTimeout = stepTimeout }, func(p *panicking) {
+			p.serverSend(Frame{Type: FrameSettings})
+			p.expect(p.toClient, "client", isType(FrameSettings))
+			// Do not acknowledge this SETTINGS. The timer's GOAWAY writer
+			// must contain a panic just as the main relay loops do.
+			p.client.onWrite.Store(true)
+		}, "(*relay).goAwayClient"},
 		{"masked server loop", masking(t, true), func(p *panicking) {
 			p.server.onRead.Store(true)
-			writeAsync(p.harness.server, ping)
+			writeAsync(p.harness.server, panicPing)
 		}, "(*relay).serverLoopMasked"},
 		{"client send loop", masking(t, true), func(p *panicking) {
 			// A masked body reaches the client from clientSendLoop.
@@ -214,7 +225,7 @@ func TestPanicWithTheLockHeldStillEndsTheRelay(t *testing.T) {
 		}
 	}()
 	p.server.onRead.Store(true)
-	writeAsync(p.harness.server, ping)
+	writeAsync(p.harness.server, panicPing)
 	select {
 	case <-p.done: //nolint:errcheck // only waits for the relay to stop
 	case <-time.After(waitFor):

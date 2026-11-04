@@ -63,9 +63,9 @@ func (r *relay) resolveLookup(s *stream, lookup *scope.Lookup, done func(*swap.S
 //
 // At most MaxLookups lookups run at once, each on a goroutine; the others
 // wait in lookupQueue, in order, with no goroutine of their own. A stream
-// has at most two lookups (its request, and an extended CONNECT's
-// trailers), and a dropped stream's waiting lookups leave the queue, so the
-// queue is bounded by the open streams (MaxStreams).
+// has at most two lookups (its request, and a streamed request's trailers),
+// and a dropped stream's waiting lookups leave the queue, so the queue is
+// bounded by the open streams (MaxStreams).
 func (r *relay) lookupLocked(s *stream, lookup *scope.Lookup, done func(*swap.Swapper, error) error) {
 	if s.lookupCtx == nil {
 		s.lookupCtx, s.lookupCancel = context.WithCancel(r.ctx)
@@ -128,7 +128,8 @@ func (r *relay) runLookup(ctx context.Context, p pendingLookup) {
 // a stream error of type STREAM_CLOSED (RFC 9113 5.1), which resets the
 // stream on both sides, and cancels its lookup. Such a frame never starts
 // another lookup or reaches the server. Past maxStreamErrors, the
-// connection ends with PROTOCOL_ERROR.
+// connection ends with PROTOCOL_ERROR; the drop also counts toward the
+// reset limit (clientDropped).
 func (r *relay) endedStream(s *stream, credit int) error {
 	r.streamErrors++
 	if r.streamErrors > maxStreamErrors {
@@ -148,6 +149,9 @@ func (r *relay) endedStream(s *stream, credit int) error {
 		r.forgetResetLocked(s)
 	}
 	r.mu.Unlock()
+	if err := r.clientDropped(); err != nil {
+		return err
+	}
 	if serverID != 0 {
 		if err := r.writeServer(Frame{Type: FrameRSTStream, Stream: serverID, Payload: binary.BigEndian.AppendUint32(nil, errCodeCancel)}); err != nil {
 			return err
@@ -172,8 +176,8 @@ func (r *relay) refuseLookup(s *stream, cause error) error {
 	return r.badGateway(s.clientID, s.authority, ended, cause)
 }
 
-// openResolved opens a stream that is not buffered (no body, or an extended
-// CONNECT) once its lookup answered.
+// openResolved opens a stream that is not buffered (no body) once its lookup
+// answered.
 func (r *relay) openResolved(s *stream, fields []hpack.HeaderField, priority *Priority, endStream bool, swapper *swap.Swapper, err error) error {
 	if err != nil {
 		return r.refuseLookup(s, err)
@@ -184,6 +188,10 @@ func (r *relay) openResolved(s *stream, fields []hpack.HeaderField, priority *Pr
 	if err := r.swapFields(swapper, fields, s.authority); err != nil {
 		// Nothing went upstream, so the client may retry elsewhere.
 		r.opts.Logger.Error("refusing a request whose swapped headers cannot be sent", "stream", s.clientID, "error", err)
+		return r.abort(s, errCodeRefusedStream)
+	}
+	if !r.recountFields(s, fields, nil) {
+		r.opts.Logger.Error("refusing a request whose swapped headers pass the connection buffer limit", "stream", s.clientID, "connection_limit_bytes", r.opts.MaxBuffered)
 		return r.abort(s, errCodeRefusedStream)
 	}
 	return r.open(s, fields, priority, endStream)

@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"flag"
+	"io"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 )
 
 func TestDescribeParentLeavesCredentialsOut(t *testing.T) {
@@ -20,6 +23,32 @@ func TestDescribeParentLeavesCredentialsOut(t *testing.T) {
 	got := describeParent(u)
 	if got != "http://proxy.example:8080" || strings.Contains(got, "minted") || strings.Contains(got, "secret") {
 		t.Fatalf("describeParent = %q", got)
+	}
+}
+
+func TestMaskStreamWindowFlag(t *testing.T) {
+	parse := func(args ...string) (mask.Window, error) {
+		fs, opts := newFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		err := fs.Parse(args)
+		return *opts.maskWindow, err
+	}
+	for args, want := range map[string]mask.Window{
+		"":                            mask.Fixed,
+		"-mask-stream-window=fixed":   mask.Fixed,
+		"-mask-stream-window=minimal": mask.Minimal,
+	} {
+		got, err := parse(strings.Fields(args)...)
+		if err != nil || got != want {
+			t.Fatalf("%q: got %v, %v", args, got, err)
+		}
+	}
+	// An unknown value refuses to start, and says what is accepted.
+	for _, bad := range []string{"none", "Minimal", ""} {
+		_, err := parse("-mask-stream-window=" + bad)
+		if err == nil || !strings.Contains(err.Error(), "want fixed or minimal") {
+			t.Fatalf("%q: %v", bad, err)
+		}
 	}
 }
 
@@ -96,5 +125,41 @@ func TestParseParentErrorsLeaveCredentialsOut(t *testing.T) {
 	}
 	if u, err := parseParent(""); u != nil || err != nil {
 		t.Fatalf("empty: %v, %v", u, err)
+	}
+}
+
+// Resource-limit flags remain on the FlagSet used by run after integrating
+// the credential-safe usage handling.
+func TestConnectionLimitFlags(t *testing.T) {
+	fs, opts := newFlagSet("test", flag.ContinueOnError)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if opts.idleTimeout.String() != "5m0s" || opts.headerTimeout.String() != "10s" || opts.maxConns != 1024 {
+		t.Fatalf("defaults: idle %s, header %s, max %d", opts.idleTimeout, opts.headerTimeout, opts.maxConns)
+	}
+	if err := fs.Parse([]string{"-idle-timeout=0", "-header-timeout=2s", "-max-conns=7"}); err != nil {
+		t.Fatal(err)
+	}
+	if opts.idleTimeout != 0 || opts.headerTimeout.String() != "2s" || opts.maxConns != 7 {
+		t.Fatalf("overrides: idle %s, header %s, max %d", opts.idleTimeout, opts.headerTimeout, opts.maxConns)
+	}
+}
+
+// The private-destination override must remain registered on the FlagSet
+// used by run, alongside the credential-safe usage handling.
+func TestAllowPrivateDestinationsFlag(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		fs, opts := newFlagSet("test", flag.ContinueOnError)
+		var args []string
+		if enabled {
+			args = []string{"-allow-private-destinations"}
+		}
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		if opts.allowPrivate != enabled {
+			t.Fatalf("allowPrivate = %t, want %t", opts.allowPrivate, enabled)
+		}
 	}
 }

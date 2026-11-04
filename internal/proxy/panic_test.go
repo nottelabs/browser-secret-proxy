@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -13,6 +14,52 @@ import (
 // relayPanicValue is what a panicking destination connection panics with.
 // It stands for a real value, so it must never reach a log.
 const relayPanicValue = "sk_live_real_secret_value_in_a_panic"
+
+// idlePanicHandler injects a failure on the idle timer's goroutine.
+type idlePanicHandler struct{ slog.Handler }
+
+func (h idlePanicHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return idlePanicHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h idlePanicHandler) WithGroup(name string) slog.Handler {
+	return idlePanicHandler{h.Handler.WithGroup(name)}
+}
+
+func (h idlePanicHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if rec.Message == "closing an idle connection" {
+		panic(relayPanicValue)
+	}
+	return h.Handler.Handle(ctx, rec)
+}
+
+func TestIdleTimerPanicClosesOnlyItsConnection(t *testing.T) {
+	destinationClosed := make(chan struct{}, 1)
+	plain := startTCPDestination(t, func(c net.Conn) {
+		_, _ = io.Copy(io.Discard, c)
+		destinationClosed <- struct{}{}
+	})
+	dest := startDestination(t, allowedHost, []string{"http/1.1"}, respondOK)
+	p := startProxy(t, mapDialer{otherHost + ":443": plain, allowedHost + ":443": dest.addr}, dest.ca, func(c *Config) {
+		c.IdleTimeout = 300 * time.Millisecond
+		c.Logger = slog.New(idlePanicHandler{c.Logger.Handler()})
+	})
+	conn, resp := connect(t, p.addr, otherHost+":443", "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("CONNECT answered %s", resp.Status)
+	}
+	expectClosed(t, conn, 5*time.Second)
+	select {
+	case <-destinationClosed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("destination connection not closed")
+	}
+	waitForLog(t, p, "idle timer panicked", "panic_type=string", "proxy.idlePanicHandler.Handle")
+	conn2, resp := connect(t, p.addr, allowedHost+":443", "")
+	_ = resp.Body.Close()
+	getOK(t, chromeClient(t, conn2, allowedHost, p.ca), allowedHost)
+}
 
 // panicConn panics once in Read or Write once armed: a bug hit once.
 type panicConn struct {
