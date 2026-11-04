@@ -570,7 +570,17 @@ host.
   resolver that issues it.
 - **Responses** are masked for known forms of the values only: see
   [what masking misses](#what-masking-misses).
-- **WebSockets** and other upgraded connections get no swaps once upgraded.
+- **WebSockets** get no swaps and no masking once upgraded. They are the
+  only tunnel the proxy opens inside an intercepted connection: an HTTP/1.1
+  `Upgrade: websocket`, or an HTTP/2 extended `CONNECT` with `:protocol`
+  `websocket`. The handshake request is swapped like any other and the head
+  of its answer is masked, but once the destination accepts it, the frames
+  pass through untouched both ways. A WebSocket endpoint that echoes a value
+  from its handshake (`wss://host/ws?token=...`) returns it unmasked. Every
+  other tunnel is answered `502` and not sent, so its answer cannot pass
+  through unmasked: a `CONNECT` inside an intercepted connection (HTTP/1.1,
+  or HTTP/2 without `:protocol`), another HTTP/2 `:protocol`, and an
+  HTTP/1.1 upgrade to another protocol, such as `h2c`.
 
 ## Exposing the proxy
 
@@ -703,9 +713,11 @@ How a masked response changes:
   destination already had on file before the principal sent its stand-in,
   is not masked. Values looked up for another principal
   are not masked on this one's connections.
-- WebSockets and other tunnels (an HTTP/1.1 upgrade or an accepted HTTP/2
-  `CONNECT`), whose frames pass through untouched, and responses on hosts
-  that are not allowlisted (they are never decrypted).
+- WebSocket frames (after an HTTP/1.1 upgrade or an HTTP/2 extended
+  `CONNECT` the destination accepted), which pass through untouched, even a
+  value the destination echoes from the swapped handshake. Other tunnels
+  are refused: see [what it does not guarantee](#what-it-does-not-guarantee).
+- Responses on hosts that are not allowlisted (they are never decrypted).
 
 Allowlist only the endpoints that need the values, and check what they
 return.
@@ -727,7 +739,8 @@ return.
 - `Expect: 100-continue` is answered by the proxy, which needs the whole body
   before forwarding the request.
 - WebSockets (extended CONNECT over HTTP/2, HTTP/1.1 upgrades) are streamed
-  without swaps once the destination accepts them.
+  without swaps once the destination accepts them. Other tunnels inside an
+  intercepted connection (`CONNECT`, an upgrade to `h2c`) get `502`.
 - Text formats other than JSON and forms (XML, multipart) get real values as
   is; a value that needs escaping in such a body is not escaped.
 - HTTP/2 clients must respect flow control: a client that sends past its

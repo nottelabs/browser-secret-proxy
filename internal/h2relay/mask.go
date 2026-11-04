@@ -589,10 +589,11 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 			contentType = f.Value
 		}
 	}
-	// An accepted CONNECT (2xx: a WebSocket over extended CONNECT) carries a
-	// tunnel, not a body: its frames pass through untouched, like an
-	// HTTP/1.1 upgrade. A refused one has an ordinary body, masked like any
-	// other.
+	// An accepted CONNECT (2xx) carries a tunnel, not a body: its frames
+	// pass through untouched, like an HTTP/1.1 upgrade. Only an extended
+	// CONNECT for a WebSocket is sent (requestHead refuses any other), so a
+	// 2xx to an ordinary request is never a tunnel. A refused CONNECT has an
+	// ordinary body, masked like any other.
 	tunnel := method == "CONNECT" && len(status) == 3 && status[0] == '2'
 	// A 2xx to CONNECT, 204 included, is a tunnel: its DATA is the tunnel's.
 	bodiless := !tunnel && (method == "HEAD" || status == "204" || status == "304")

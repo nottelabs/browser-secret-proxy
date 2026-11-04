@@ -1016,8 +1016,15 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // than one :authority or host, of which a server may use another than the
 // one checked. Session.CheckAuthority refuses a host that disagrees with
 // :authority.
+//
+// It also refuses every CONNECT but an extended CONNECT for a WebSocket
+// (RFC 8441), a :protocol on any other request, and more than one :method,
+// of which a server may use another than the relay: the response to an
+// accepted CONNECT is a tunnel that passes through unmasked, and a plain
+// CONNECT is accepted by any catch-all handler that answers 200.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
-	authorityFields, hostFields, uppercase := 0, 0, ""
+	methodFields, authorityFields, hostFields, uppercase := 0, 0, 0, ""
+	var protocols []string
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
@@ -1025,19 +1032,27 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		switch f.Name {
 		case ":method":
 			method = f.Value
+			methodFields++
 		case ":authority":
 			authorities = append(authorities, f.Value)
 			authorityFields++
 		case "host":
 			authorities = append(authorities, f.Value)
 			hostFields++
+		case ":protocol":
+			protocols = append(protocols, f.Value)
 		}
 	}
+	webSocket := method == "CONNECT" && len(protocols) == 1 && strings.EqualFold(protocols[0], "websocket")
 	switch {
 	case uppercase != "":
 		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
 	case authorityFields > 1 || hostFields > 1:
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
+	case methodFields > 1:
+		err = fmt.Errorf("%w: more than one :method field", scope.ErrRefused)
+	case (strings.EqualFold(method, "CONNECT") || len(protocols) > 0) && !webSocket:
+		err = fmt.Errorf("%w: a tunnel other than an extended CONNECT for a WebSocket", scope.ErrRefused)
 	}
 	return method, authorities, err
 }

@@ -160,6 +160,59 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 	}
 }
 
+// A CONNECT other than an extended CONNECT for a WebSocket (RFC 8441) is
+// answered 502 before any swap and never sent: the server's 2xx to it, an
+// ordinary page from a catch-all handler as much as a real tunnel, would
+// reach the client unmasked. So is a :protocol on another method, which a
+// server could still take for a tunnel, and a second :method, which a
+// server could read instead of the one the relay saw.
+func TestTunnelRequestsAreAnswered502(t *testing.T) {
+	protocol := func(value string) hpack.HeaderField { return hpack.HeaderField{Name: ":protocol", Value: value} }
+	token := hpack.HeaderField{Name: "x-token", Value: "tok_standin"}
+	for name, fields := range map[string][]hpack.HeaderField{
+		"plain CONNECT": {
+			{Name: ":method", Value: "CONNECT"}, {Name: ":authority", Value: "allowed.test"}, token,
+		},
+		"plain CONNECT with a path":        request("CONNECT", token),
+		"extended CONNECT for connect-udp": request("CONNECT", protocol("connect-udp"), token),
+		"two :protocol fields":             request("CONNECT", protocol("websocket"), protocol("connect-ip")),
+		"lower-case connect":               request("connect", protocol("websocket")),
+		":protocol on a GET":               request("GET", protocol("websocket"), token),
+		"a GET that names CONNECT too": append([]hpack.HeaderField{{Name: ":method", Value: "GET"}},
+			request("CONNECT", protocol("websocket"), token)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(fields...)})
+			h.expect(h.toClient, "client", isBadGateway(1))
+			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+		})
+	}
+}
+
+// An extended CONNECT for a WebSocket goes through, its fields swapped,
+// whatever the case of its :protocol.
+func TestWebSocketConnectIsSwapped(t *testing.T) {
+	h := newHarness(t, nil)
+	fields := request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "WebSocket"})
+	fields[3].Value = "/socket?k=tok_standin"
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(fields...)})
+	f := h.expect(h.toServer, "server", isType(FrameHeaders))
+	_, fragment, err := HeadersPayload(f.Flags, f.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := hpack.NewDecoder(4096, nil).DecodeFull(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range got {
+		if field.Name == ":path" && field.Value != "/socket?k=real_value" {
+			t.Fatalf(":path %q", field.Value)
+		}
+	}
+}
+
 // A host that agrees with :authority is not refused.
 func TestHostAgreeingWithAuthorityIsSwapped(t *testing.T) {
 	h := newHarness(t, nil)
