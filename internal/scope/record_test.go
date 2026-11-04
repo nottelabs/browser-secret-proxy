@@ -2,6 +2,9 @@ package scope
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,6 +146,74 @@ func TestRecordIsBounded(t *testing.T) {
 	}
 	if len(rec.principals) > MaxPrincipals {
 		t.Fatalf("%d principals kept", len(rec.principals))
+	}
+}
+
+// A lookup never evicts its own values from the record, even when every
+// value on record was looked up at the same time: a response echoing any
+// of them is masked. A lookup with more values than the record keeps per
+// principal is refused, since its response could not be masked, and
+// leaves the record as it was.
+func TestALookupNeverEvictsItsOwnValues(t *testing.T) {
+	values := map[string]string{}
+	standIns := make([]string, MaxValuesPerPrincipal+200)
+	for i := range standIns {
+		standIns[i] = fmt.Sprintf("tok_%04d", i)
+		values[standIns[i]] = fmt.Sprintf("real_value_%04d", i)
+	}
+	r, err := resolve.NewStatic(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts, _ := hostmatch.New([]string{"api.example.com"})
+	detector, err := resolve.NewDetector(r, resolve.Patterns{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	newScope := func(masking bool) *Scope {
+		sc, err := New(Config{Resolver: r, Detector: detector, Hosts: hosts, Mask: masking, Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(sc.Close)
+		return sc
+	}
+	s := newScope(true).Session(resolve.Principal{ID: "u", Password: "p"}, "api.example.com")
+	send := func(standIns []string) (string, error) {
+		t.Helper()
+		body := strings.Join(standIns, " ")
+		sw, err := s.Swapper(context.Background(), swap.Part{Place: swap.BodyPlace("text/plain"), Text: body})
+		if err != nil {
+			return "", err
+		}
+		sent, _, err := sw.Body("text/plain", []byte(body), 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(sent), nil
+	}
+	if _, err := send(standIns[:200]); err != nil {
+		t.Fatal(err)
+	}
+	full := standIns[200:]
+	sent, err := send(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The destination echoes the body it received.
+	if echoed := s.Masker().String(mask.Text, sent); echoed != strings.Join(full, " ") {
+		t.Fatalf("%d real values of the lookup reach the client", strings.Count(echoed, "real_value_"))
+	}
+	if _, err := send(standIns); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a lookup of %d values: %v, want a refusal", len(standIns), err)
+	}
+	if echoed := s.Masker().String(mask.Text, sent); echoed != strings.Join(full, " ") {
+		t.Fatal("a refused lookup changed the record")
+	}
+	// Without masking there is nothing to keep, and no bound.
+	if _, err := newScope(false).Session(resolve.Principal{ID: "u"}, "api.example.com").Swapper(context.Background(), swap.Part{Place: swap.Literal, Text: strings.Join(standIns, " ")}); err != nil {
+		t.Fatalf("without masking: %v", err)
 	}
 }
 

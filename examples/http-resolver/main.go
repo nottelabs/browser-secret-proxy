@@ -27,8 +27,10 @@ import (
 )
 
 type value struct {
-	Real  string   `json:"real"`
-	Hosts []string `json:"hosts,omitempty"`
+	Real string `json:"real"`
+	// Hosts is null for a plain string. An empty list is answered as one,
+	// which the proxy refuses: left out, it would mean any host in -hosts.
+	Hosts []string `json:"hosts"`
 }
 
 func (v *value) UnmarshalJSON(data []byte) error {

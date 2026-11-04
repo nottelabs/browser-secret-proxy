@@ -10,11 +10,11 @@ import (
 
 func TestHandlerAnswersTheResolverAPI(t *testing.T) {
 	var values map[string]value
-	if err := json.Unmarshal([]byte(`{"tok_a": "real_a", "tok_b": {"real": "real_b", "hosts": ["api.test"]}}`), &values); err != nil {
+	if err := json.Unmarshal([]byte(`{"tok_a": "real_a", "tok_b": {"real": "real_b", "hosts": ["api.test"]}, "tok_d": {"real": "real_d", "hosts": []}}`), &values); err != nil {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"stand_ins": ["tok_a", "tok_b", "tok_c"], "host": "api.test", "principal_id": "u"}`))
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"stand_ins": ["tok_a", "tok_b", "tok_c", "tok_d"], "host": "api.test", "principal_id": "u"}`))
 	handler(values).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
@@ -30,6 +30,11 @@ func TestHandlerAnswersTheResolverAPI(t *testing.T) {
 	}
 	a, b := answer.Values["tok_a"], answer.Values["tok_b"]
 	if a.Real == nil || *a.Real != "real_a" || len(a.Hosts) != 0 || b.Real == nil || *b.Real != "real_b" || len(b.Hosts) != 1 {
+		t.Fatalf("answer %s", rec.Body.String())
+	}
+	// An empty host list is passed on as one (the proxy then refuses the
+	// value), not dropped, which would let it go to any host in -hosts.
+	if d := answer.Values["tok_d"]; a.Hosts != nil || d.Hosts == nil || len(d.Hosts) != 0 {
 		t.Fatalf("answer %s", rec.Body.String())
 	}
 	if _, ok := answer.Values["tok_c"]; ok {

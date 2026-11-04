@@ -2,6 +2,7 @@ package scope
 
 import (
 	"crypto/sha256"
+	"slices"
 	"sync"
 	"time"
 
@@ -18,7 +19,8 @@ const (
 	// longer in use.
 	Retention = 15 * time.Minute
 	// MaxValuesPerPrincipal bounds the values masked for one principal; the
-	// least recently resolved go first.
+	// least recently resolved go first, but never those of the lookup that
+	// adds them. A request whose lookup alone has more is refused.
 	MaxValuesPerPrincipal = 1024
 	// MaxPrincipals bounds the principals with values on record; the least
 	// recently active go first.
@@ -139,9 +141,29 @@ func (r *record) close() {
 }
 
 // add records values resolved for p, each until its expiry or Retention
-// from now, whichever is first.
-func (r *record) add(p resolve.Principal, values map[string]resolve.Value) {
+// from now, whichever is first. When there are more than
+// MaxValuesPerPrincipal on record, the least recently resolved go first,
+// but never one of these values: when these alone are more than
+// MaxValuesPerPrincipal, add records nothing and returns false.
+func (r *record) add(p resolve.Principal, values map[string]resolve.Value) bool {
 	now := r.now()
+	kept := make(map[string]entry, len(values)) // by real value
+	for standIn, v := range values {
+		if len(v.Real) < mask.MinLength {
+			continue
+		}
+		until := now.Add(Retention)
+		if !v.ExpiresAt.IsZero() && v.ExpiresAt.Before(until) {
+			until = v.ExpiresAt
+		}
+		if !now.Before(until) {
+			continue // already expired: never kept
+		}
+		kept[v.Real] = entry{standIn: standIn, seen: now, until: until}
+	}
+	if len(kept) > MaxValuesPerPrincipal {
+		return false
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := keyOf(p)
@@ -155,35 +177,31 @@ func (r *record) add(p resolve.Principal, values map[string]resolve.Value) {
 		r.principals[key] = pv
 	}
 	pv.seen = now
-	for standIn, v := range values {
-		if len(v.Real) < mask.MinLength {
-			continue
-		}
-		until := now.Add(Retention)
-		if !v.ExpiresAt.IsZero() && v.ExpiresAt.Before(until) {
-			until = v.ExpiresAt
-		}
-		if !now.Before(until) {
-			continue // already expired: never kept
-		}
-		if old, ok := pv.values[v.Real]; !ok || old.standIn != standIn {
+	for real, e := range kept {
+		if old, ok := pv.values[real]; !ok || old.standIn != e.standIn {
 			pv.stale = true
 		}
-		pv.values[v.Real] = entry{standIn: standIn, seen: now, until: until}
-		r.armLocked(until)
+		pv.values[real] = e
+		r.armLocked(e.until)
 	}
 	pv.dropExpired(now)
-	for len(pv.values) > MaxValuesPerPrincipal {
-		oldest := ""
-		for real, e := range pv.values {
-			if oldest == "" || e.seen.Before(pv.values[oldest].seen) {
-				oldest = real
+	if excess := len(pv.values) - MaxValuesPerPrincipal; excess > 0 {
+		// Only values of earlier lookups go, oldest first: one may carry
+		// this same time, so comparing times alone could drop one of these.
+		older := make([]string, 0, len(pv.values)-len(kept))
+		for real := range pv.values {
+			if _, ok := kept[real]; !ok {
+				older = append(older, real)
 			}
 		}
-		delete(pv.values, oldest)
+		slices.SortFunc(older, func(a, b string) int { return pv.values[a].seen.Compare(pv.values[b].seen) })
+		for _, real := range older[:excess] {
+			delete(pv.values, real)
+		}
 		pv.stale = true
 		pv.masker = nil
 	}
+	return true
 }
 
 // forget drops every value on record for p: its credential is no longer

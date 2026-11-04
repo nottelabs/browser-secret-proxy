@@ -333,11 +333,16 @@ Your service answers `200` with the values it releases:
 {"values": {"tok_1": {"real": "<real value>", "hosts": ["api.example.com"], "expires_at": "2026-01-02T15:04:05Z"}}}
 ```
 
+- `host` is the `CONNECT` host as `-hosts` matches it: in lower case,
+  without the port or a trailing dot. `API.Example.COM.:443` is sent as
+  `api.example.com`.
 - `principal_id` is the proxy username of the connection
   (`SECRET_PROXY_USERNAME`), empty when authentication is off. The proxy
   password is never sent.
 - `hosts` (optional) restricts the value to those hosts, in the `-hosts`
-  syntax. Without it the value may go to any host in `-hosts`.
+  syntax. Without it, or with `null`, the value may go to any host in
+  `-hosts`. An empty list (`"hosts": []`) is not the same: like any invalid
+  list, it refuses the request.
 - `expires_at` (optional) is when the value stops being used.
 - Leave out any stand-in you do not release for this host or principal. The
   request is then refused, as it is for any other status, a malformed answer,
@@ -394,6 +399,9 @@ The signed claims carry the values:
 - `nbf` and `iat` (optional, Unix seconds): a token is refused before
   `nbf`, or when `iat` is in the future, beyond 30 seconds of clock skew.
 - `hosts` (optional) restricts every value of the token to those hosts.
+  Without it the values may go to any host in `-hosts`. An empty list
+  refuses every request that carries one of them, and `examples/seal`
+  refuses to seal one.
 - `sub` (optional) names the principal in logs; the username is used when it
   is empty. Neither changes what the token gives: the principal is the token
   itself, so its values are masked on all of its connections, whatever
@@ -407,7 +415,11 @@ key, is not signed by a configured issuer key, was altered, is for another
 audience, or has expired gets `407`. So does a token in the earlier
 encrypt-only format, and a token that is not in its canonical compact form
 (five segments of unpadded base64url, without line breaks or non-zero
-unused bits), so a token cannot be presented as several passwords. A
+unused bits), so a token cannot be presented as several passwords. So
+does a token whose claims name a member twice, at any depth, or spell a
+claim above in another case (`"HOSTS"`, `"Exp"`): a JSON parser that keeps
+the last duplicate, or ignores case, would read other claims than the
+issuer checked. Other members are allowed. A
 connection whose token expires while it is open gets `502` for every later
 request to an allowlisted host, whether or not the request holds a
 stand-in.
@@ -526,8 +538,9 @@ host.
   tunneled without decryption, so no swap can happen there.
 - **Each value only goes where it is allowed.** A value can carry its own
   host list (the same syntax as `-hosts`); without one, the `-hosts`
-  allowlist applies. It is checked against the host of the `CONNECT`, which
-  is where the request really goes, never against the request's own `Host`
+  allowlist applies (an empty list refuses the request). It is checked
+  against the host of the `CONNECT`, which is where the request really goes,
+  never against the request's own `Host`
   or `:authority`: a request naming another host than its `CONNECT` is
   answered `502`, with or without stand-ins. So is a request a server could
   read as naming another host: one with more than one `Host` (HTTP/1.1), or
@@ -596,7 +609,9 @@ connections. To keep real values in memory no longer than needed, a value
 is masked for 15 minutes after its last lookup, or until it expires if that
 is sooner, and no longer once the principal's credential is reported
 invalid (at most 1,024 values per principal, the least recently looked up
-dropped first). Values are kept for at most 4,096 principals: when one more
+dropped first, but never those of the request that looks them up; a
+request that alone carries more than 1,024 values is answered `502` and
+not sent). Values are kept for at most 4,096 principals: when one more
 principal looks a value up, the least recently active principal's values are
 dropped, and its responses are not masked until it looks values up again.
 Expired values leave memory within 5 seconds, whether or not more requests
