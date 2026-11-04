@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope/scopetest"
 )
 
@@ -161,6 +162,17 @@ func FuzzFramePayloads(f *testing.F) {
 	})
 }
 
+// failOnPanic fails the test when err is a panic the relay recovered: the
+// relay contains it to the connection, but it is still a bug the fuzzer
+// must report. Any other error is fine.
+func failOnPanic(t *testing.T, err error) {
+	t.Helper()
+	var p *panics.Error
+	if errors.As(err, &p) {
+		t.Fatalf("relay %v at %s", p, p.Site)
+	}
+}
+
 // FuzzRelay feeds arbitrary bytes from the client (after the preface) or
 // from the server to a relay, with masking off and on. The other side
 // behaves: the server answers every request, the client sends one. The
@@ -255,12 +267,13 @@ func FuzzRelay(f *testing.F) {
 		// relay has acted on all of it, and in the fromServer case the
 		// server's write races the close. A failure found here may take a
 		// few runs to reproduce; the target only checks that the relay
-		// does not panic or hang.
+		// does not panic, even a panic it contains, or hang.
 		time.Sleep(time.Millisecond)
 		_ = clientTest.Close()
 		_ = serverTest.Close()
 		select {
-		case <-done: //nolint:errcheck // any error is fine; only a hang is not
+		case err := <-done:
+			failOnPanic(t, err)
 		case <-time.After(waitFor):
 			t.Fatal("relay did not stop")
 		}

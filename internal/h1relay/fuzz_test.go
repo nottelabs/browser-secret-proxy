@@ -3,6 +3,7 @@ package h1relay
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 )
 
 // fuzzOptions is options or maskedOptions without logging.
@@ -46,7 +48,8 @@ func relayOnce(t *testing.T, o Options, client func(net.Conn), server func(net.C
 	client(clientSide)
 	_ = clientSide.Close()
 	select {
-	case <-done: //nolint:errcheck // any error is fine; only a hang is not
+	case err := <-done:
+		failOnPanic(t, err)
 	case <-time.After(waitFor):
 		t.Fatal("relay did not stop")
 	}
@@ -55,6 +58,17 @@ func relayOnce(t *testing.T, o Options, client func(net.Conn), server func(net.C
 }
 
 const waitFor = 5 * time.Second
+
+// failOnPanic fails the test when err is a panic the relay recovered: the
+// relay contains it to the connection, but it is still a bug the fuzzer
+// must report. Any other error is fine.
+func failOnPanic(t *testing.T, err error) {
+	t.Helper()
+	var p *panics.Error
+	if errors.As(err, &p) {
+		t.Fatalf("relay %v at %s", p, p.Site)
+	}
+}
 
 // inputConn is the relay's end of a client that has sent in and keeps the
 // connection open: reads return in, then block until Close, and writes are
@@ -110,7 +124,8 @@ func relayInput(t *testing.T, o Options, in []byte, server func(net.Conn)) {
 	<-served
 	_ = client.Close()
 	select {
-	case <-done: //nolint:errcheck // any error is fine; only a hang is not
+	case err := <-done:
+		failOnPanic(t, err)
 	case <-time.After(waitFor):
 		t.Fatal("relay did not stop")
 	}
