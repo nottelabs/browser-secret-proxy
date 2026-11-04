@@ -38,7 +38,8 @@ cleanup() {
   set +e
   if [ -n "$session_id" ]; then
     log "stopping session $session_id"
-    curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer $NOTTE_API_KEY" \
+    curl -sS -o /dev/null --connect-timeout 10 --max-time 30 -X DELETE \
+      -H "Authorization: Bearer $NOTTE_API_KEY" \
       "$NOTTE_API_URL/sessions/$session_id/stop"
   fi
   [ -n "$bore_pid" ] && kill "$bore_pid" 2>/dev/null
@@ -55,7 +56,7 @@ api() {
   # api METHOD PATH [JSON]: prints the body, fails on a non-2xx status.
   local method="$1" path="$2" body="${3:-}" out status
   out="$work/response.json"
-  status="$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+  status="$(curl -sS -o "$out" -w '%{http_code}' --connect-timeout 10 --max-time 120 -X "$method" \
     -H "Authorization: Bearer $NOTTE_API_KEY" -H 'Content-Type: application/json' \
     ${body:+--data "$body"} "$NOTTE_API_URL$path")"
   if [ "${status:0:1}" != 2 ]; then
