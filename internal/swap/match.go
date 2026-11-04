@@ -18,8 +18,8 @@ const (
 	// Query is a query string or a form body: the stand-in as is, query- or
 	// path-escaped.
 	Query
-	// JSON is a JSON body: as is outside strings; as is or JSON-escaped
-	// inside them.
+	// JSON is a JSON body: as is outside strings; inside them as is,
+	// JSON-escaped, or written with any JSON escapes (\u0026 for &, say).
 	JSON
 )
 
@@ -72,7 +72,7 @@ func Matches(part Part, standIns []string) []string {
 				i++
 			case text[i] == '"':
 				if in {
-					inString.scan(text[start:i], hit)
+					scanJSONString(inString, literal, text[start:i], hit)
 				} else {
 					literal.scan(text[start:i], hit)
 				}
@@ -81,7 +81,7 @@ func Matches(part Part, standIns []string) []string {
 		}
 		if start < len(text) {
 			if in {
-				inString.scan(text[start:], hit)
+				scanJSONString(inString, literal, text[start:], hit)
 			} else {
 				literal.scan(text[start:], hit)
 			}
@@ -97,6 +97,17 @@ func Matches(part Part, standIns []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// scanJSONString finds stand-ins in the content of one JSON string the way
+// the Swapper replaces them there: in the decoded text when the string holds
+// escapes, else as written, raw or JSON-escaped.
+func scanJSONString(inString, literal *matcher, segment string, hit []bool) {
+	if decoded, ok := decodeJSONString(segment); ok {
+		literal.scan(decoded, hit)
+		return
+	}
+	inString.scan(segment, hit)
 }
 
 func distinct(forms ...string) []string {

@@ -49,3 +49,6 @@ First release, planned as 0.1.0.
     the earlier encrypt-only format, from before this release, are refused.
 - Stand-in detection by pattern (`-standin-pattern`, `-standin-prefixes`),
   with an optional Luhn check for card-like stand-ins (`-standin-luhn`).
+- Stand-ins in JSON request bodies are found and swapped when the client
+  escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
+  or any `\uXXXX` escape).

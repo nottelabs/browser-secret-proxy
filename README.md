@@ -151,7 +151,10 @@ value is inserted in the form its place needs:
 - query strings and form bodies: query-escaped, whether the stand-in was raw
   or percent-encoded;
 - JSON bodies (`application/json`, `text/json` and `+json` types):
-  JSON-escaped inside strings;
+  JSON-escaped inside strings. A stand-in is found there however the client
+  escaped it (`a\u0026b` for `a&b`, as Go's `encoding/json` writes it, or
+  any character as `\uXXXX`); a string that held one is then written again
+  with standard escaping, which decodes to the same text with the real value;
 - headers: as is. A real value containing a line break or NUL is refused in a
   header, and the request is not sent;
 - other bodies: as is.
