@@ -1,8 +1,10 @@
 name: E2E
 
-# Runs the proxy image against Notte staging: a real browser session sends one
-# host through the proxy, exposed on a public address with an ngrok TCP tunnel, and
-# the job checks that host receives the real value (scripts/e2e-notte.sh).
+# Runs the proxy image against Notte staging: real browser sessions send
+# allowlisted hosts through two proxies (an http resolver run and a file
+# resolver run with response masking), exposed with ngrok tunnels, and the job
+# checks what each destination received, scenario by scenario
+# (scripts/e2e-notte.sh, scripts/e2e-notte).
 #
 # Needs the NOTTE_API_KEY (a staging key) and NGROK_AUTHTOKEN repository
 # secrets. Pull requests from forks get no secrets, so the job skips them.
@@ -23,6 +25,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  GO_VERSION: 1.26.x
   # ngrok's static binary, copied out of its image pinned by digest.
   NGROK_IMAGE: ngrok/ngrok:3.39.12-debian@sha256:2658b5ad05e1111e3ff07caa38d2eea742407b8de9a5978b88b87516debc0d2f
 
@@ -36,6 +39,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
       - name: Build the image
         run: make docker
       - name: Install ngrok

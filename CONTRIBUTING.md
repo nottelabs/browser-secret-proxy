@@ -59,14 +59,40 @@ A change in behavior needs a test that fails without it. Tests that compare
 what the destination receives with what the client sent are the core of the
 suite; extend them rather than loosening them.
 
-`scripts/e2e-notte.sh` checks the image end to end with a real browser: it
-starts the proxy, makes it public with an [ngrok](https://ngrok.com) TCP
-tunnel, starts a Notte session that sends one echo host through it, and checks
-that host receives the real value while another host still gets the stand-in.
+`scripts/e2e-notte.sh` checks the image end to end with a real browser. It
+runs the Go program in `scripts/e2e-notte`, which starts two proxies, makes
+them public with [ngrok](https://ngrok.com) tunnels and starts one Notte
+session for each:
+
+- The first proxy uses the `http` resolver, served by a detokenize service in
+  the program over mutual TLS, with response masking off. The session sends
+  `postman-echo.com` through it and the page reads what the host echoes back.
+- The second uses the `file` resolver with response masking on. The session
+  sends a capture server in the program, public through an ngrok HTTPS
+  endpoint, through it. The program reads what arrived upstream from the
+  capture server directly, not through the browser.
+
+| Scenario | What it checks |
+| --- | --- |
+| `card` | A card number and CVC in a form-urlencoded POST body |
+| `password-form` | A username and password in a form-urlencoded login POST |
+| `password-json` | A password in a JSON body sent by page JavaScript, with the stand-in written with `\u` escapes and a real value that needs JSON escaping |
+| `totp` | A 2FA code: a stable stand-in whose real value is the RFC 6238 code the resolver computes for each request (its cache is off); the echoed code must be the code of that time step or an adjacent one |
+| `bearer-token` | A token in an `Authorization: Bearer` header |
+| `api-key-query` | An API key in the query string |
+| `masking` | The capture server receives the real value and sends it back; the page sees the stand-in, and the proxy log shows the swap |
+| `not-allowlisted` | `httpbingo.org`, outside the session's secret proxy hosts, receives the stand-ins unchanged |
+
+`password-json` runs on the `file` resolver because stand-in patterns and
+prefixes match the raw request text, so the `http` resolver would not find a
+stand-in written with escapes. The program prints a PASS or FAIL line per
+scenario and exits non-zero when one fails.
+
 The E2E workflow runs it against Notte staging on pull requests from this
-repository, on `main` and daily. To run it yourself you need Docker, `jq`,
-`ngrok` v3 with an authtoken (TCP tunnels need a verified ngrok account) and a
-Notte API key:
+repository, on `main` and daily. To run it yourself you need Go, Docker with
+host networking (Linux, OrbStack, or Docker Desktop with host networking
+turned on), `ngrok` v3 with an authtoken (TCP tunnels need a verified ngrok
+account) and a Notte API key:
 
 ```sh
 make docker
