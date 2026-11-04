@@ -44,8 +44,12 @@ func (p Principal) GoString() string { return p.String() }
 
 // Value is a real value and where it may be sent.
 type Value struct {
-	Real      string
-	Hosts     []string  // hosts this value may be sent to; empty means the proxy's configured hosts
+	Real string
+	// Hosts this value may be sent to, in the -hosts syntax. Nil means the
+	// proxy's configured hosts. An empty list that is not nil (an explicit
+	// "hosts": []) is not the same: it is invalid, and a request that
+	// carries the value is refused.
+	Hosts     []string
 	ExpiresAt time.Time // zero means no expiry
 }
 

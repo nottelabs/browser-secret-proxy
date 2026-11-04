@@ -21,6 +21,8 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/strictjson"
 )
 
 // The only algorithms a sealed token may use: the outer JWE, and the JWS it
@@ -43,7 +45,9 @@ const maxSealedToken = 32 << 10
 type SealedPayload struct {
 	// Values maps each stand-in to its real value.
 	Values map[string]string `json:"values"`
-	// Hosts the values may be sent to; empty means the proxy's -hosts.
+	// Hosts the values may be sent to; nil means the proxy's -hosts. An
+	// empty list is invalid (see Value.Hosts): Seal refuses it, and a token
+	// with one opens, but every request carrying its values is refused.
 	Hosts []string `json:"hosts,omitempty"`
 	// Aud names the proxies the token is for; it must contain the proxy's
 	// configured audience. Required.
@@ -506,6 +510,9 @@ func (s *Sealed) decrypt(token string, now time.Time) (*sealedEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: the sealed token is not signed by a configured issuer key", ErrUnauthenticated)
 	}
+	if err := CheckSealedClaims(claims); err != nil {
+		return nil, fmt.Errorf("%w: the sealed token's claims are ambiguous: %w", ErrUnauthenticated, err)
+	}
 	var payload SealedPayload
 	if err := json.Unmarshal(claims, &payload); err != nil {
 		return nil, fmt.Errorf("%w: the sealed token's claims are not the expected JSON", ErrUnauthenticated)
@@ -535,6 +542,23 @@ func (s *Sealed) decrypt(token string, now time.Time) (*sealedEntry, error) {
 	return e, nil
 }
 
+// sealedClaims names the members of SealedPayload, as their json tags
+// spell them. encoding/json matches member names in any case and keeps the
+// last of two, so without checking them {"hosts": [...], "HOSTS": []} would
+// be read as no host restriction, while an issuer that checks the claims
+// another way sees one. Other members are allowed.
+var sealedClaims = strictjson.Object{
+	"values": strictjson.Map{}, "hosts": nil, "aud": nil, "exp": nil, "nbf": nil, "iat": nil, "sub": nil,
+}
+
+// CheckSealedClaims reports an error when claims, the JSON of a
+// SealedPayload, names a member twice, at any depth, or spells a member of
+// SealedPayload in another case: the proxy refuses such a token. The error
+// never quotes the claims.
+func CheckSealedClaims(claims []byte) error {
+	return strictjson.Check(claims, sealedClaims)
+}
+
 // Seal makes a sealed token: it signs payload with the issuer's private key
 // (Ed25519 for EdDSA, or P-256 for ES256), then encrypts the signed JWT to
 // the proxy's public key. It refuses a token longer than the proxy accepts.
@@ -542,6 +566,11 @@ func Seal(proxyKey crypto.PublicKey, issuerKey crypto.Signer, payload SealedPayl
 	alg, err := signingAlgorithm(issuerKey)
 	if err != nil {
 		return "", err
+	}
+	if payload.Hosts != nil && len(payload.Hosts) == 0 {
+		// It would be left out of the claims, and the values could then go
+		// to any host in -hosts.
+		return "", errors.New("the payload has an empty host list: give the hosts the values may go to, or none (nil) for the proxy's -hosts")
 	}
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: alg, Key: issuerKey}, (&jose.SignerOptions{}).WithType("JWT"))
 	if err != nil {
