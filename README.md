@@ -122,9 +122,20 @@ curl --proxy http://127.0.0.1:8080 --cacert ca.pem \
 | `-listen` | Address to listen on (default `127.0.0.1:8080`). The proxy serves plain HTTP; see [Exposing the proxy](#exposing-the-proxy). |
 | `-ca-cert`, `-ca-key` | PEM CA certificate and key (PKCS #8, PKCS #1 or SEC 1). Required. |
 | `-hosts` | Comma-separated hosts to decrypt: exact names, or `*.domain` for every name below `domain` (not `domain` itself). Required. |
-| `-swaps` | JSON file of stand-in to real value. Required. See [Where values are replaced](#where-values-are-replaced). |
+| `-resolver` | Where real values come from: `file` (default), `http` or `sealed`. See [Production setup](#production-setup-where-real-values-come-from). |
+| `-swaps` | `file` mode: JSON file of stand-in to real value. Given alone, it selects the `file` mode. |
+| `-swaps-reload` | `file` mode: how often the file is checked for changes (default `2s`, `0` never). |
+| `-resolver-url` | `http` mode: `https://` URL of your detokenize service. |
+| `-resolver-cert`, `-resolver-key` | `http` mode: PEM client certificate and key the proxy presents to the service. Required. |
+| `-resolver-ca` | `http` mode: PEM CA bundle that verifies the service (default: system roots). |
+| `-resolver-timeout` | `http` mode: timeout of one lookup, connection included (default `2s`). |
+| `-resolver-cache-ttl` | `http` mode: longest a looked-up value is kept in memory (default `1m`, `0` no cache). |
+| `-sealed-key` | `sealed` mode: PEM EC private key (P-256, P-384 or P-521) that proxy passwords are sealed to. Several keys in the file are all accepted. |
+| `-standin-pattern` | Regular expression (RE2) matching stand-ins. Repeatable. See [Finding stand-ins](#finding-stand-ins). |
+| `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
+| `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
 | `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
-| `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty. |
+| `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty. Not used in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
 | `-version` | Print the version and exit. |
@@ -144,6 +155,158 @@ value is inserted in the form its place needs:
 - headers: as is. A real value containing a line break or NUL is refused in a
   header, and the request is not sent;
 - other bodies: as is.
+
+## Production setup: where real values come from
+
+The proxy finds the stand-ins in each request to an allowlisted host, looks
+up their real values once for that request, and swaps them in. The source of
+those values is the resolver, chosen with `-resolver`. Every mode fails
+closed: when a stand-in cannot be resolved, may not go to the request's host
+or has expired, the request is answered `502` and nothing of it is sent.
+
+| Mode | Values live in | Use it when |
+| --- | --- | --- |
+| `file` | A JSON file on the proxy's host, reloaded when it changes. | A secret manager can write a file next to the proxy: Vault Agent templates, the Kubernetes Secrets Store CSI driver, a Kubernetes Secret volume. The simplest setup, with no extra service. |
+| `http` | Your own detokenize service, asked over mutual TLS. | Values are issued per user or per session, change often, or must be checked and audited by a service you already run. |
+| `sealed` | The proxy password itself, encrypted to the proxy's key. | You want no lookup service and no storage to provision: whoever starts the session seals the values it needs and hands the token over as the proxy password. |
+
+### file
+
+```sh
+browser-secret-proxy -ca-cert ca.pem -ca-key ca.key -hosts api.example.com \
+  -swaps /vault/secrets/swaps.json
+```
+
+The file maps each stand-in to its real value, as in the
+[quick start](#2-list-the-stand-ins). The proxy checks it every
+`-swaps-reload` (2 seconds by default) and, when its content changed,
+replaces the whole map in one step: a request uses either the old values or
+the new ones, never a mix. Both rewrites in place and symlink swaps (how
+Secret volumes and the CSI driver publish a new version) are picked up. If
+the new content does not load (invalid JSON, an empty map), the proxy keeps
+the previous map and logs the error once, without the file's content.
+
+Point the secret manager at a tmpfs (an `emptyDir` with `medium: Memory`, or
+the CSI driver's own mount) so the values never touch a disk.
+
+### http
+
+```sh
+browser-secret-proxy -ca-cert ca.pem -ca-key ca.key -hosts api.example.com \
+  -resolver http -resolver-url https://detokenize.internal:8443/v1/detokenize \
+  -resolver-cert proxy-client.pem -resolver-key proxy-client.key -resolver-ca detokenize-ca.pem \
+  -standin-prefixes tok_
+```
+
+For each request that carries stand-ins not in its cache, the proxy sends one
+call:
+
+```http
+POST /v1/detokenize
+Content-Type: application/json
+
+{"stand_ins": ["tok_1", "tok_2"], "host": "api.example.com", "principal_id": "proxy-user"}
+```
+
+Your service answers `200` with the values it releases:
+
+```json
+{"values": {"tok_1": {"real": "<real value>", "hosts": ["api.example.com"], "expires_at": "2026-01-02T15:04:05Z"}}}
+```
+
+- `principal_id` is the proxy username of the connection
+  (`SECRET_PROXY_USERNAME`), empty when authentication is off. The proxy
+  password is never sent.
+- `hosts` (optional) restricts the value to those hosts, in the `-hosts`
+  syntax. Without it the value may go to any host in `-hosts`.
+- `expires_at` (optional) is when the value stops being used.
+- Leave out any stand-in you do not release for this host or principal. The
+  request is then refused, as it is for any other status, a malformed answer,
+  a redirect or a timeout (`-resolver-timeout`, 2 seconds by default).
+- Values are cached in memory per principal, host and stand-in until the earlier
+  of `expires_at` and `-resolver-cache-ttl` (1 minute by default). Refusals
+  and errors are not cached. A request with more than 256 stand-ins is
+  refused without a call.
+- The connection uses mutual TLS: the service should accept only the proxy's
+  client certificate.
+
+[`examples/http-resolver`](examples/http-resolver) is a small reference
+service that answers from a JSON file and requires a client certificate:
+
+```sh
+go run ./examples/http-resolver -cert server.pem -key server.key \
+  -client-ca proxy-client-ca.pem -values values.json
+```
+
+### sealed
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out sealed.key
+openssl ec -in sealed.key -pubout -out sealed-public.pem
+chmod 600 sealed.key
+
+browser-secret-proxy -ca-cert ca.pem -ca-key ca.key -hosts api.example.com \
+  -resolver sealed -sealed-key sealed.key
+```
+
+The proxy password is a compact JWE encrypted to the proxy's public key
+(`ECDH-ES+A256KW` key agreement, `A256GCM` content encryption; no other
+algorithm is accepted). Its payload carries the values:
+
+```json
+{"values": {"tok_standin_123": "<real API token>"}, "hosts": ["api.example.com"], "exp": 1767366245, "sub": "session-42"}
+```
+
+- `exp` (Unix seconds) is required. An expired token is refused, and a
+  connection that outlives its token stops swapping.
+- `hosts` (optional) restricts every value of the token to those hosts.
+- `sub` (optional) names the principal in logs; the username is used when it
+  is empty.
+
+The proxy decrypts the token on every `CONNECT`: that both admits the client
+and gives the values, with no lookup service and no external storage. A
+token that does not decrypt with the proxy's key, was altered, or has
+expired gets `407`. A connection whose token expires while it is open gets
+`502` for every later request to an allowlisted host, whether or not the
+request holds a stand-in.
+
+Decrypted tokens, real values included, are kept in memory so each request
+does not decrypt again: at most 256 tokens, each until the earlier of its
+`exp` and 5 minutes after it was decrypted. Nothing is written to disk.
+The token's own stand-ins are what the proxy looks for, so no pattern is
+needed. To rotate the key, put the new and the old key in the `-sealed-key`
+file until the old tokens have expired.
+
+A token proves only that it was made for this proxy, not who made it: anyone
+who holds the public key can seal values of their own and use the proxy
+with them on the `-hosts` allowlist. That gives them nothing they did not
+already have (a token cannot reveal another token's values), but it is
+access to the proxy, so share the public key only with the systems that
+create tokens and restrict who can reach the proxy (see
+[Exposing the proxy](#exposing-the-proxy)). The token is as sensitive as the
+values it carries: create tokens where the real values already are, and give
+them a short `exp`. For testing,
+[`examples/seal`](examples/seal) seals a payload file:
+
+```sh
+go run ./examples/seal -public-key sealed-public.pem -ttl 1h payload.json
+```
+
+### Finding stand-ins
+
+The proxy must know which strings to look up:
+
+- in `file` mode, the keys of the file;
+- in `sealed` mode, the keys of the connection's token;
+- in every mode, matches of `-standin-pattern` (regular expressions) and of
+  `-standin-prefixes` (a prefix followed by letters, digits, `_` or `-`, not
+  inside a longer word). In `http` mode you must set at least one of them.
+
+A match the resolver does not answer for refuses the request, so patterns
+must match stand-ins only. Pick stand-ins that cannot appear in other
+traffic, such as a prefix of your own (`tok_`) or test card numbers. With
+`-standin-luhn`, card-like matches (12 to 19 digits) must pass the Luhn
+check, so arbitrary digit runs in a page are not taken for card stand-ins.
 
 ## Using it with a Notte session
 
@@ -225,8 +388,10 @@ host.
 - **Values are isolated by principal.** The principal is the proxy
   credential of the `CONNECT` (`SECRET_PROXY_USERNAME` or the resolver's own
   credential check). Every request is looked up again for its connection's
-  principal, and the proxy caches no value between requests, so a value
-  looked up for one principal is never used for another.
+  principal, and what the resolvers keep in memory cannot serve another
+  principal: the `http` cache is keyed by principal, host and stand-in, and
+  the `sealed` cache by the token itself, which only its holder can present.
+  The `file` mode has one map for every principal by design.
 
 ### What it does not guarantee
 
@@ -356,8 +521,11 @@ return.
 - Server push is not supported.
 - Response masking has limits of its own: see
   [What masking misses](#what-masking-misses).
-- The swaps file and the CA are read once at start. Restart the proxy to
-  change them.
+- The CA, the `http` mode's client certificate and the `sealed` key are
+  read once at start. Restart the proxy to change them. The swaps file is
+  reloaded (see [file](#file)).
+- In `http` mode, a lookup holds back the other requests of the same HTTP/2
+  connection until it answers or times out. Cached values need no lookup.
 
 ## Verifying a release
 
