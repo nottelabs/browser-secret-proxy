@@ -19,7 +19,7 @@ import (
 
 // maskingSetup is a proxy with masking on whose principal alice has the
 // value of standIn on record once a request carried it.
-func maskingSetup(t *testing.T, proto string, handler func(*tls.Conn), values map[string]string) *testProxy {
+func maskingSetup(t *testing.T, proto string, handler func(*tls.Conn), values map[string]string, configure ...func(*Config)) *testProxy {
 	t.Helper()
 	dest := startDestination(t, allowedHost, []string{proto}, handler)
 	return startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, func(c *Config) {
@@ -32,6 +32,9 @@ func maskingSetup(t *testing.T, proto string, handler func(*tls.Conn), values ma
 			t.Fatal(err)
 		}
 		c.Resolver, c.Detector, c.MaskResponses = r, d, true
+		for _, f := range configure {
+			f(c)
+		}
 	})
 }
 

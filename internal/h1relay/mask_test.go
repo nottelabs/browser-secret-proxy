@@ -211,6 +211,7 @@ func TestUnmaskableResponsesAreRefused(t *testing.T) {
 		"stacked codings": "HTTP/1.1 200 OK\r\nContent-Encoding: gzip, br\r\nContent-Length: 4\r\n\r\nabcd",
 		"partial":         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/10\r\nContent-Length: 4\r\n\r\nabcd",
 		"transfer coding": "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+		"Kelvin chunked":  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chun\u212aed\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			resp, body := roundTrip(t, maskedOptions(t, false), "GET", raw)

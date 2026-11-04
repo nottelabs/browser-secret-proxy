@@ -61,6 +61,8 @@ func TestValuesAreCheckedAgainstHostAndExpiry(t *testing.T) {
 		{"own wildcard", resolve.Value{Real: "r", Hosts: []string{"*.pay.example"}}, "a.b.pay.example", true},
 		{"own wildcard does not cover the domain", resolve.Value{Real: "r", Hosts: []string{"*.pay.example"}}, "pay.example", false},
 		{"invalid host list", resolve.Value{Real: "r", Hosts: []string{"*"}}, "api.example.com", false},
+		{"empty host list", resolve.Value{Real: "r", Hosts: []string{}}, "api.example.com", false},
+		{"host list of an empty name", resolve.Value{Real: "r", Hosts: []string{""}}, "api.example.com", false},
 		{"not expired", resolve.Value{Real: "r", ExpiresAt: now.Add(time.Second)}, "api.example.com", true},
 		{"expired", resolve.Value{Real: "r", ExpiresAt: now.Add(-time.Second)}, "api.example.com", false},
 		{"expires now", resolve.Value{Real: "r", ExpiresAt: now}, "api.example.com", false},
@@ -110,6 +112,24 @@ func TestOneLookupPerRequestWithTheRequestsStandIns(t *testing.T) {
 	sw, err = session(t, r, p).Swapper(context.Background(), lit("nothing here")...)
 	if err != nil || sw != nil || len(got) != 1 {
 		t.Fatalf("got %v, %v after %d lookups", sw, err, len(got))
+	}
+}
+
+// The resolver decides on the host as the allowlist matches it: in lower
+// case, without a port or a trailing dot.
+func TestTheResolverGetsTheCanonicalHost(t *testing.T) {
+	var got []string
+	r := scopetest.Resolver{Known: []string{"tok_a"}, Fn: func(req resolve.Request) (resolve.Result, error) {
+		got = append(got, req.Host)
+		return resolve.Result{Values: map[string]resolve.Value{"tok_a": {Real: "r"}}}, nil
+	}}
+	for _, host := range []string{"API.Example.COM.", "api.example.com", "X.Pay.Example"} {
+		if _, err := sessionTo(t, r, resolve.Principal{}, host).Swapper(context.Background(), lit("tok_a")...); err != nil {
+			t.Fatalf("%s: %v", host, err)
+		}
+	}
+	if strings.Join(got, ",") != "api.example.com,api.example.com,x.pay.example" {
+		t.Fatalf("the resolver was asked for %q", got)
 	}
 }
 

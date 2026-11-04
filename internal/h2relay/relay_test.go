@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,14 @@ func newHarnessWith(t *testing.T, mutate func(*Options), setup func(*relay)) *ha
 // newRawHarness starts the relay with the client's preface sent and nothing
 // from the server yet.
 func newRawHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *harness {
+	t.Helper()
+	h := newSilentHarness(t, mutate, setup)
+	h.write(h.client, []byte(Preface))
+	return h
+}
+
+// newSilentHarness starts the relay with nothing sent from either side.
+func newSilentHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *harness {
 	t.Helper()
 	hosts, err := hostmatch.New([]string{"allowed.test"})
 	if err != nil {
@@ -110,7 +119,6 @@ func newRawHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *har
 			t.Error("relay did not stop")
 		}
 	})
-	h.write(h.client, []byte(Preface))
 	return h
 }
 
@@ -288,11 +296,12 @@ func TestStreamLimitRefusesNewStreams(t *testing.T) {
 	h.quiet(h.toServer, 50*time.Millisecond, isType(FrameHeaders))
 }
 
-// Buffered bodies share one budget per connection: the stream that would
-// pass it is refused, the others carry on, and nothing stays held.
+// Buffered bodies share one budget per connection, with the header lists
+// of their requests: the stream that would pass it is refused, the others
+// carry on, and nothing stays held.
 func TestBufferedBodiesShareABudget(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.MaxBuffered = 1000 })
 	post := request("POST", hpack.HeaderField{Name: "content-type", Value: "application/json"})
+	h := newHarness(t, func(o *Options) { o.MaxBuffered = 1000 + 2*int(fieldsSize(post)) })
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(post...)},
 		Frame{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("a"), 600)},
@@ -300,8 +309,8 @@ func TestBufferedBodiesShareABudget(t *testing.T) {
 		Frame{Type: FrameData, Stream: 3, Payload: bytes.Repeat([]byte("b"), 600)},
 	)
 	h.expect(h.toClient, "client", isRefusal(3))
-	if _, _, held := h.state(); held != 600 {
-		t.Fatalf("relay holds %d bytes, want the 600 of stream 1", held)
+	if _, _, held := h.state(); held != 600+fieldsSize(post) {
+		t.Fatalf("relay holds %d bytes, want the 600 of stream 1 and its headers", held)
 	}
 	h.clientSend(Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte("tok_standin")})
 	headers := h.expect(h.toServer, "server", isType(FrameHeaders))
@@ -385,7 +394,12 @@ func TestGoAwayRefusesUnsentRequests(t *testing.T) {
 
 // Finished requests leave no state behind on a long-lived connection.
 func TestCompletedStreamsAreForgotten(t *testing.T) {
-	h := newHarness(t, nil)
+	// The resets below come one reset period apart, as the reset limit
+	// allows; the clock is read on the client loop only.
+	clock := time.Now()
+	h := newHarnessWith(t, nil, func(r *relay) {
+		r.now = func() time.Time { clock = clock.Add(resetWindow); return clock }
+	})
 	const requests = 200
 	for i := 0; i < requests; i++ {
 		id := uint32(2*i + 1)
@@ -573,13 +587,12 @@ func settingsFrame(settings ...Setting) Frame {
 	return Frame{Type: FrameSettings, Payload: payload}
 }
 
-// otherRequest is a request whose body is streamed upstream, not buffered:
-// an extended CONNECT (RFC 8441), the only request on an intercepted
-// connection whose body is not swapped, since every request there goes to
-// the allowlisted CONNECT host. method is ignored.
-func otherRequest(string) []hpack.HeaderField {
-	return request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})
-}
+// streaming makes the relay swap nothing, so it streams request bodies
+// upstream instead of buffering them. On an intercepted connection every
+// request is for the allowlisted CONNECT host and every body is buffered;
+// a relay streams the bodies of requests for authorities off its Hosts
+// list, and the tests that use this cover that path.
+func streaming(o *Options) { o.Hosts = nil }
 
 func isGoAway(code uint32) func(Frame) bool {
 	return func(f Frame) bool {
@@ -590,11 +603,11 @@ func isGoAway(code uint32) func(Frame) bool {
 // A client that sends more on a stream than its window allows ends the
 // connection with FLOW_CONTROL_ERROR instead of growing the relay's queue.
 func TestStreamWindowViolationClosesTheConnection(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, streaming)
 	h.serverSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 100}))
 	h.expect(h.toClient, "client", isType(FrameSettings))
 	h.clientSend(Frame{Type: FrameSettings, Flags: FlagAck}) // the client now uses 100
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)})
 	h.expect(h.toServer, "server", isType(FrameHeaders))
 	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 	_, _ = h.client.Write(encodeFrames([]Frame{{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("x"), 200)}}))
@@ -607,10 +620,10 @@ func TestStreamWindowViolationClosesTheConnection(t *testing.T) {
 // The same for the connection window, which is 65,535 bytes until the relay
 // grants more.
 func TestConnectionWindowViolationClosesTheConnection(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, streaming)
 	h.serverSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 1 << 20}, Setting{ID: SettingMaxFrameSize, Value: 1 << 20}))
 	h.expect(h.toClient, "client", isType(FrameSettings))
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)})
 	h.expect(h.toServer, "server", isType(FrameHeaders))
 	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 	_, _ = h.client.Write(encodeFrames([]Frame{{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("x"), 70000)}}))
@@ -621,40 +634,40 @@ func TestConnectionWindowViolationClosesTheConnection(t *testing.T) {
 }
 
 // A streamed upload that would pass the connection's buffer budget while the
-// server withholds credit is reset on both sides, and nothing stays held.
+// server withholds credit is reset on both sides, and nothing of it stays
+// held.
 func TestStreamedUploadsShareTheBudget(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.MaxBuffered = 70000 })
-	// Stream 1 uses up the server's 65,535 byte connection window.
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)})
+	h := newHarness(t, func(o *Options) { streaming(o); o.MaxBuffered = 50000 })
+	// Stream 1 uses up the server's 65,535 byte connection window, a frame
+	// at a time so its bytes stay within the budget; the relay credits the
+	// client as they reach the server.
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)})
 	for sent := 0; sent < defaultWindow; {
 		n := min(defaultMaxFrame, defaultWindow-sent)
-		h.clientSend(Frame{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("c"), n)})
+		h.sendData(1, n, false)
+		h.receiveData(1, n)
 		sent += n
 	}
-	for received := 0; received < defaultWindow; {
-		if f := h.next(h.toServer, "server"); f.Type == FrameData {
-			received += len(f.Payload)
-		}
+	h.credit(defaultWindow)
+	// Streams 3 and 5 stream within their windows but cannot be sent on, so
+	// their bytes queue up: stream 3's 10,000, then stream 5's until the two
+	// pass the budget.
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 3, Payload: h.clientBlock(request("POST")...)})
+	h.sendData(3, 10000, false)
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 5, Payload: h.clientBlock(request("POST")...)})
+	var streamHeaders Frame
+	for seen := 0; seen < 2; seen++ {
+		streamHeaders = h.expect(h.toServer, "server", isType(FrameHeaders))
 	}
-	// Stream 3 buffers 10,000 bytes (credited at once); stream 5 streams
-	// within its windows but cannot be sent on, so its bytes queue up.
-	h.clientSend(
-		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 3, Payload: h.clientBlock(request("POST")...)},
-		Frame{Type: FrameData, Stream: 3, Payload: bytes.Repeat([]byte("b"), 10000)},
-		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 5, Payload: h.clientBlock(otherRequest("POST")...)},
-	)
-	streamHeaders := h.expect(h.toServer, "server", isType(FrameHeaders))
-	for sent := 0; sent < 4*defaultMaxFrame-1; {
-		n := min(defaultMaxFrame, 4*defaultMaxFrame-1-sent)
-		h.clientSend(Frame{Type: FrameData, Stream: 5, Payload: bytes.Repeat([]byte("s"), n)})
-		sent += n
-	}
+	h.sendData(5, 3*defaultMaxFrame, false)
 	h.expect(h.toClient, "client", func(f Frame) bool {
 		return f.Type == FrameRSTStream && f.Stream == 5 && binary.BigEndian.Uint32(f.Payload) == errCodeCalm
 	})
 	h.expect(h.toServer, "server", func(f Frame) bool {
 		return f.Type == FrameRSTStream && f.Stream == streamHeaders.Stream && binary.BigEndian.Uint32(f.Payload) == errCodeCancel
 	})
+	// Both header blocks have reached the server and released their budget;
+	// only stream 3's queued body remains after stream 5 is reset.
 	if _, _, held := h.state(); held != 10000 {
 		t.Fatalf("relay holds %d bytes, want stream 3's 10000", held)
 	}
@@ -676,15 +689,15 @@ func TestLargeServerHeaderTableSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 4 || got[0] != (Setting{ID: 3, Value: 100}) || got[1].ID != SettingHeaderTableSize || got[2] != (Setting{ID: SettingInitialWindowSize, Value: 1 << 20}) ||
+	if len(got) != 4 || got[0] != (Setting{ID: 3, Value: 100}) || got[1] != (Setting{ID: SettingHeaderTableSize, Value: decoderTableSize}) || got[2] != (Setting{ID: SettingInitialWindowSize, Value: 1 << 20}) ||
 		got[3] != (Setting{ID: SettingMaxFrameSize, Value: 1 << 20}) {
 		t.Fatalf("client settings %v", got)
 	}
 	// The client follows what it received: a table size update to it,
-	// then a header large enough to need a table above 4096 bytes.
+	// then a header that fills the table.
 	h.clientEnc.SetMaxDynamicTableSizeLimit(got[1].Value)
 	h.clientEnc.SetMaxDynamicTableSize(got[1].Value)
-	big := hpack.HeaderField{Name: "x-big", Value: strings.Repeat("v", 20000)}
+	big := hpack.HeaderField{Name: "x-big", Value: strings.Repeat("v", 4000)}
 	for _, id := range []uint32{1, 3} {
 		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: id, Payload: h.clientBlock(request("GET", big)...)})
 		if f := h.expect(h.toServer, "server", isType(FrameHeaders)); f.Stream != id {
@@ -693,11 +706,46 @@ func TestLargeServerHeaderTableSize(t *testing.T) {
 	}
 }
 
+// The client never learns that the server supports extended CONNECT (RFC
+// 8441): SETTINGS_ENABLE_CONNECT_PROTOCOL is dropped from every server
+// SETTINGS frame, the first one and later ones, with masking off and on. A
+// client may only send an extended CONNECT after it got that setting with
+// value 1 (RFC 8441 section 3), so a browser opens its WebSockets over
+// HTTP/1.1, where only a 101 opens the stream. The other settings arrive
+// unchanged and in order.
+func TestServerSettingsNeverEnableExtendedConnect(t *testing.T) {
+	enable := Setting{ID: SettingEnableConnectProtocol, Value: 1}
+	streams := Setting{ID: SettingMaxConcurrentStreams, Value: 100}
+	window := Setting{ID: SettingInitialWindowSize, Value: 1 << 20}
+	for _, masked := range []bool{false, true} {
+		t.Run("masking "+strconv.FormatBool(masked), func(t *testing.T) {
+			var mutate func(*Options)
+			if masked {
+				mutate = masking(t, false)
+			}
+			h := newRawHarness(t, mutate, nil)
+			for _, frame := range []struct{ sent, want []Setting }{
+				{[]Setting{enable, streams}, []Setting{streams}}, // the server's preface
+				{[]Setting{window, enable, streams}, []Setting{window, streams}},
+				{[]Setting{enable}, nil},
+				{[]Setting{{ID: SettingEnableConnectProtocol, Value: 0}}, nil},
+			} {
+				h.serverSend(settingsFrame(frame.sent...))
+				f := h.expect(h.toClient, "client", func(f Frame) bool { return f.Type == FrameSettings && f.Flags&FlagAck == 0 })
+				got, err := ParseSettings(f.Payload)
+				if err != nil || !slices.Equal(got, frame.want) {
+					t.Fatalf("server sent %v, client got %v (%v), want %v", frame.sent, got, err, frame.want)
+				}
+			}
+		})
+	}
+}
+
 // Two SETTINGS frames sent before either is acknowledged: a window of 0,
 // then back to 65,535. After both ACKs the client uses 65,535, so a DATA
 // frame within it is legal.
 func TestSettingsAcksApplyEachFrameInOrder(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, streaming)
 	h.serverSend(
 		settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 0}),
 		settingsFrame(Setting{ID: SettingInitialWindowSize, Value: defaultWindow}),
@@ -706,7 +754,7 @@ func TestSettingsAcksApplyEachFrameInOrder(t *testing.T) {
 	h.expect(h.toClient, "client", isType(FrameSettings))
 	h.clientSend(Frame{Type: FrameSettings, Flags: FlagAck}, Frame{Type: FrameSettings, Flags: FlagAck})
 	h.clientSend(
-		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)},
+		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
 		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: bytes.Repeat([]byte("d"), 1000)},
 	)
 	h.expect(h.toServer, "server", isType(FrameHeaders))
@@ -727,7 +775,7 @@ func TestSettingsAcksApplyEachFrameInOrder(t *testing.T) {
 // The decrease itself is enforced once acknowledged, also when an increase
 // follows it later.
 func TestSettingsDecreaseTakesEffectOnItsAck(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, streaming)
 	h.serverSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 0}))
 	h.expect(h.toClient, "client", isType(FrameSettings))
 	h.serverSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: defaultWindow}))
@@ -742,7 +790,7 @@ func TestSettingsDecreaseTakesEffectOnItsAck(t *testing.T) {
 	h.serverSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 10}))
 	h.expect(h.toClient, "client", isType(FrameSettings))
 	h.clientSend(Frame{Type: FrameSettings, Flags: FlagAck}, Frame{Type: FrameSettings, Flags: FlagAck}) // now 10
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)})
 	h.expect(h.toServer, "server", isType(FrameHeaders))
 	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 	_, _ = h.client.Write(encodeFrames([]Frame{{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("x"), 11)}}))
@@ -853,22 +901,22 @@ func (h *harness) credit(n int) {
 // A streamed upload the client resets while its bytes wait for the server's
 // credit gives their connection credit back, so other streams keep flowing.
 func TestResetUploadReturnsConnectionCredit(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, streaming)
 	// Stream 1 uses up the server's connection window; the relay credits
 	// the client as the bytes reach the server.
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)})
 	h.sendData(1, defaultWindow, false)
 	h.receiveData(1, defaultWindow)
 	h.credit(defaultWindow)
 	// Stream 3's 60,000 bytes queue: the server grants no more yet.
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 3, Payload: h.clientBlock(otherRequest("POST")...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 3, Payload: h.clientBlock(request("POST")...)})
 	h.sendData(3, 60000, false)
 	h.clientSend(rstStream(3, errCodeCancel))
 	h.credit(60000) // the discarded bytes' credit comes back
 	// The server opens its window again; stream 5 sends within the
 	// connection window the client now has.
 	h.serverSend(windowUpdate(0, defaultWindow))
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 5, Payload: h.clientBlock(otherRequest("POST")...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 5, Payload: h.clientBlock(request("POST")...)})
 	h.sendData(5, 50000, true)
 	if !h.receiveData(5, 50000) {
 		t.Fatal("stream 5 did not end")
@@ -882,9 +930,9 @@ func TestResetUploadReturnsConnectionCredit(t *testing.T) {
 // The server answers before the upload is done and keeps reading: its later
 // WINDOW_UPDATEs still reach the upload, which completes.
 func TestEarlyResponseKeepsTheUploadGoing(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, streaming)
 	const total = 100000
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("POST")...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)})
 	serverID := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
 	h.sendData(1, defaultWindow, false)
 	h.receiveData(1, defaultWindow) // the server's stream window is now 0
@@ -934,6 +982,28 @@ func TestPriorityNeverPointsAtTheWrongStream(t *testing.T) {
 	if p := parsePriority(pf.Payload); pf.Stream != 3 || p.Weight != 50 || p.DependsOn != 0 {
 		t.Fatalf("PRIORITY reached server stream %d as %+v, want stream 3, weight 50", pf.Stream, p)
 	}
+}
+
+// A client frame of an unknown type on a stream goes upstream under that
+// stream's server ID, never under its client ID, which can be another
+// stream's server ID (RFC 9113 5.5). One for a stream with nothing upstream
+// (still buffering, closed, or idle) is dropped. One on stream 0 goes as is.
+func TestUnknownClientFramesFollowTheirStream(t *testing.T) {
+	h := newHarness(t, nil)
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)}) // buffering
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 3, Payload: h.clientBlock(request("GET")...)})
+	if f := h.expect(h.toServer, "server", isType(FrameHeaders)); f.Stream != 1 {
+		t.Fatalf("client stream 3 went upstream on %d, want 1", f.Stream)
+	}
+	frame := func(stream uint32, b byte) Frame { return Frame{Type: unknownType, Stream: stream, Payload: []byte{b}} }
+	h.clientSend(frame(1, 'a'), frame(3, 'b'), frame(101, 'c'), frame(0, 'd'))
+	for _, want := range []Frame{frame(1, 'b'), frame(0, 'd')} {
+		f := h.expect(h.toServer, "server", isType(unknownType))
+		if f.Stream != want.Stream || !bytes.Equal(f.Payload, want.Payload) {
+			t.Fatalf("server got %q on %d, want %q on %d", f.Payload, f.Stream, want.Payload, want.Stream)
+		}
+	}
+	h.quiet(h.toServer, 50*time.Millisecond, isType(unknownType))
 }
 
 // With a server limit of one concurrent stream, an upload that got its final
@@ -1054,42 +1124,42 @@ func TestBufferedUploadKeepsItsWindowAfterADecrease(t *testing.T) {
 }
 
 // Server SETTINGS (which make the relay scan buffering streams) arriving
-// while the client opens uploads: the race detector must find no stream
-// field written after the stream became visible to the other goroutines.
+// while the client opens uploads, buffered (allowlisted) or streamed: the
+// race detector must find no stream field written after the stream became
+// visible to the other goroutines.
 func TestSettingsWhileUploadsOpen(t *testing.T) {
-	h := newHarness(t, nil)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < 200; i++ {
-			value := uint32(defaultWindow)
-			if i%2 == 1 {
-				value = 1 << 20
+	for name, mutate := range map[string]func(*Options){"buffered": nil, "streamed": streaming} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, mutate)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for i := 0; i < 200; i++ {
+					value := uint32(defaultWindow)
+					if i%2 == 1 {
+						value = 1 << 20
+					}
+					_ = h.server.SetWriteDeadline(time.Now().Add(waitFor))
+					if _, err := h.server.Write(encodeFrames([]Frame{settingsFrame(Setting{ID: SettingInitialWindowSize, Value: value})})); err != nil {
+						return
+					}
+				}
+			}()
+			for i := 0; i < 100; i++ {
+				h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: uint32(2*i + 1), Payload: h.clientBlock(request("POST")...)})
 			}
-			_ = h.server.SetWriteDeadline(time.Now().Add(waitFor))
-			if _, err := h.server.Write(encodeFrames([]Frame{settingsFrame(Setting{ID: SettingInitialWindowSize, Value: value})})); err != nil {
-				return
-			}
-		}
-	}()
-	for i := 0; i < 100; i++ {
-		id := uint32(2*i + 1)
-		fields := request("POST") // allowlisted: buffered
-		if i%4 == 3 {
-			fields = otherRequest("POST") // streamed
-		}
-		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: id, Payload: h.clientBlock(fields...)})
+			<-done
+			// The connection still works.
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 201, Payload: h.clientBlock(request("GET")...)})
+			h.expect(h.toServer, "server", func(f Frame) bool {
+				if f.Type != FrameHeaders {
+					return false
+				}
+				_, fragment, err := HeadersPayload(f.Flags, f.Payload)
+				return err == nil && len(fragment) > 0 && f.Flags&FlagEndStream != 0
+			})
+		})
 	}
-	<-done
-	// The connection still works.
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 201, Payload: h.clientBlock(otherRequest("GET")...)})
-	h.expect(h.toServer, "server", func(f Frame) bool {
-		if f.Type != FrameHeaders {
-			return false
-		}
-		_, fragment, err := HeadersPayload(f.Flags, f.Payload)
-		return err == nil && len(fragment) > 0 && f.Flags&FlagEndStream != 0
-	})
 }
 
 // drainClient returns every frame the client gets until the relay closes
@@ -1202,14 +1272,14 @@ func TestServerMustStartWithSettings(t *testing.T) {
 
 // Frames held for the server's SETTINGS are bounded by the buffer budget.
 func TestHeldFramesAreBounded(t *testing.T) {
-	h := newRawHarness(t, func(o *Options) { o.MaxStreams = 1; o.MaxBuffered = 200 }, nil)
+	h := newRawHarness(t, func(o *Options) { o.MaxStreams = 1; o.MaxBuffered = 300 }, nil)
 	h.clientSend(Frame{Type: FrameSettings})
 	// Stream 1 goes upstream; every later one is refused, and each refusal
 	// waits for the server's SETTINGS. The relay closes the connection once
-	// they pass 200 bytes, so writes stop succeeding.
+	// they pass 300 bytes, so writes stop succeeding.
 	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 	for i := uint32(0); i < 40; i++ {
-		frame := Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 2*i + 1, Payload: h.clientBlock(otherRequest("GET")...)}
+		frame := Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 2*i + 1, Payload: h.clientBlock(request("GET")...)}
 		if _, err := h.client.Write(encodeFrames([]Frame{frame})); err != nil {
 			break
 		}
@@ -1309,7 +1379,7 @@ func startConnection(t *testing.T, client, server net.Conn) {
 func TestShutdownWithAStuckClientWrite(t *testing.T) {
 	client, server, done, serverClosed := bareRelay(t)
 	startConnection(t, client, server)
-	writeAsync(server, Frame{Type: FramePing, Payload: make([]byte, 8)}) // the client never reads it
+	writeAsync(server, Frame{Type: FrameSettings}) // the client never reads it
 	time.Sleep(50 * time.Millisecond)
 	checkPromptShutdown(t, client, done, serverClosed)
 }
@@ -1321,7 +1391,7 @@ func TestShutdownDuringAnUnfinishedHeaderBlock(t *testing.T) {
 	startConnection(t, client, server)
 	var encBuf bytes.Buffer
 	enc := hpack.NewEncoder(&encBuf)
-	for _, f := range otherRequest("GET") {
+	for _, f := range request("GET") {
 		_ = enc.WriteField(f)
 	}
 	if _, err := client.Write(encodeFrames([]Frame{{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: encBuf.Bytes()}})); err != nil {
