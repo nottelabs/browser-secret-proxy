@@ -166,7 +166,7 @@ or has expired, the request is answered `502` and nothing of it is sent.
 | --- | --- | --- |
 | `file` | A JSON file on the proxy's host, reloaded when it changes. | A secret manager can write a file next to the proxy: Vault Agent templates, the Kubernetes Secrets Store CSI driver, a Kubernetes Secret volume. The simplest setup, with no extra service. |
 | `http` | Your own detokenize service, asked over mutual TLS. | Values are issued per user or per session, change often, or must be checked and audited by a service you already run. |
-| `sealed` | The proxy password itself, encrypted to the proxy's key. | You want no lookup service and nothing stored on the proxy: whoever starts the session seals the values it needs and hands the token over as the proxy password. |
+| `sealed` | The proxy password itself, encrypted to the proxy's key. | You want no lookup service and no storage to provision: whoever starts the session seals the values it needs and hands the token over as the proxy password. |
 
 ### file
 
@@ -262,8 +262,15 @@ algorithm is accepted). Its payload carries the values:
   is empty.
 
 The proxy decrypts the token on every `CONNECT`: that both admits the client
-and gives the values, with no lookup and nothing stored. A token that
-does not decrypt with the proxy's key, was altered, or has expired gets `407`.
+and gives the values, with no lookup service and no external storage. A
+token that does not decrypt with the proxy's key, was altered, or has
+expired gets `407`. A connection whose token expires while it is open gets
+`502` for every later request to an allowlisted host, whether or not the
+request holds a stand-in.
+
+Decrypted tokens, real values included, are kept in memory so each request
+does not decrypt again: at most 256 tokens, each until the earlier of its
+`exp` and 5 minutes after it was decrypted. Nothing is written to disk.
 The token's own stand-ins are what the proxy looks for, so no pattern is
 needed. To rotate the key, put the new and the old key in the `-sealed-key`
 file until the old tokens have expired.
@@ -365,9 +372,10 @@ host.
 - **Values are isolated by principal.** The principal is the proxy
   credential of the `CONNECT` (`SECRET_PROXY_USERNAME` or the resolver's own
   credential check). Every request is looked up again for its connection's
-  principal. The `http` resolver's cache is keyed by principal, host and stand-in,
-  and the other modes keep no cache of their own, so a value looked up for
-  one principal is never used for another.
+  principal, and what the resolvers keep in memory cannot serve another
+  principal: the `http` cache is keyed by principal, host and stand-in, and
+  the `sealed` cache by the token itself, which only its holder can present.
+  The `file` mode has one map for every principal by design.
 
 ### What it does not guarantee
 
