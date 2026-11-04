@@ -60,16 +60,17 @@ what the destination receives with what the client sent are the core of the
 suite; extend them rather than loosening them.
 
 `scripts/e2e-notte.sh` checks the image end to end with a real browser: it
-starts the proxy, makes it public with a [bore](https://github.com/ekzhang/bore)
+starts the proxy, makes it public with an [ngrok](https://ngrok.com) TCP
 tunnel, starts a Notte session that sends one echo host through it, and checks
 that host receives the real value while another host still gets the stand-in.
 The E2E workflow runs it against Notte staging on pull requests from this
 repository, on `main` and daily. To run it yourself you need Docker, `jq`,
-`bore` and a Notte API key:
+`ngrok` v3 with an authtoken (TCP tunnels need a verified ngrok account) and a
+Notte API key:
 
 ```sh
 make docker
-NOTTE_API_KEY=... scripts/e2e-notte.sh
+NOTTE_API_KEY=... NGROK_AUTHTOKEN=... scripts/e2e-notte.sh
 ```
 
 ## Pull requests

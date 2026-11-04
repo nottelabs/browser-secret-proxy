@@ -2,26 +2,26 @@
 # End-to-end check against a real Notte environment.
 #
 # Starts the proxy image with a throwaway CA and swaps file, exposes it on a
-# public address through a bore tunnel, starts a Notte session that sends one
+# public address through an ngrok TCP tunnel, starts a Notte session that sends one
 # host through it, and checks that:
 #   - the allowlisted host receives the real value instead of the stand-in;
 #   - another host still receives the stand-in.
 #
-# Needs: docker, curl, jq, openssl, bore (https://github.com/ekzhang/bore).
+# Needs: docker, curl, jq, openssl, ngrok (v3).
 #
 # Environment:
 #   NOTTE_API_KEY    API key for the Notte environment (required)
+#   NGROK_AUTHTOKEN  ngrok agent authtoken; TCP tunnels need a verified account (required)
 #   NOTTE_API_URL    default https://us-staging.notte.cc
 #   IMAGE            proxy image to test, default browser-secret-proxy:dev
-#   BORE_SERVER      default bore.pub
 #   SWAP_HOST        allowlisted echo host, default postman-echo.com
 #   CONTROL_HOST     echo host outside the allowlist, default httpbingo.org
 set -euo pipefail
 
 : "${NOTTE_API_KEY:?set NOTTE_API_KEY}"
+: "${NGROK_AUTHTOKEN:?set NGROK_AUTHTOKEN}"
 NOTTE_API_URL="${NOTTE_API_URL:-https://us-staging.notte.cc}"
 IMAGE="${IMAGE:-browser-secret-proxy:dev}"
-BORE_SERVER="${BORE_SERVER:-bore.pub}"
 SWAP_HOST="${SWAP_HOST:-postman-echo.com}"
 CONTROL_HOST="${CONTROL_HOST:-httpbingo.org}"
 LOCAL_PORT="${LOCAL_PORT:-18080}"
@@ -31,7 +31,7 @@ fail() { printf '[e2e] FAIL: %s\n' "$*" >&2; exit 1; }
 
 work="$(mktemp -d)"
 container="bsp-e2e-$$"
-bore_pid=""
+tunnel_pid=""
 session_id=""
 
 cleanup() {
@@ -42,10 +42,10 @@ cleanup() {
       -H "Authorization: Bearer $NOTTE_API_KEY" \
       "$NOTTE_API_URL/sessions/$session_id/stop"
   fi
-  if [ -n "$bore_pid" ]; then
-    kill "$bore_pid" 2>/dev/null
-    log "bore log:"
-    cat "$work/bore.log" >&2
+  if [ -n "$tunnel_pid" ]; then
+    kill "$tunnel_pid" 2>/dev/null
+    log "ngrok log:"
+    tail -n 20 "$work/ngrok.log" >&2
   fi
   if docker inspect "$container" >/dev/null 2>&1; then
     log "proxy logs:"
@@ -102,21 +102,23 @@ for _ in $(seq 1 20); do
 done
 [ -n "$ready" ] || fail "the proxy did not start"
 
-log "opening a tunnel through $BORE_SERVER"
-bore local "$LOCAL_PORT" --to "$BORE_SERVER" >"$work/bore.log" 2>&1 &
-bore_pid=$!
+log "opening an ngrok TCP tunnel"
+# A config of its own, so a local ngrok setup is not used. The token stays
+# in the environment, and the agent's local web interface is off.
+printf 'version: "3"\nagent:\n  web_addr: false\n' >"$work/ngrok.yml"
+ngrok tcp "$LOCAL_PORT" --config "$work/ngrok.yml" --log stdout --log-format logfmt >"$work/ngrok.log" 2>&1 &
+tunnel_pid=$!
 public=""
 for _ in $(seq 1 30); do
-  public="$(grep -o "listening at [^ ]*" "$work/bore.log" | awk '{print $3}' | head -n1 || true)"
+  public="$(grep -o 'url=tcp://[^ ]*' "$work/ngrok.log" | head -n1 | sed 's|^url=tcp://||' || true)"
   [ -n "$public" ] && break
-  kill -0 "$bore_pid" 2>/dev/null || fail "bore exited"
+  kill -0 "$tunnel_pid" 2>/dev/null || fail "ngrok exited"
   sleep 1
 done
 [ -n "$public" ] || fail "no tunnel address"
 log "proxy is public at $public"
 
-# The relay can hand out a port that does not accept connections. Check the
-# public address reaches the proxy (any HTTP answer, such as its 407) before
+# Check the public address reaches the proxy (any HTTP answer, such as its 407) before
 # starting a session, so that failure is reported as the tunnel's.
 public_status="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 "http://$public/" || true)"
 [ "$public_status" != 000 ] || fail "the tunnel at $public does not reach the proxy"
