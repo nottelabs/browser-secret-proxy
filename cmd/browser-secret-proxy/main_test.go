@@ -127,3 +127,21 @@ func TestParseParentErrorsLeaveCredentialsOut(t *testing.T) {
 		t.Fatalf("empty: %v, %v", u, err)
 	}
 }
+
+// The private-destination override must remain registered on the FlagSet
+// used by run, alongside the credential-safe usage handling.
+func TestAllowPrivateDestinationsFlag(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		fs, opts := newFlagSet("test", flag.ContinueOnError)
+		var args []string
+		if enabled {
+			args = []string{"-allow-private-destinations"}
+		}
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		if opts.allowPrivate != enabled {
+			t.Fatalf("allowPrivate = %t, want %t", opts.allowPrivate, enabled)
+		}
+	}
+}

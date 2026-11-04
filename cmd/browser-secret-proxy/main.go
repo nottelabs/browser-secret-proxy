@@ -98,6 +98,10 @@ func run() error {
 		// Real values in responses are replaced by their stand-ins.
 		MaskResponses:    opts.maskResponses,
 		MaskStreamWindow: *opts.maskWindow,
+		// Internal destinations are refused unless allowed. A parent proxy
+		// resolves names itself, so only IP literals are checked then.
+		AllowPrivateDestinations: opts.allowPrivate,
+		ParentProxy:              parentURL != nil,
 	})
 	if err != nil {
 		return err
@@ -109,7 +113,7 @@ func run() error {
 	parentDescription := describeParent(parentURL)
 	attrs := append([]any{"address", ln.Addr().String(), "hosts", opts.hosts}, values.logAttrs...)
 	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed",
-		"mask_responses", opts.maskResponses, "mask_stream_window", opts.maskWindow.String())
+		"mask_responses", opts.maskResponses, "mask_stream_window", opts.maskWindow.String(), "allow_private_destinations", opts.allowPrivate)
 	logger.Info("listening", attrs...)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -151,6 +155,7 @@ type options struct {
 	resolver                             *resolverFlags
 	maskWindow                           *mask.Window
 	maskResponses, verbose, showVersion  bool
+	allowPrivate                         bool
 }
 
 // newFlagSet defines the command line. No default comes from the
@@ -166,6 +171,7 @@ func newFlagSet(name string, handling flag.ErrorHandling) (*flag.FlagSet, *optio
 	o.resolver = registerResolverFlags(fs)
 	fs.StringVar(&o.parent, "upstream-proxy", "", "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
 	fs.BoolVar(&o.maskResponses, "mask-responses", true, "replace real values with their stand-ins in responses from allowlisted hosts")
+	fs.BoolVar(&o.allowPrivate, "allow-private-destinations", false, "let CONNECT reach loopback, private, link-local and other internal addresses")
 	o.maskWindow = registerMaskStreamWindow(fs)
 	fs.BoolVar(&o.verbose, "v", false, "debug logging")
 	fs.BoolVar(&o.showVersion, "version", false, "print the version and exit")

@@ -174,3 +174,15 @@ First release, planned as 0.1.0.
   stand-in let a multi-line value through). Over HTTP/2, a request whose
   field values hold a NUL, CR or LF, or start or end with a space or tab
   (malformed, RFC 9113 8.2.1), is answered `502` and not sent.
+
+### Changed
+
+- Behavior change: a `CONNECT` to an internal address is refused with `403`,
+  for tunneled and decrypted hosts alike. Internal means loopback, private,
+  link-local (`169.254.169.254` included), unspecified, multicast and
+  `100.64.0.0/10`, also in IPv4-mapped or IPv4-compatible form. The proxy
+  resolves a name once, refuses it when any of its addresses is internal,
+  and dials the addresses it checked. Through `-upstream-proxy`, only
+  IP-literal destinations are checked. `-allow-private-destinations` turns
+  the check off. Tunnels without decryption are logged at info level, with
+  their host, port and principal.

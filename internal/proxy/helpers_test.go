@@ -177,6 +177,9 @@ func startProxy(t *testing.T, dialer mapDialer, destinationCAs *x509.CertPool, m
 		Authority: authority, Hosts: hosts, Resolver: resolver, Detector: detector, Dialer: dialer, RootCAs: destinationCAs,
 		HandshakeTimeout: 10 * time.Second, MaskResponses: true,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		// The destinations are local servers. Tests of the default set it
+		// back to false.
+		AllowPrivateDestinations: true,
 	}
 	if mutate != nil {
 		mutate(&cfg)
