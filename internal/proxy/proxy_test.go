@@ -48,6 +48,7 @@ func getOK(t *testing.T, conn io.ReadWriter, host string) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
 		t.Fatalf("response %d %q", resp.StatusCode, body)
 	}
@@ -74,6 +75,7 @@ func TestClientHelloIsReplayedExactly(t *testing.T) {
 	orders := map[string]bool{}
 	for i := 0; i < 4; i++ {
 		conn, resp := connect(t, p.addr, allowedHost+":443", "")
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("CONNECT answered %s", resp.Status)
 		}
@@ -268,7 +270,8 @@ func TestHTTP2IsMirrored(t *testing.T) {
 	dest := startDestination(t, allowedHost, []string{"h2", "http/1.1"}, h2Destination(2, captures))
 	p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, nil)
 
-	conn, _ := connect(t, p.addr, allowedHost+":443", "")
+	conn, resp := connect(t, p.addr, allowedHost+":443", "")
+	_ = resp.Body.Close()
 	uconn := chromeClient(t, conn, allowedHost, p.ca)
 	if got := uconn.ConnectionState().NegotiatedProtocol; got != "h2" {
 		t.Fatalf("negotiated %q with the client, want h2", got)
@@ -424,6 +427,7 @@ func TestNonAllowlistedHostIsTunneled(t *testing.T) {
 	p := startProxy(t, mapDialer{otherHost + ":443": dest.addr}, dest.ca, nil)
 
 	conn, resp := connect(t, p.addr, otherHost+":443", "")
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT answered %s", resp.Status)
 	}
@@ -456,7 +460,8 @@ func TestUnreplayableClientHelloFailsLoudly(t *testing.T) {
 	dest := startDestination(t, allowedHost, []string{"http/1.1"}, respondOK)
 	p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, nil)
 
-	conn, _ := connect(t, p.addr, allowedHost+":443", "")
+	conn, resp := connect(t, p.addr, allowedHost+":443", "")
+	_ = resp.Body.Close()
 	uconn := utls.UClient(conn, &utls.Config{ServerName: allowedHost, RootCAs: p.ca}, utls.HelloCustom)
 	err := uconn.ApplyPreset(&utls.ClientHelloSpec{
 		TLSVersMin:         utls.VersionTLS12,
@@ -480,11 +485,12 @@ func TestUnreplayableClientHelloFailsLoudly(t *testing.T) {
 	if err := uconn.Handshake(); err != nil {
 		t.Fatalf("handshake for the error response: %v", err)
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(uconn), nil)
+	resp, err = http.ReadResponse(bufio.NewReader(uconn), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	text, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(text), "cannot replay") || !strings.Contains(string(text), "4919") {
 		t.Fatalf("got %d %q", resp.StatusCode, text)
 	}
@@ -513,6 +519,7 @@ func TestProxyAuthentication(t *testing.T) {
 		basic("user:pass word"): http.StatusOK,
 	} {
 		_, resp := connect(t, p.addr, otherHost+":443", authorization)
+		_ = resp.Body.Close()
 		if resp.StatusCode != want {
 			t.Errorf("authorization %q: %s, want %d", authorization, resp.Status, want)
 		}
@@ -522,6 +529,7 @@ func TestProxyAuthentication(t *testing.T) {
 func TestNonConnectAndUnreachableDestinations(t *testing.T) {
 	p := startProxy(t, mapDialer{}, nil, nil)
 	_, resp := connect(t, p.addr, "unreachable.test:443", "")
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("unreachable destination: %s", resp.Status)
 	}
@@ -537,6 +545,7 @@ func TestNonConnectAndUnreachableDestinations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("plain GET: %s", resp.Status)
 	}
@@ -577,7 +586,8 @@ func TestHTTP1KeepsTheRawRequest(t *testing.T) {
 	})
 	p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, nil)
 
-	conn, _ := connect(t, p.addr, allowedHost+":443", "")
+	conn, resp := connect(t, p.addr, allowedHost+":443", "")
+	_ = resp.Body.Close()
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: allowedHost, RootCAs: p.ca, NextProtos: []string{"h2", "http/1.1"}})
 	if err := tlsConn.Handshake(); err != nil {
 		t.Fatal(err)
@@ -601,6 +611,7 @@ func TestHTTP1KeepsTheRawRequest(t *testing.T) {
 		t.Fatalf("response %v, %v", resp, err)
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 	swappedBody := "card=4111111111111111&token=sk_live_real_secret_value"
 	want := "POST /pay?card=4111111111111111 HTTP/1.1\r\n" +
 		"Host: " + allowedHost + "\r\n" +
@@ -640,6 +651,7 @@ func TestHTTP1KeepsTheRawRequest(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("upload response %v, %v", resp, err)
 	}
+	_ = resp.Body.Close()
 	swappedUpload := `{"token":"sk_live_real_secret_value"}`
 	wantUpload := "POST /upload HTTP/1.1\r\nHost: " + allowedHost + "\r\n" +
 		"Content-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(swappedUpload)) + "\r\nExpect: 100-continue\r\n\r\n" + swappedUpload
@@ -699,6 +711,7 @@ func TestShutdownClosesIdleTunnels(t *testing.T) {
 	dest := startDestination(t, otherHost, []string{"http/1.1"}, respondOK)
 	p := startProxy(t, mapDialer{otherHost + ":443": dest.addr}, dest.ca, nil)
 	conn, resp := connect(t, p.addr, otherHost+":443", "")
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT answered %s", resp.Status)
 	}

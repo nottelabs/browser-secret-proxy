@@ -65,7 +65,7 @@ func Serve(client, server net.Conn, opts Options) error {
 	err := <-done
 	_ = client.Close()
 	_ = server.Close()
-	<-done
+	<-done //nolint:errcheck // waits for the other side; err above is the cause
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return nil
 	}

@@ -245,7 +245,7 @@ func (r *relay) run() error {
 	}
 	r.shutdown()
 	for ; pending > 0; pending-- {
-		<-errs
+		<-errs //nolint:errcheck // waits for the other loops; first is the cause
 	}
 	if errors.Is(first, io.EOF) || errors.Is(first, net.ErrClosed) {
 		return nil

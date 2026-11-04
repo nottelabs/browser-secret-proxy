@@ -291,8 +291,8 @@ func Compare(original, replay *Hello) error {
 }
 
 func compareExtension(want, got Extension) error {
-	switch {
-	case want.Type == ExtKeyShare:
+	switch want.Type {
+	case ExtKeyShare:
 		a, b := (&Hello{Extensions: []Extension{want}}).KeyShares(), (&Hello{Extensions: []Extension{got}}).KeyShares()
 		if a == nil || b == nil || len(a) != len(b) {
 			return errors.New("key share entries differ")
@@ -306,11 +306,11 @@ func compareExtension(want, got Extension) error {
 			}
 		}
 		return nil
-	case want.Type == ExtEncryptedHello:
+	case ExtEncryptedHello:
 		return compareGREASEECH(want.Data, got.Data)
-	case want.Type == ExtSupportedGroups:
+	case ExtSupportedGroups:
 		return compareU16List(want.Data, got.Data, 2)
-	case want.Type == ExtSupportedVersions:
+	case ExtSupportedVersions:
 		return compareU16List(want.Data, got.Data, 1)
 	default:
 		if !bytes.Equal(want.Data, got.Data) {

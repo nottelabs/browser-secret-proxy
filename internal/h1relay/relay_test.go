@@ -28,8 +28,8 @@ func options(t *testing.T) Options {
 }
 
 // serve runs a relay between pipes, sends request from a client goroutine and
-// returns the relay's error and how many bytes the client got to write.
-func serve(t *testing.T, request func(w io.Writer) error) (error, int64) {
+// returns how many bytes the client got to write and the relay's error.
+func serve(t *testing.T, request func(w io.Writer) error) (int64, error) {
 	t.Helper()
 	clientSide, relayClient := net.Pipe()
 	relayServer, serverSide := net.Pipe()
@@ -49,10 +49,10 @@ func serve(t *testing.T, request func(w io.Writer) error) (error, int64) {
 	case err := <-result:
 		_ = clientSide.Close()
 		_ = serverSide.Close()
-		return err, written.Load()
+		return written.Load(), err
 	case <-time.After(10 * time.Second):
 		t.Fatal("relay did not stop")
-		return nil, 0
+		return 0, nil
 	}
 }
 
@@ -64,7 +64,7 @@ func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 // the relay reading (and holding) the rest of it.
 func TestEndlessLineIsRefusedAtTheLimit(t *testing.T) {
 	const total = 8 * maxHeadBytes
-	err, written := serve(t, func(w io.Writer) error {
+	written, err := serve(t, func(w io.Writer) error {
 		chunk := []byte(strings.Repeat("a", 32<<10))
 		for sent := 0; sent < total; sent += len(chunk) {
 			if _, err := w.Write(chunk); err != nil {
@@ -82,7 +82,7 @@ func TestEndlessLineIsRefusedAtTheLimit(t *testing.T) {
 }
 
 func TestEndlessHeaderIsRefused(t *testing.T) {
-	err, _ := serve(t, func(w io.Writer) error {
+	_, err := serve(t, func(w io.Writer) error {
 		if _, err := io.WriteString(w, "GET / HTTP/1.1\r\nHost: allowed.test\r\nX-Long: "); err != nil {
 			return err
 		}
@@ -100,7 +100,7 @@ func TestEndlessHeaderIsRefused(t *testing.T) {
 }
 
 func TestChunkedTrailersAreCapped(t *testing.T) {
-	err, _ := serve(t, func(w io.Writer) error {
+	_, err := serve(t, func(w io.Writer) error {
 		if _, err := io.WriteString(w, "POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n"); err != nil {
 			return err
 		}
@@ -140,7 +140,7 @@ func pipesWith(t *testing.T, opts Options) (client net.Conn, clientReader *bufio
 		_ = clientSide.Close()
 		_ = serverSide.Close()
 		select {
-		case <-done:
+		case <-done: //nolint:errcheck // only waits for the relay to stop
 		case <-time.After(5 * time.Second):
 			t.Error("relay did not stop")
 		}
