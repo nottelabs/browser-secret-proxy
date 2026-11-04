@@ -83,6 +83,15 @@ type Snapshotter interface {
 	Snapshot(p Principal) (Snapshot, error)
 }
 
+// Local is implemented by resolvers, and snapshots, that answer from memory
+// without waiting on anything (the file and sealed modes). The proxy
+// resolves their requests in line, in the client's order; it resolves the
+// others' (the http mode, which waits on a service) off the connection's
+// reader, so a slow lookup holds back only its own request.
+type Local interface {
+	Local()
+}
+
 // Authenticator is implemented by resolvers whose proxy credential carries
 // the values (sealed). When the configured resolver implements it, the proxy
 // calls it on every CONNECT instead of comparing a fixed username and

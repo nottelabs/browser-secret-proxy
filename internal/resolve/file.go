@@ -182,5 +182,11 @@ func (f *File) StandIns(Principal) []string { return f.current.Load().standIns }
 // StandIns returns the snapshot's stand-ins, whoever asks.
 func (snapshot *fileSnapshot) StandIns(Principal) []string { return snapshot.standIns }
 
+// Local marks the file as answering from memory.
+func (f *File) Local() {}
+
+// Local marks a file snapshot as answering from memory.
+func (snapshot *fileSnapshot) Local() {}
+
 // Count is the number of stand-ins currently loaded.
 func (f *File) Count() int { return len(f.current.Load().standIns) }

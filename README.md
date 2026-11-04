@@ -681,8 +681,16 @@ return.
 - The CA, the `http` mode's client certificate and the `sealed` key are
   read once at start. Restart the proxy to change them. The swaps file is
   reloaded (see [file](#file)).
-- In `http` mode, a lookup holds back the other requests of the same HTTP/2
-  connection until it answers or times out. Cached values need no lookup.
+- In `http` mode, a request that needs a lookup waits for it on its own:
+  over HTTP/2, the other requests of the connection go on meanwhile, and a
+  request that waited goes upstream when its lookup answers, so its order
+  among the connection's requests can differ from the browser's. Requests
+  that need no lookup keep the browser's order, and the `file` and `sealed`
+  modes, which answer from memory, keep it for every request. At most 16
+  lookups run at once per HTTP/2 connection; more wait for one to end. A
+  request reset by the browser, or refused by the destination's `GOAWAY`,
+  while its lookup runs cancels the lookup. An HTTP/1.1 connection carries
+  one request at a time, so its lookup holds back only that connection.
 
 ## Verifying a release
 

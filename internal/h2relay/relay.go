@@ -61,7 +61,12 @@ type Options struct {
 	// control (default 64 MiB).
 	MaxBuffered int
 	// MaxStreams caps the client streams open at once (default 256).
+	// Streams waiting for a lookup count toward it.
 	MaxStreams int
+	// MaxLookups caps the resolver lookups running at once on the
+	// connection, each on a goroutine (default DefaultMaxLookups); more wait
+	// in a queue, without a goroutine, for a free one.
+	MaxLookups int
 	// MaxHeaderBytes caps a client header block, encoded and decoded
 	// (default 1 MiB).
 	MaxHeaderBytes int
@@ -85,6 +90,8 @@ var (
 
 const (
 	errCodeNoError       = 0x0
+	errCodeProtocol      = 0x1
+	errCodeStreamClosed  = 0x5
 	errCodeInternal      = 0x2
 	errCodeFlowControl   = 0x3
 	errCodeRefusedStream = 0x7
@@ -102,9 +109,21 @@ const (
 type relay struct {
 	opts           Options
 	client, server net.Conn
-	// ctx ends with the relay, canceling a resolver call in progress.
+	// ctx ends with the relay, canceling every resolver lookup in progress.
 	ctx    context.Context
 	cancel context.CancelFunc
+	// Resolver lookups run off clientLoop (lookup.go): lookups tracks their
+	// goroutines so the relay ends only after they did, lookupsRunning and
+	// lookupQueue (guarded by mu) are the running and waiting ones, and
+	// asyncErrs carries an I/O error one of them met to run, which ends the
+	// connection.
+	lookups        sync.WaitGroup
+	lookupsRunning int
+	lookupQueue    []pendingLookup
+	asyncErrs      chan error
+	// streamErrors counts the client's stream errors (frames on a stream it
+	// ended); past maxStreamErrors they end the connection. clientLoop only.
+	streamErrors int
 
 	clientMu sync.Mutex // serializes writes to the client
 	// The server's first SETTINGS must be the first frame the client gets
@@ -189,14 +208,21 @@ type relay struct {
 
 type stream struct {
 	clientID, serverID uint32
-	swap               bool
-	authority          string
-	method             string
-	buffering          bool
-	headers            []hpack.HeaderField
-	priority           *Priority
-	body               bytes.Buffer
-	trailers           []hpack.HeaderField
+	// lookupCtx is the context of the stream's resolver lookups, canceled
+	// when the stream is dropped (guarded by relay.mu).
+	lookupCtx    context.Context
+	lookupCancel context.CancelFunc
+	// finishing is set once finish took the buffered request to swap and
+	// send it (guarded by relay.mu).
+	finishing bool
+	swap      bool
+	authority string
+	method    string
+	buffering bool
+	headers   []hpack.HeaderField
+	priority  *Priority
+	body      bytes.Buffer
+	trailers  []hpack.HeaderField
 	// Control frames for a stream that has no server ID yet, combined so a
 	// client cannot grow them: the summed WINDOW_UPDATE increment and the
 	// latest PRIORITY_UPDATE.
@@ -241,6 +267,9 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	if opts.MaxStreams <= 0 {
 		opts.MaxStreams = 256
 	}
+	if opts.MaxLookups <= 0 {
+		opts.MaxLookups = DefaultMaxLookups
+	}
 	if opts.MaxHeaderBytes <= 0 {
 		opts.MaxHeaderBytes = 1 << 20
 	}
@@ -261,6 +290,7 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 		recvConn: defaultWindow, clientInitial: defaultWindow, maxConcurrent: -1, ackedInitial: defaultWindow, maxInitialSent: defaultWindow,
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
+	r.asyncErrs = make(chan error, 1)
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
@@ -311,11 +341,14 @@ func (r *relay) run() error {
 	case first = <-errs:
 		pending--
 	case first = <-timeout:
+	case first = <-r.asyncErrs:
 	}
 	r.shutdown()
 	for ; pending > 0; pending-- {
 		<-errs //nolint:errcheck // waits for the other loops; first is the cause
 	}
+	// shutdown canceled every lookup; none outlives the relay.
+	r.lookups.Wait()
 	if errors.Is(first, io.EOF) || errors.Is(first, net.ErrClosed) {
 		return nil
 	}
@@ -459,12 +492,18 @@ var errFlowControl = errors.New("client exceeded its flow-control window")
 
 // flowControlError ends the connection after a window violation.
 func (r *relay) flowControlError() error {
+	return r.connectionError(errCodeFlowControl, errFlowControl)
+}
+
+// connectionError tells the client with GOAWAY that the connection ends for
+// code, and returns cause, which ends the relay.
+func (r *relay) connectionError(code uint32, cause error) error {
 	r.mu.Lock()
 	last := r.maxClientID
 	r.mu.Unlock()
-	payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, last), errCodeFlowControl)
+	payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, last), code)
 	_ = r.writeClient(Frame{Type: FrameGoAway, Payload: payload})
-	return errFlowControl
+	return cause
 }
 
 // clientLoop reads the client's frames and sends them on.
@@ -648,8 +687,11 @@ func (r *relay) openStreamsLocked() int {
 }
 
 // dropLocked forgets the request side of a stream and releases what it held.
-// The server mapping stays until the server ends the stream, so its
-// remaining frames still reach the client.
+// Every caller ends the stream toward the client (a refusal or a reset). The
+// server mapping stays until the server ends the stream: without masking,
+// its remaining frames still go to the client, which ignores them after
+// decoding any header block; with masking, the response side ends here
+// (endRespLocked) and the server's remaining frames are absorbed.
 func (r *relay) dropLocked(s *stream) {
 	r.held -= int64(s.body.Len() + len(s.out))
 	if s.streaming && len(s.out) > 0 {
@@ -673,8 +715,15 @@ func (r *relay) dropLocked(s *stream) {
 	}
 	r.dequeue(s)
 	delete(r.streams, s.clientID)
-	if r.masking && s.serverID == 0 {
-		// Never sent upstream: no response will come.
+	if s.lookupCancel != nil {
+		s.lookupCancel() // a lookup still in flight is no longer wanted
+		r.dropLookupsLocked(s)
+	}
+	if r.masking {
+		// The stream ends toward the client too (it was refused or reset):
+		// its response, queued or still to come, is released with its
+		// queued bytes and masking worker, and nothing more of it reaches
+		// the client.
 		if rs := r.resp[s.clientID]; rs != nil {
 			r.endRespLocked(rs)
 		}
@@ -837,18 +886,13 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		s = &stream{clientID: clientID, swap: r.opts.Hosts.Match(authority), authority: authority, method: method, clientEnded: endStream}
 		// A request with a body is swapped once the body is complete
 		// (finish), with a single lookup for its headers, body and trailers.
+		// Any other request on an allowlisted authority is prepared here;
+		// one that needs a lookup waits for it off this loop (lookup.go).
 		buffered := !endStream && s.swap && method != "CONNECT"
+		var lookup *scope.Lookup
 		if s.swap && !buffered {
-			swapper, err := r.opts.Session.Swapper(r.ctx, fieldText(fields)...)
-			if err != nil {
+			if lookup, err = r.opts.Session.Prepare(fieldText(fields)...); err != nil {
 				return r.badGateway(clientID, authority, endStream, err)
-			}
-			if swapper != nil {
-				if err := r.swapFields(swapper, fields, authority); err != nil {
-					// Nothing went upstream, so the client may retry elsewhere.
-					r.opts.Logger.Error("refusing a request whose swapped headers cannot be sent", "stream", clientID, "error", err)
-					return r.writeClient(refusal(clientID))
-				}
 			}
 		}
 		// Every field other goroutines read is set before the stream is
@@ -871,6 +915,11 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 			topUp = r.topUpBufferingLocked()
 		}
 		r.mu.Unlock()
+		if lookup != nil {
+			return r.resolveLookup(s, lookup, func(swapper *swap.Swapper, err error) error {
+				return r.openResolved(s, fields, priority, endStream, swapper, err)
+			})
+		}
 		if !buffered {
 			return r.open(s, fields, priority, endStream)
 		}
@@ -891,18 +940,39 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 
 	// Trailers. A buffered request's are swapped with its body in finish;
 	// a streamed request (extended CONNECT) on an allowlisted authority gets
-	// a lookup of its own.
+	// a lookup of its own. A header block after the client ended the stream
+	// is a stream error.
 	r.mu.Lock()
-	buffering := s.buffering
+	buffering, ended := s.buffering, s.clientEnded
 	r.mu.Unlock()
+	if ended {
+		return r.endedStream(s, 0)
+	}
 	if s.swap && !buffering {
-		swapper, err := r.opts.Session.Swapper(r.ctx, fieldText(fields)...)
-		if err == nil && swapper != nil {
-			err = r.swapFields(swapper, fields, s.authority)
-		}
+		lookup, err := r.opts.Session.Prepare(fieldText(fields)...)
 		if err != nil {
 			r.opts.Logger.Error("resetting a request whose trailers cannot be sent", "stream", clientID, "error", err)
 			return r.abort(s, errCodeCalm)
+		}
+		if lookup != nil {
+			r.mu.Lock()
+			s.clientEnded = s.clientEnded || endStream
+			r.mu.Unlock()
+			return r.resolveLookup(s, lookup, func(swapper *swap.Swapper, err error) error {
+				if err == nil {
+					err = r.swapFields(swapper, fields, s.authority)
+				}
+				if err != nil {
+					r.opts.Logger.Error("resetting a request whose trailers cannot be sent", "stream", s.clientID, "error", err)
+					return r.abort(s, errCodeCalm)
+				}
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				s.trailers = fields
+				s.outEnd = s.outEnd || endStream
+				r.enqueueLocked(s)
+				return nil
+			})
 		}
 	}
 	r.mu.Lock()
@@ -1178,6 +1248,11 @@ func (r *relay) onData(f Frame) error {
 		r.mu.Unlock()
 		return r.flowControlError()
 	}
+	if s.clientEnded {
+		// DATA after the client ended the stream.
+		r.mu.Unlock()
+		return r.endedStream(s, len(f.Payload))
+	}
 	s.clientEnded = s.clientEnded || end
 	if s.buffering {
 		overBody := s.body.Len()+len(data) > r.opts.MaxBody
@@ -1230,16 +1305,18 @@ func (r *relay) onData(f Frame) error {
 // releases it through dropLocked.
 func (r *relay) finish(s *stream) error {
 	r.mu.Lock()
-	if r.streams[s.clientID] != s || !s.buffering {
+	if r.streams[s.clientID] != s || !s.buffering || s.finishing {
 		r.mu.Unlock()
-		return nil // dropped meanwhile (reset, refused, server going away)
+		return nil // dropped meanwhile (reset, refused, server going away), or already finishing
 	}
+	// Finishing from here on, so nothing the client sends starts it again
+	// while the lookup runs.
+	s.finishing = true
 	// s.body is not written again: the client ended the stream, and so its
 	// trailers are final too.
 	original := s.body.Bytes()
 	headers, priority, trailers := s.headers, s.priority, s.trailers
 	s.headers = nil
-	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
 	r.mu.Unlock()
 
 	contentType := ""
@@ -1250,19 +1327,30 @@ func (r *relay) finish(s *stream) error {
 	}
 	parts := append(fieldText(headers), fieldText(trailers)...)
 	parts = append(parts, swap.Part{Place: swap.BodyPlace(contentType), Text: string(original)})
-	swapper, err := r.opts.Session.Swapper(r.ctx, parts...)
+	lookup, err := r.opts.Session.Prepare(parts...)
 	if err != nil {
-		r.mu.Lock()
-		current := r.streams[s.clientID] == s
-		if current {
-			r.dropLocked(s)
-		}
-		r.mu.Unlock()
-		if !current {
-			return nil
-		}
-		return r.badGateway(s.clientID, s.authority, true, err)
+		return r.refuseLookup(s, err)
 	}
+	if lookup == nil {
+		return r.finishSwapped(s, nil, headers, priority, trailers, original, contentType)
+	}
+	// The body stays buffered (and counted) while a lookup runs off
+	// clientLoop.
+	return r.resolveLookup(s, lookup, func(swapper *swap.Swapper, err error) error {
+		if err != nil {
+			return r.refuseLookup(s, err)
+		}
+		return r.finishSwapped(s, swapper, headers, priority, trailers, original, contentType)
+	})
+}
+
+// finishSwapped swaps a buffered request's headers, trailers and body with
+// swapper (nil: nothing to swap) and sends the request upstream.
+func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.HeaderField, priority *Priority, trailers []hpack.HeaderField, original []byte, contentType string) error {
+	r.mu.Lock()
+	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
+	r.mu.Unlock()
+	var err error
 	body, changed := original, false
 	if swapper != nil {
 		for _, list := range [][]hpack.HeaderField{headers, trailers} {

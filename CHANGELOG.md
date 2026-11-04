@@ -59,3 +59,8 @@ First release, planned as 0.1.0.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).
+- Over HTTP/2, a request waiting on a resolver lookup (the `http` mode) no
+  longer holds back the other requests of its connection: each lookup runs
+  on its own, at most 16 at a time per connection, and is canceled when its
+  request is reset or refused. The `file` and `sealed` modes, which answer
+  from memory, resolve in line and keep the browser's request order.

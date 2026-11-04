@@ -147,25 +147,39 @@ func refused(format string, args ...any) error {
 // Content-Type). It returns nil when the request holds no stand-in, and a
 // *RefusedError when it must not be sent.
 func (s *Session) Swapper(ctx context.Context, parts ...swap.Part) (*swap.Swapper, error) {
-	values, err := s.Values(ctx, parts...)
-	if err != nil || values == nil {
+	lookup, err := s.Prepare(parts...)
+	if err != nil || lookup == nil {
 		return nil, err
 	}
-	reals := make(map[string]string, len(values))
-	for standIn, v := range values {
-		reals[standIn] = v.Real
-	}
-	sw, err := swap.New(reals)
-	if err != nil {
-		return nil, refused("%v", err)
-	}
-	return sw, nil
+	return lookup.Swapper(ctx)
 }
 
 // Values resolves the stand-ins a swap of parts would replace and checks
 // that each value may go to the connection's host now. It returns nil when
 // there are none.
 func (s *Session) Values(ctx context.Context, parts ...swap.Part) (map[string]resolve.Value, error) {
+	lookup, err := s.Prepare(parts...)
+	if err != nil || lookup == nil {
+		return nil, err
+	}
+	return lookup.Values(ctx)
+}
+
+// Lookup is one request's resolution, prepared but not made: the stand-ins
+// a swap would replace, and the resolver (or snapshot of it) to ask.
+type Lookup struct {
+	session  *Session
+	resolver resolve.Resolver
+	standIns []string
+}
+
+// Prepare does everything before the resolver is called, all of it local:
+// it takes the resolver's snapshot (refusing the request when the
+// principal's credential is no longer valid) and finds the stand-ins a swap
+// of parts would replace. It returns nil when there is nothing to resolve,
+// so a caller can tell, without waiting on the resolver, which requests need
+// a lookup.
+func (s *Session) Prepare(parts ...swap.Part) (*Lookup, error) {
 	cfg := s.scope.cfg
 	resolver := cfg.Resolver
 	var known resolve.KnownStandIns
@@ -197,9 +211,43 @@ func (s *Session) Values(ctx context.Context, parts ...swap.Part) (map[string]re
 	if len(standIns) == 0 {
 		return nil, nil
 	}
+	return &Lookup{session: s, resolver: resolver, standIns: standIns}, nil
+}
+
+// Local reports whether the lookup is answered from memory, without
+// waiting (resolve.Local): a caller may then resolve it in line.
+func (l *Lookup) Local() bool {
+	_, ok := l.resolver.(resolve.Local)
+	return ok
+}
+
+// Swapper resolves the lookup and returns a Swapper holding exactly its
+// values, or a *RefusedError when the request must not be sent. It waits
+// for the resolver, at most the scope's Timeout, or until ctx ends.
+func (l *Lookup) Swapper(ctx context.Context) (*swap.Swapper, error) {
+	values, err := l.Values(ctx)
+	if err != nil {
+		return nil, err
+	}
+	reals := make(map[string]string, len(values))
+	for standIn, v := range values {
+		reals[standIn] = v.Real
+	}
+	sw, err := swap.New(reals)
+	if err != nil {
+		return nil, refused("%v", err)
+	}
+	return sw, nil
+}
+
+// Values resolves the lookup and checks that each value may go to the
+// connection's host now.
+func (l *Lookup) Values(ctx context.Context) (map[string]resolve.Value, error) {
+	s, standIns := l.session, l.standIns
+	cfg := s.scope.cfg
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
-	result, err := resolver.Resolve(ctx, resolve.Request{StandIns: standIns, Host: s.host, Principal: s.principal})
+	result, err := l.resolver.Resolve(ctx, resolve.Request{StandIns: standIns, Host: s.host, Principal: s.principal})
 	if err != nil {
 		// The resolver's error may quote what it was sent, or a real value:
 		// only its category is logged, and nothing reaches the client.
