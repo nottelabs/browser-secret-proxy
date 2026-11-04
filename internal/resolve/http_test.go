@@ -251,6 +251,36 @@ func TestHTTPCache(t *testing.T) {
 	}
 }
 
+// The service decides per host: an answer for one host is not reused for
+// another, even for the same principal and stand-in.
+func TestHTTPCacheIsPerHost(t *testing.T) {
+	d := startDetokenizer(t, func(req detokenizeRequest, w http.ResponseWriter) {
+		values := map[string]any{}
+		if req.Host == "allowed.test" {
+			values["tok_a"] = map[string]any{"real": "real_a"}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": values})
+	})
+	h := newTestHTTP(t, d.config())
+	lookup := func(host string) Result {
+		t.Helper()
+		res, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: host, Principal: Principal{ID: "u"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if _, ok := lookup("allowed.test:443").Values["tok_a"]; !ok {
+		t.Fatal("the allowed host was refused")
+	}
+	if _, ok := lookup("denied.test").Values["tok_a"]; ok {
+		t.Fatal("an answer for another host was reused")
+	}
+	if _, ok := lookup("allowed.test").Values["tok_a"]; !ok || d.calls.Load() != 2 {
+		t.Fatalf("the allowed host's answer was not cached (port ignored): %d calls", d.calls.Load())
+	}
+}
+
 func TestHTTPCacheIsBounded(t *testing.T) {
 	d := startDetokenizer(t, func(req detokenizeRequest, w http.ResponseWriter) {
 		out := map[string]any{}

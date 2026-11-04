@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -34,8 +35,19 @@ func (v *value) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &v.Real); err == nil {
 		return nil
 	}
-	type plain value
-	return json.Unmarshal(data, (*plain)(v))
+	var entry struct {
+		Real  *string  `json:"real"`
+		Hosts []string `json:"hosts"`
+	}
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return err
+	}
+	if entry.Real == nil {
+		// Without it the entry would answer an empty value.
+		return errors.New("an entry without \"real\"")
+	}
+	v.Real, v.Hosts = *entry.Real, entry.Hosts
+	return nil
 }
 
 // handler answers detokenize requests from values.

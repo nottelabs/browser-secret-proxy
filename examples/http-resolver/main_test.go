@@ -41,4 +41,8 @@ func TestHandlerAnswersTheResolverAPI(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("malformed request: status %d", rec.Code)
 	}
+
+	if err := json.Unmarshal([]byte(`{"tok_a": {"hosts": ["api.test"]}}`), &values); err == nil {
+		t.Fatal("an entry without real loaded")
+	}
 }

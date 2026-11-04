@@ -31,7 +31,8 @@ type HTTPConfig struct {
 	CA string
 	// Timeout bounds one call, connection included (default 2 s).
 	Timeout time.Duration
-	// CacheTTL is the longest a value is kept in memory (default 60 s).
+	// CacheTTL is the longest a value is kept in memory, per principal,
+	// host and stand-in (default 60 s).
 	// A value's own expires_at shortens it. Negative disables the cache.
 	CacheTTL time.Duration
 	// CacheSize caps the cached values (default 10000).
@@ -56,7 +57,8 @@ type HTTPConfig struct {
 // One call covers every stand-in of a request that is not cached. Any other
 // status, a malformed answer or a timeout is an error, and a stand-in left
 // out of values is unresolved: either way the request is refused. Answers
-// are cached in memory per principal and stand-in.
+// are cached in memory per principal, host and stand-in: the service decides
+// for each host, so an answer for one host is never reused for another.
 type HTTP struct {
 	cfg    HTTPConfig
 	client *http.Client
@@ -65,7 +67,7 @@ type HTTP struct {
 	cache map[cacheKey]cacheEntry
 }
 
-type cacheKey struct{ principal, standIn string }
+type cacheKey struct{ principal, host, standIn string }
 
 type cacheEntry struct {
 	value Value
@@ -164,10 +166,11 @@ func (h *HTTP) Resolve(ctx context.Context, req Request) (Result, error) {
 		return out, fmt.Errorf("%d stand-ins in one request, more than the resolver batch limit of %d", len(req.StandIns), h.cfg.MaxBatch)
 	}
 	now := h.cfg.now()
+	host := hostOnly(req.Host)
 	var missing []string
 	h.mu.Lock()
 	for _, s := range req.StandIns {
-		key := cacheKey{req.Principal.ID, s}
+		key := cacheKey{req.Principal.ID, host, s}
 		if e, ok := h.cache[key]; ok {
 			if now.Before(e.until) {
 				out.Values[s] = e.value
@@ -182,7 +185,7 @@ func (h *HTTP) Resolve(ctx context.Context, req Request) (Result, error) {
 		return out, nil
 	}
 
-	answer, err := h.call(ctx, detokenizeRequest{StandIns: missing, Host: hostOnly(req.Host), PrincipalID: req.Principal.ID})
+	answer, err := h.call(ctx, detokenizeRequest{StandIns: missing, Host: host, PrincipalID: req.Principal.ID})
 	if err != nil {
 		return out, err
 	}
@@ -196,7 +199,7 @@ func (h *HTTP) Resolve(ctx context.Context, req Request) (Result, error) {
 		}
 		value := Value{Real: *v.Real, Hosts: v.Hosts, ExpiresAt: v.ExpiresAt}
 		out.Values[s] = value
-		h.store(cacheKey{req.Principal.ID, s}, value, now)
+		h.store(cacheKey{req.Principal.ID, host, s}, value, now)
 	}
 	return out, nil
 }
