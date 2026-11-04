@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestDecodeJSONString(t *testing.T) {
@@ -47,19 +48,54 @@ func TestDecodeJSONString(t *testing.T) {
 	}
 }
 
+// writeJSONEscaped writes valid UTF-8 exactly as encoding/json does, the
+// form the swapper and the masker search for. For invalid UTF-8, which the
+// swapper never escapes (decodeJSONString refuses it), the spelling of
+// U+FFFD depends on the Go version: \ufffd before Go 1.27, the raw character
+// from 1.27 on. There the test checks that both outputs mean the same text.
 func TestWriteJSONEscapedMatchesEncodingJSON(t *testing.T) {
-	for _, s := range []string{"plain", `q"x\y`, "\n\r\t\b\f\x00\x1f", "\u00e9 \U0001F600", "\u2028\u2029", "a&b<c>", "bad\xffbyte", ""} {
+	escape := func(s string) string {
+		t.Helper()
 		w := &limitedBuilder{limit: 1 << 20}
 		if err := writeJSONEscaped(w, s); err != nil {
 			t.Fatal(err)
 		}
+		return `"` + w.b.String() + `"`
+	}
+	stdlib := func(s string) string {
 		var buf bytes.Buffer
 		enc := json.NewEncoder(&buf)
 		enc.SetEscapeHTML(false)
 		_ = enc.Encode(s)
-		want := strings.TrimSuffix(buf.String(), "\n")
-		if got := `"` + w.b.String() + `"`; got != want {
+		return strings.TrimSuffix(buf.String(), "\n")
+	}
+	decode := func(js string) (string, bool) {
+		var s string
+		err := json.Unmarshal([]byte(js), &s)
+		return s, err == nil && utf8.ValidString(js)
+	}
+	for _, s := range []string{"plain", `q"x\y`, "\n\r\t\b\f\x00\x1f\x7f", "\u00e9 \U0001F600", "\u2028\u2029", "a&b<c>", "</script>", ""} {
+		got, want := escape(s), stdlib(s)
+		if got != want {
 			t.Errorf("escape(%q) = %s, encoding/json gives %s", s, got, want)
+		}
+		if back, ok := decode(got); !ok || back != s {
+			t.Errorf("escape(%q) = %s decodes to %q, %v", s, got, back, ok)
+		}
+	}
+	for s, want := range map[string]string{
+		"bad\xffbyte":    `"bad\ufffdbyte"`,
+		"cut\xc3":        `"cut\ufffd"`,
+		"a\xed\xa0\x80b": `"a\ufffd\ufffd\ufffdb"`, // an encoded surrogate
+	} {
+		got := escape(s)
+		if got != want {
+			t.Errorf("escape(%q) = %s, want %s", s, got, want)
+		}
+		back, ok := decode(got)
+		std, stdOK := decode(stdlib(s))
+		if !ok || !stdOK || back != std {
+			t.Errorf("escape(%q) decodes to %q, encoding/json's output to %q", s, back, std)
 		}
 	}
 }
