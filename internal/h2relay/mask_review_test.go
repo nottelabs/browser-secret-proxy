@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"strconv"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
 
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope/scopetest"
@@ -75,83 +75,46 @@ func TestCancelledWaitingResponseReturnsCredit(t *testing.T) {
 	}
 }
 
-// An accepted extended CONNECT (a WebSocket) carries frames, not a body: they
-// pass through untouched even with a value on record in them. Any 2xx
-// accepts it, 204 included, which elsewhere has no content.
-func TestExtendedConnectTunnelIsNotMasked(t *testing.T) {
-	for _, code := range []string{"200", "204"} {
-		t.Run(code, func(t *testing.T) {
-			h := newHarness(t, masking(t, false))
-			c := newClientView(h)
-			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
-				Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
-			id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
-			h.serverSend(status(h, id, false, field(":status", code)))
-			if head := c.readHead(1); head[":status"] != code {
-				t.Fatalf("head %v", head)
-			}
-			frame := "\x81\x19" + realToken // a WebSocket text frame holding the value
-			h.serverSend(data(id, frame, false))
-			f := h.expect(h.toClient, "client", isType(FrameData))
-			if string(f.Payload) != frame {
-				t.Fatalf("client got %q, want the frame untouched", f.Payload)
-			}
-		})
-	}
-}
-
-// Nothing in an RFC 8441 response shows that a WebSocket endpoint answered
-// (there is no Sec-WebSocket-Accept), so a 2xx from any handler accepts an
-// extended CONNECT for a WebSocket. On a destination that supports extended
-// CONNECT, a catch-all handler that answers every method with what the
-// request carried returns the swapped value unmasked. This pins that known
-// gap, which the README states under the security model: a change that
-// closes it changes this test.
-func TestExtendedConnectToACatchAllHandlerIsNotMasked(t *testing.T) {
+// An extended CONNECT for a WebSocket (RFC 8441) is answered 502 and never
+// sent, with masking on too. Before, the relay swapped its stand-ins and
+// took any 2xx to it for an open WebSocket, whose DATA passed through
+// unmasked: nothing in an RFC 8441 response (it has no Sec-WebSocket-Accept)
+// shows that a WebSocket endpoint answered, so on a destination that
+// supports extended CONNECT a catch-all handler that echoes what the request
+// carried returned the real value to the client.
+func TestWebSocketExtendedConnectIsRefused(t *testing.T) {
 	h := newHarness(t, masking(t, false))
-	c := newClientView(h)
 	fields := request("CONNECT", field(":protocol", "websocket"))
 	fields[3].Value = "/?q=" + tokenSIn
 	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(fields...)})
-	f := h.expect(h.toServer, "server", isType(FrameHeaders))
-	_, fragment, err := HeadersPayload(f.Flags, f.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sent, err := hpack.NewDecoder(4096, nil).DecodeFull(fragment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := ""
-	for _, sf := range sent {
-		if sf.Name == ":path" {
-			path = sf.Value
+	h.expect(h.toClient, "client", isBadGateway(1))
+	h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+}
+
+// No CONNECT reaches the server, but if one did, a 2xx to it would be an
+// ordinary response, its body masked, and a 204 to it bodiless: the relay
+// never treats a response as a tunnel whose DATA passes through unmasked.
+func TestConnectResponseIsNotATunnel(t *testing.T) {
+	m := mask.New([]mask.Pair{{Real: realToken, StandIn: tokenSIn}})
+	for status, want := range map[string]respPlan{
+		"200": {body: true},
+		"204": {bodiless: true},
+	} {
+		_, plan, err := maskResponseHead([]hpack.HeaderField{field(":status", status)}, status, "CONNECT", false, m)
+		if err != nil || plan.body != want.body || plan.bodiless != want.bodiless {
+			t.Fatalf("%s to CONNECT: plan %+v, error %v; want body %v, bodiless %v", status, plan, err, want.body, want.bodiless)
 		}
-	}
-	if path != "/?q="+realToken {
-		t.Fatalf("server got :path %q, want the value swapped in", path)
-	}
-	echo := "method CONNECT q " + realToken
-	h.serverSend(status(h, f.Stream, false, field(":status", "200"),
-		field("content-type", "text/plain; charset=utf-8"), field("content-length", strconv.Itoa(len(echo)))))
-	if head := c.readHead(1); head[":status"] != "200" {
-		t.Fatalf("head %v", head)
-	}
-	h.serverSend(data(f.Stream, echo, true))
-	if got := h.expect(h.toClient, "client", isType(FrameData)); string(got.Payload) != echo {
-		t.Fatalf("client got %q, want the echo untouched", got.Payload)
 	}
 }
 
 // Content on a bodiless response is reset even when it ends the server's
-// stream while the request is still open (an extended CONNECT answered
-// 304): the client stops sending once reset, so the request ends too, the
+// stream while the request is still open (a streamed upload answered 304):
+// the client stops sending once reset, so the request ends too, the
 // server's stream is reset, and the stream gives back its slot.
 func TestBodilessResetEndsARequestStillOpen(t *testing.T) {
-	h := newHarness(t, masking(t, true))
+	h := newHarness(t, func(o *Options) { masking(t, true)(o); streaming(o) })
 	c := newClientView(h)
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
-		Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)})
 	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
 	h.serverSend(status(h, id, false, field(":status", "304")), data(id, "card "+realCard, true))
 	if resp := c.read(1, true); !resp.resetSeen || bytes.Contains(resp.body, []byte(realCard)) {
@@ -255,37 +218,6 @@ func TestShrinkingResponseCreditsTheServerOnce(t *testing.T) {
 	}
 }
 
-// A refused extended CONNECT (a WebSocket handshake answered 403) has an
-// ordinary body: an echoed value in it is masked.
-func TestRefusedConnectBodyIsMasked(t *testing.T) {
-	h := newHarness(t, masking(t, false))
-	c := newClientView(h)
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
-		Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
-	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
-	h.serverSend(status(h, id, false, field(":status", "403"), field("content-type", "text/plain")), data(id, "denied for "+realToken, true))
-	resp := c.read(1, true)
-	if string(resp.body) != "denied for "+tokenSIn {
-		t.Fatalf("client got %q", resp.body)
-	}
-}
-
-// A refused extended CONNECT's compressed body is decoded and masked like any
-// other body, and its content-encoding dropped only because it was decoded.
-func TestRefusedConnectCompressedBodyIsDecodedAndMasked(t *testing.T) {
-	h := newHarness(t, masking(t, false))
-	c := newClientView(h)
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
-		Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
-	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
-	body := compressed(t, "gzip", []byte("denied for "+realToken))
-	h.serverSend(status(h, id, false, field(":status", "403"), field("content-encoding", "gzip")), data(id, string(body), true))
-	resp := c.read(1, true)
-	if string(resp.body) != "denied for "+tokenSIn || resp.head["content-encoding"] != "" {
-		t.Fatalf("client got %v %q", resp.head, resp.body)
-	}
-}
-
 // transfer-encoding is malformed in HTTP/2 and a coding the masker would not
 // see: a response carrying it is refused.
 func TestTransferEncodingFieldIsRefused(t *testing.T) {
@@ -316,14 +248,15 @@ func (h *harness) respReleased(stream uint32) {
 }
 
 // openMaskedResponse opens a masked response on stream 1 whose output waits
-// for a client that granted no window, and returns its server stream ID.
+// for a client that granted no window, and returns its server stream ID. A
+// POST stays open.
 func openMaskedResponse(t *testing.T, h *harness, method string, extra ...hpack.HeaderField) uint32 {
 	t.Helper()
 	h.clientSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 0}))
 	h.expect(h.toServer, "server", isType(FrameSettings))
 	flags := FlagEndHeaders | FlagEndStream
-	if method == "CONNECT" {
-		flags = FlagEndHeaders
+	if method == "POST" {
+		flags = FlagEndHeaders // an upload still open
 	}
 	h.clientSend(Frame{Type: FrameHeaders, Flags: flags, Stream: 1, Payload: h.clientBlock(request(method, extra...)...)})
 	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
@@ -383,8 +316,8 @@ func TestGoAwayReleasesARefusedStreamsResponse(t *testing.T) {
 // A stream reset by the relay (abort: a streamed upload over the buffer
 // limit) releases its waiting response.
 func TestAbortReleasesItsResponse(t *testing.T) {
-	h := newHarness(t, func(o *Options) { masking(t, false)(o); o.MaxBuffered = 1000 })
-	id := openMaskedResponse(t, h, "CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})
+	h := newHarness(t, func(o *Options) { masking(t, false)(o); streaming(o); o.MaxBuffered = 1000 })
+	id := openMaskedResponse(t, h, "POST")
 	h.clientSend(Frame{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("u"), 2000)})
 	h.expect(h.toClient, "client", func(f Frame) bool { return f.Type == FrameRSTStream && f.Stream == 1 })
 	h.respReleased(1)

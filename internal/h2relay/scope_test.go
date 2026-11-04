@@ -66,8 +66,8 @@ func TestOutOfScopeRequestsAreAnswered502(t *testing.T) {
 	h.expect(h.toServer, "server", isType(FrameHeaders))
 }
 
-// An extended CONNECT is not buffered: its refusal also tells the client to
-// stop sending.
+// A request refused before its body arrives, here an extended CONNECT
+// refused as a tunnel, also tells the client to stop sending.
 func TestRefusedStreamingRequestIsReset(t *testing.T) {
 	h := newHarness(t, scoped(t))
 	fields := request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"}, hpack.HeaderField{Name: "authorization", Value: "tok_old"})
@@ -160,12 +160,15 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 	}
 }
 
-// A CONNECT other than an extended CONNECT for a WebSocket (RFC 8441) is
-// answered 502 before any swap and never sent: the server's 2xx to it, an
-// ordinary page from a catch-all handler as much as a real tunnel, would
-// reach the client unmasked. So is a :protocol on another method, which a
-// server could still take for a tunnel, and a second :method, which a
-// server could read instead of the one the relay saw.
+// Every CONNECT, an extended CONNECT for a WebSocket (RFC 8441) included, is
+// answered 502 before any swap and never sent: nothing in the server's 2xx
+// to it shows whether a tunnel or a catch-all handler answered, and either
+// would reach the client unmasked with the values swapped into the request.
+// So is a :protocol on another method, which a server could still take for
+// a tunnel, and a second :method, which a server could read instead of the
+// one the relay saw. The relay never tells the client that the server
+// supports extended CONNECT (TestServerSettingsNeverEnableExtendedConnect),
+// so a browser sends none: it opens its WebSockets over HTTP/1.1.
 func TestTunnelRequestsAreAnswered502(t *testing.T) {
 	protocol := func(value string) hpack.HeaderField { return hpack.HeaderField{Name: ":protocol", Value: value} }
 	token := hpack.HeaderField{Name: "x-token", Value: "tok_standin"}
@@ -174,6 +177,8 @@ func TestTunnelRequestsAreAnswered502(t *testing.T) {
 			{Name: ":method", Value: "CONNECT"}, {Name: ":authority", Value: "allowed.test"}, token,
 		},
 		"plain CONNECT with a path":        request("CONNECT", token),
+		"extended CONNECT for websocket":   request("CONNECT", protocol("websocket"), token),
+		"extended CONNECT for WebSocket":   request("CONNECT", protocol("WebSocket"), token),
 		"extended CONNECT for connect-udp": request("CONNECT", protocol("connect-udp"), token),
 		"two :protocol fields":             request("CONNECT", protocol("websocket"), protocol("connect-ip")),
 		"lower-case connect":               request("connect", protocol("websocket")),
@@ -187,29 +192,6 @@ func TestTunnelRequestsAreAnswered502(t *testing.T) {
 			h.expect(h.toClient, "client", isBadGateway(1))
 			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
 		})
-	}
-}
-
-// An extended CONNECT for a WebSocket goes through, its fields swapped,
-// whatever the case of its :protocol.
-func TestWebSocketConnectIsSwapped(t *testing.T) {
-	h := newHarness(t, nil)
-	fields := request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "WebSocket"})
-	fields[3].Value = "/socket?k=tok_standin"
-	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(fields...)})
-	f := h.expect(h.toServer, "server", isType(FrameHeaders))
-	_, fragment, err := HeadersPayload(f.Flags, f.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := hpack.NewDecoder(4096, nil).DecodeFull(fragment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, field := range got {
-		if field.Name == ":path" && field.Value != "/socket?k=real_value" {
-			t.Fatalf(":path %q", field.Value)
-		}
 	}
 }
 

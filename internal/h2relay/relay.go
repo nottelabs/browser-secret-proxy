@@ -4,7 +4,8 @@
 // and PING frames in the order the client sent them, the same pseudo-header
 // and header order, and the same priority on each request.
 //
-// The response direction is forwarded byte for byte, flow control included.
+// The response direction is forwarded byte for byte, flow control included,
+// but for two of the server's settings (see clientSettings).
 // In the request direction the relay decodes each header block, swaps
 // stand-ins on allowlisted authorities and encodes it again for the upstream.
 // A request whose stand-ins cannot be swapped (see package scope) is answered
@@ -904,7 +905,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		// (finish), with a single lookup for its headers, body and trailers.
 		// Any other request on an allowlisted authority is prepared here;
 		// one that needs a lookup waits for it off this loop (lookup.go).
-		buffered := !endStream && s.swap && method != "CONNECT"
+		buffered := !endStream && s.swap
 		var lookup *scope.Lookup
 		if s.swap && !buffered {
 			if lookup, err = r.opts.Session.Prepare(fieldText(fields)...); err != nil {
@@ -954,10 +955,10 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		return nil
 	}
 
-	// Trailers. A buffered request's are swapped with its body in finish;
-	// a streamed request (extended CONNECT) on an allowlisted authority gets
-	// a lookup of its own. A header block after the client ended the stream
-	// is a stream error.
+	// Trailers. A buffered request's are swapped with its body in finish.
+	// Every request with a body on an allowlisted authority is buffered,
+	// but a streamed one there would get a lookup of its own. A header block
+	// after the client ended the stream is a stream error.
 	r.mu.Lock()
 	buffering, ended := s.buffering, s.clientEnded
 	r.mu.Unlock()
@@ -1017,16 +1018,17 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // one checked. Session.CheckAuthority refuses a host that disagrees with
 // :authority.
 //
-// It also refuses every CONNECT but an extended CONNECT for a WebSocket
-// (RFC 8441), a :protocol on any other request, and more than one :method,
-// of which a server may use another than the relay: the response to an
-// accepted CONNECT is a tunnel that passes through unmasked, and a plain
-// CONNECT is accepted by any catch-all handler that answers 200. So is an
-// extended CONNECT on a destination that supports it (see
-// maskResponseHead), which is why only a WebSocket gets one.
+// It also refuses every CONNECT, an extended CONNECT (RFC 8441) for a
+// WebSocket included, any request with a :protocol, and more than one
+// :method, of which a server may use another than the relay. A CONNECT asks
+// for a tunnel, which masking cannot follow, and nothing in a 2xx to it
+// shows whether a tunnel or a catch-all handler answered: either way the
+// values swapped into the request would come back unmasked. The client
+// never learns that the server supports extended CONNECT (clientSettings),
+// so a browser opens its WebSockets over HTTP/1.1, where only a 101 opens
+// one.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
-	methodFields, authorityFields, hostFields, uppercase := 0, 0, 0, ""
-	var protocols []string
+	methodFields, authorityFields, hostFields, protocolFields, uppercase := 0, 0, 0, 0, ""
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
@@ -1042,10 +1044,9 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 			authorities = append(authorities, f.Value)
 			hostFields++
 		case ":protocol":
-			protocols = append(protocols, f.Value)
+			protocolFields++
 		}
 	}
-	webSocket := method == "CONNECT" && len(protocols) == 1 && strings.EqualFold(protocols[0], "websocket")
 	switch {
 	case uppercase != "":
 		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
@@ -1053,8 +1054,8 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
 	case methodFields > 1:
 		err = fmt.Errorf("%w: more than one :method field", scope.ErrRefused)
-	case (strings.EqualFold(method, "CONNECT") || len(protocols) > 0) && !webSocket:
-		err = fmt.Errorf("%w: a tunnel other than an extended CONNECT for a WebSocket", scope.ErrRefused)
+	case strings.EqualFold(method, "CONNECT") || protocolFields > 0:
+		err = fmt.Errorf("%w: a CONNECT or :protocol, which would open a tunnel", scope.ErrRefused)
 	}
 	return method, authorities, err
 }
@@ -1890,16 +1891,28 @@ func (r *relay) applyClientAck() error {
 }
 
 // clientSettings is the server's SETTINGS payload as the client receives it:
-// unchanged except that SETTINGS_HEADER_TABLE_SIZE is lowered to what the
-// relay's request decoder accepts. That value only bounds the client's own
-// HPACK encoder, whose output the relay decodes and encodes again, so the
-// server sees no difference.
+// unchanged except for two settings. SETTINGS_HEADER_TABLE_SIZE is lowered
+// to what the relay's request decoder accepts. That value only bounds the
+// client's own HPACK encoder, whose output the relay decodes and encodes
+// again, so the server sees no difference. SETTINGS_ENABLE_CONNECT_PROTOCOL
+// is dropped: the relay refuses every CONNECT (requestHead), and a client
+// may only send an extended CONNECT after it got that setting with value 1
+// (RFC 8441 section 3), so a browser opens its WebSockets over HTTP/1.1
+// instead of sending one to be refused.
 func clientSettings(payload []byte) []byte {
-	out := append([]byte{}, payload...)
-	for i := 0; i+6 <= len(out); i += 6 {
-		if binary.BigEndian.Uint16(out[i:]) == SettingHeaderTableSize && binary.BigEndian.Uint32(out[i+2:]) > decoderTableSize {
-			binary.BigEndian.PutUint32(out[i+2:], decoderTableSize)
+	out := make([]byte, 0, len(payload))
+	for i := 0; i+6 <= len(payload); i += 6 {
+		setting := payload[i : i+6]
+		switch binary.BigEndian.Uint16(setting) {
+		case SettingEnableConnectProtocol:
+			continue
+		case SettingHeaderTableSize:
+			if binary.BigEndian.Uint32(setting[2:]) > decoderTableSize {
+				out = binary.BigEndian.AppendUint32(append(out, setting[:2]...), decoderTableSize)
+				continue
+			}
 		}
+		out = append(out, setting...)
 	}
 	return out
 }
