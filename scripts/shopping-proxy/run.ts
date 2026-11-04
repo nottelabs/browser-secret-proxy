@@ -41,7 +41,9 @@ async function extendToCard() {
   }
   // The observed Birkenstock payment UI uses a Cards accordion, not a radio.
   // This exact row was visible in run41867915431; never click an order control.
-  const cardRow=page.getByText(/^Cards$/).filter({visible:true}).first();
+  const cardRow=siteKey==='birkenstock-us'
+    ? page.locator('#payment-button-scheme')
+    : page.getByText(/^Cards$/).filter({visible:true}).first();
   if(siteKey==='birkenstock-us'){
     emit('waitingForCardsAccordion',{timeoutMs:45000});
     await cardRow.waitFor({state:'visible',timeout:45000});
