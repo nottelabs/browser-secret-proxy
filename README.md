@@ -711,6 +711,11 @@ How a masked response changes:
   `CONNECT`), whose frames pass through untouched, and responses on hosts
   that are not allowlisted (they are never decrypted).
 
+Over HTTP/2, what the destination sends outside header blocks and DATA
+reaches the browser only as numbers (settings, window sizes, error codes),
+with masking on or off: the proxy drops GOAWAY debug data and frames of
+extension or unknown types, and answers the destination's PINGs itself.
+
 Allowlist only the endpoints that need the values, and check what they
 return.
 
@@ -741,11 +746,16 @@ return.
   destination. A `PRIORITY_UPDATE` value over 1 KiB ends it with
   `PROTOCOL_ERROR`.
 - When the destination sends GOAWAY, requests it will not process are refused
-  with `REFUSED_STREAM`.
+  with `REFUSED_STREAM`. The browser gets the GOAWAY without its debug data.
 - Server push is not supported.
 - HTTP/2 frames of a type the proxy does not know go to the destination on
   the stream they belong to there, or are dropped when that stream is not
-  open upstream (its request still buffered, or ended).
+  open upstream (its request still buffered, or ended). From the destination
+  they are dropped, and so are `ALTSVC`, `ORIGIN` and `PRIORITY_UPDATE`
+  frames: the destination cannot point the browser at other origins or
+  services through the proxy's connection.
+- The proxy answers the destination's HTTP/2 PINGs itself. The browser's
+  PINGs go to the destination, and only its ACKs of them come back.
 - Response masking has limits of its own: see
   [What masking misses](#what-masking-misses).
 - The CA, the `http` mode's client certificate and the `sealed` key are

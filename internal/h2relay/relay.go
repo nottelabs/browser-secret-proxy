@@ -4,7 +4,10 @@
 // and PING frames in the order the client sent them, the same pseudo-header
 // and header order, and the same priority on each request.
 //
-// The response direction is forwarded byte for byte, flow control included.
+// The response direction is forwarded byte for byte, flow control included,
+// except for connection control (see control.go): the relay answers the
+// server's PINGs, drops GOAWAY debug data, and drops frames of extension or
+// unknown types.
 // In the request direction the relay decodes each header block, swaps
 // stand-ins on allowlisted authorities and encodes it again for the upstream.
 // A request whose stand-ins cannot be swapped (see package scope) is answered
@@ -146,6 +149,13 @@ type relay struct {
 	enc         *hpack.Encoder
 	encBuf      bytes.Buffer
 	dec         *hpack.Decoder // used by the client reader only
+	// PING (control.go). Guarded by serverMu: clientStarted is set once the
+	// client's first SETTINGS went upstream, and pingAcks holds the relay's
+	// answers to server PINGs until then. pings is the data of the client's
+	// PINGs the server has not acknowledged, oldest first (guarded by mu).
+	clientStarted bool
+	pingAcks      []Frame
+	pings         [][8]byte
 
 	mu           sync.Mutex
 	cond         *sync.Cond
@@ -588,9 +598,9 @@ func (r *relay) clientLoop() error {
 			err = r.onPriorityUpdate(f)
 		case FramePushPromise:
 			return errors.New("client sent PUSH_PROMISE")
-		case FrameSettings, FramePing, FrameGoAway:
-			// SETTINGS (and their ACKs), PING and GOAWAY go upstream exactly
-			// as the client sent them.
+		case FrameSettings, FrameGoAway:
+			// SETTINGS (and their ACKs) and GOAWAY go upstream exactly as
+			// the client sent them.
 			if f.Type == FrameSettings && f.Flags&FlagAck != 0 {
 				r.clientFrames.ack()
 				if err := r.applyClientAck(); err != nil {
@@ -605,7 +615,14 @@ func (r *relay) clientLoop() error {
 				}
 				r.serverFrames.sent(f.Payload)
 			}
-			err = r.writeServer(f)
+			if f.Type == FrameSettings {
+				err = r.forwardClientSettings(f)
+			} else {
+				err = r.writeServer(f)
+			}
+		case FramePing:
+			// PINGs go upstream as the client sent them; its ACKs do not.
+			err = r.onClientPing(f)
 		default:
 			err = r.onUnknown(f)
 		}
@@ -1730,8 +1747,10 @@ func (r *relay) serverLoop() error {
 			return errors.New("server sent PUSH_PROMISE, which this proxy does not support")
 		case FrameGoAway:
 			err = r.onServerGoAway(f)
+		case FramePing:
+			err = r.onServerPing(f)
 		default:
-			err = r.writeClient(f)
+			// An extension or unknown frame type (control.go): dropped.
 		}
 		if err != nil {
 			return err
@@ -1811,10 +1830,12 @@ func (r *relay) serverEnded(s *stream, reset bool) {
 	r.forgetIfDoneLocked(s)
 }
 
-// onServerGoAway passes the server's GOAWAY on. Requests the server will not
-// process (still buffering here, or above its last stream ID) are refused
-// with REFUSED_STREAM so the client can retry them elsewhere, and the
-// relay sends no new request upstream afterwards.
+// onServerGoAway passes the server's GOAWAY on, with its last stream ID
+// translated and without its debug data, which only describes the server's
+// side and can echo a real value. Requests the server will not process
+// (still buffering here, or above its last stream ID) are refused with
+// REFUSED_STREAM so the client can retry them elsewhere, and the relay
+// sends no new request upstream afterwards.
 func (r *relay) onServerGoAway(f Frame) error {
 	if len(f.Payload) < 8 {
 		return errors.New("server sent a bad GOAWAY")
@@ -1839,7 +1860,7 @@ func (r *relay) onServerGoAway(f Frame) error {
 	if len(refused) > 0 {
 		r.opts.Logger.Warn("server is going away, refusing requests it will not process", "streams", len(refused))
 	}
-	f.Payload = append(binary.BigEndian.AppendUint32(nil, translated), f.Payload[4:]...)
+	f.Payload = append(binary.BigEndian.AppendUint32(nil, translated), f.Payload[4:8]...)
 	return r.writeClient(append(refused, f)...)
 }
 
