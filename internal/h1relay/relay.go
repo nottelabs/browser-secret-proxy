@@ -221,6 +221,11 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 				expectContinue = strings.EqualFold(h.value, "100-continue")
 			}
 		}
+		// Every request goes to the CONNECT host: one naming another host is
+		// refused, so no value scoped to that host goes with it.
+		if err := opts.Session.CheckAuthority(host); err != nil {
+			return refuse(client, progress, sent, host, opts, err)
+		}
 		doSwap := opts.Hosts.Match(host)
 		hasBody := chunked || contentLength > 0
 		if hasBody && !chunked && contentLength > opts.MaxBody {
@@ -264,7 +269,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		}
 		var swapper *swap.Swapper
 		if doSwap {
-			swapper, err = opts.Session.Swapper(ctx, host, swappableText(parts[1], headers, body)...)
+			swapper, err = opts.Session.Swapper(ctx, swappableText(parts[1], headers, body)...)
 			if err != nil {
 				return refuse(client, progress, sent, host, opts, err)
 			}

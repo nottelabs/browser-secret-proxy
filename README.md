@@ -197,15 +197,29 @@ host.
   tunneled without decryption, so no swap can happen there.
 - **Each value only goes where it is allowed.** A value can carry its own
   host list (the same syntax as `-hosts`); without one, the `-hosts`
-  allowlist applies. A value is never swapped into a request for any other
-  host.
+  allowlist applies. It is checked against the host of the `CONNECT`, which
+  is where the request really goes, never against the request's own `Host`
+  or `:authority`: a request naming another host than its `CONNECT` is
+  answered `502`, with or without stand-ins.
 - **Expired values are not used.** A value whose expiry has passed is not
   swapped.
 - **Fail closed.** When a request carries a stand-in that the resolver does
   not answer for, whose value may not go to the request's host or has
-  expired, or when the resolver fails, nothing of the request is sent: the
-  client gets `502` (on HTTP/1.1 the connection is then closed). The client
-  never sees the real value or the resolver's error, only the reason.
+  expired, or when the resolver fails or times out, nothing of the request
+  is sent: the client gets `502` (on HTTP/1.1 the connection is then
+  closed). Once a resolver reports that the principal's credential is no
+  longer valid (an expired token), every request on its connections gets
+  `502`, with or without stand-ins. Neither the client nor the log sees the
+  real value or the resolver's error text; the log names only its kind
+  (timeout, refused credential, error).
+- **One version per request.** A resolver whose values change (a reloaded
+  file) gives each request one version, for finding its stand-ins and for
+  looking them up.
+- **Stand-ins are found where they are swapped.** Patterns also search the
+  query-, path- and JSON-unescaped forms of the request text, the forms a
+  swap replaces. Only the stand-ins a swap would actually replace are
+  looked up and checked: where one stand-in contains another, the longer
+  one wins, as in the swap.
 - **Values are isolated by principal.** The principal is the proxy
   credential of the `CONNECT` (`SECRET_PROXY_USERNAME` or the resolver's own
   credential check). Every request is looked up again for its connection's
