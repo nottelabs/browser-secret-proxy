@@ -966,7 +966,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 	}
 	// Malformed trailers end the request: a buffered one is answered 502, a
 	// streamed one, already upstream, is reset.
-	if name := malformedValue(fields); name != "" {
+	if name, bad := malformedValue(fields); bad {
 		cause := fmt.Errorf("%w: trailer %q has a malformed value", scope.ErrRefused, name)
 		if buffering {
 			r.mu.Lock()
@@ -1032,7 +1032,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // :authority.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
 	authorityFields, hostFields, uppercase := 0, 0, ""
-	malformed := malformedValue(fields)
+	malformed, hasMalformed := malformedValue(fields)
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
@@ -1053,7 +1053,7 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
 	case authorityFields > 1 || hostFields > 1:
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
-	case malformed != "":
+	case hasMalformed:
 		err = fmt.Errorf("%w: field %q has a malformed value", scope.ErrRefused, malformed)
 	}
 	return method, authorities, err
@@ -1062,16 +1062,17 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 // malformedValue returns the name of the first field whose value RFC 9113
 // 8.2.1 forbids: one holding a NUL, CR or LF, which a server or a later
 // HTTP/1.1 hop could split the field on, or starting or ending with a space
-// or tab. It returns "" when every value is well formed.
-func malformedValue(fields []hpack.HeaderField) string {
+// or tab. It reports false when every value is well formed; the name may be
+// empty, so callers go by the boolean.
+func malformedValue(fields []hpack.HeaderField) (name string, malformed bool) {
 	for _, f := range fields {
 		v := f.Value
 		if strings.ContainsAny(v, "\x00\r\n") ||
 			v != "" && (v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
-			return f.Name
+			return f.Name, true
 		}
 	}
-	return ""
+	return "", false
 }
 
 // fieldText is the text of a header list that stand-ins are swapped in: the
