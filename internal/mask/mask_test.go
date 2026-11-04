@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -87,9 +88,15 @@ func TestLongestFormWins(t *testing.T) {
 }
 
 // Whatever the write boundaries, a stream is masked exactly as a whole
-// buffer is, and what is held back stays below the longest form.
+// buffer is, and what is held back stays below the longest form, with
+// either window.
 func TestWriterSplitsAnywhere(t *testing.T) {
-	m := testMasker(t)
+	for _, window := range []Window{Fixed, Minimal} {
+		t.Run(window.String(), func(t *testing.T) { testWriterSplitsAnywhere(t, testMasker(t).WithWindow(window)) })
+	}
+}
+
+func testWriterSplitsAnywhere(t *testing.T, m *Masker) {
 	text := "a " + card + " b 4111 1111 1111 1111 c " + `"sk_live_a\u0026b\u003cc\u003e\"d"` + " d sk_live_a&b<c>\"d" + card
 	want := m.String(Text, text)
 	for split := 0; split <= len(text); split++ {
@@ -124,10 +131,39 @@ func TestWriterSplitsAnywhere(t *testing.T) {
 	}
 }
 
-// Text that cannot begin a real value is passed on at once, so a stream of
-// events is not delayed.
-func TestWriterHoldsBackOnlyPossibleBeginnings(t *testing.T) {
+// A Writer holds back the same number of bytes whatever they are, so text
+// that cannot begin a real value waits as long as text that could.
+func TestWriterHoldsBackAFixedWindow(t *testing.T) {
 	m := testMasker(t)
+	window := m.MaxLength() - 1
+	var out bytes.Buffer
+	w := m.NewWriter(&out, Text)
+	_, _ = w.Write([]byte("data: {\"x\":1}\n\n"))
+	if out.Len() != 0 || w.Pending() != 15 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	text := strings.Repeat("event ", 100)
+	for _, part := range []string{text, "id 41111", "2"} {
+		before := out.Len()
+		_, _ = w.Write([]byte(part))
+		if w.Pending() != window {
+			t.Fatalf("after %q: held %d, want %d", part, w.Pending(), window)
+		}
+		if before > 0 && out.Len()-before != len(part) {
+			t.Fatalf("after %q: passed on %d bytes, want %d", part, out.Len()-before, len(part))
+		}
+	}
+	_ = w.Close()
+	if want := "data: {\"x\":1}\n\n" + text + "id 411112"; out.String() != want {
+		t.Fatalf("got %q, want %q", out.String(), want)
+	}
+}
+
+// The Minimal window holds back only bytes that could begin a real value,
+// as the masker did before the fixed window: text that cannot is passed on
+// at once, so a stream of events is not delayed.
+func TestMinimalWindowHoldsBackOnlyPossibleBeginnings(t *testing.T) {
+	m := testMasker(t).WithWindow(Minimal)
 	var out bytes.Buffer
 	w := m.NewWriter(&out, Text)
 	_, _ = w.Write([]byte("data: {\"x\":1}\n\n"))
@@ -141,6 +177,107 @@ func TestWriterHoldsBackOnlyPossibleBeginnings(t *testing.T) {
 	_, _ = w.Write([]byte("2"))
 	if w.Pending() != 0 || !strings.HasSuffix(out.String(), "id 411112") {
 		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	// A value split across writes is still masked.
+	out.Reset()
+	for _, part := range []string{"card 4111", " 1111 11", "11 1111!"} {
+		_, _ = w.Write([]byte(part))
+	}
+	if out.String() != "card 4242 4242 4242 4242!" || w.Pending() != 0 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	_, _ = w.Write([]byte("t=sk_live_a&b<c"))
+	if out.String() != "card 4242 4242 4242 4242!t=" || w.Pending() != 13 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	_, _ = w.Write([]byte(">\"d."))
+	if out.String() != "card 4242 4242 4242 4242!t="+tokenSIn+"." || w.Pending() != 0 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+}
+
+// What the Minimal window passes on depends on whether the end of the text
+// could begin a real value: the oracle the Fixed window closes (critic-1)
+// is open with it, which is why it is not the default.
+func TestMinimalWindowRevealsPrefixes(t *testing.T) {
+	m := testMasker(t).WithWindow(Minimal)
+	written := func(parts ...string) sizes {
+		var s sizes
+		w := m.NewWriter(&s, Text)
+		for _, p := range parts {
+			_, _ = w.Write([]byte(p))
+		}
+		_ = w.Close()
+		return s
+	}
+	hit, other := written("results for 41111", " end"), written("results for ~~~~~", " end")
+	if slices.Equal(hit, other) {
+		t.Fatalf("pieces %v for both", hit)
+	}
+}
+
+func TestWindowText(t *testing.T) {
+	for _, window := range []Window{Fixed, Minimal} {
+		text, err := window.MarshalText()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Window
+		if err := got.UnmarshalText(text); err != nil || got != window {
+			t.Fatalf("%q: got %v, %v", text, got, err)
+		}
+	}
+	if Window(0) != Fixed {
+		t.Fatal("the zero Window is not Fixed")
+	}
+	for _, bad := range []string{"", "Fixed", "min", "none"} {
+		w := Minimal
+		if err := w.UnmarshalText([]byte(bad)); err == nil || w != Minimal {
+			t.Fatalf("%q: got %v, %v", bad, w, err)
+		}
+	}
+}
+
+// sizes records the size of each Write.
+type sizes []int
+
+func (s *sizes) Write(p []byte) (int, error) {
+	*s = append(*s, len(p))
+	return len(p), nil
+}
+
+// The size of each piece a Writer passes on does not depend on whether the
+// text it holds back begins a real value: a client that has a destination
+// reflect its guesses cannot tell from the framing how much of a value a
+// guess matched (critic-1).
+func TestWriterOutputDoesNotRevealPrefixes(t *testing.T) {
+	m := testMasker(t)
+	written := func(parts ...string) sizes {
+		var s sizes
+		w := m.NewWriter(&s, Text)
+		for _, p := range parts {
+			_, _ = w.Write([]byte(p))
+		}
+		_ = w.Close()
+		return s
+	}
+	for _, short := range []bool{true, false} {
+		pad := strings.Repeat(".", 300)
+		if short {
+			pad = "results for "
+		}
+		for _, list := range m.byFirst {
+			for _, f := range list {
+				for n := 1; n < len(f.from); n++ {
+					guess := string(f.from[:n])
+					miss := strings.Repeat("~", n)
+					hit, other := written(pad+guess, " end"), written(pad+miss, " end")
+					if !slices.Equal(hit, other) {
+						t.Fatalf("pad %d, %q: pieces %v, %v for a text of the same length", len(pad), guess, hit, other)
+					}
+				}
+			}
+		}
 	}
 }
 

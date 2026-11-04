@@ -186,21 +186,25 @@ func TestUpstreamIDsFollowOpeningOrder(t *testing.T) {
 	getPath(h, 3, "/?k=tok_b")
 	g.waitStarted(t, "tok_b")
 	getPath(h, 5, "/plain")
-	g.release("b")
-	time.Sleep(20 * time.Millisecond)
-	g.release("a")
-	var paths []string
+	// Receiving the request bytes does not mean the client loop has opened
+	// /plain yet. Observe each upstream HEADERS before releasing the next
+	// lookup, so scheduler timing cannot change the opening order we test.
 	last := uint32(0)
-	for i := 0; i < 3; i++ {
+	for i, want := range []string{"/plain", "/?k=real_b", "/?k=real_a"} {
 		f := h.expect(h.toServer, "server", isType(FrameHeaders))
 		if f.Stream <= last {
 			t.Fatalf("upstream stream %d after %d", f.Stream, last)
 		}
 		last = f.Stream
-		paths = append(paths, serverPath(t, dec, f))
-	}
-	if strings.Join(paths, " ") != "/plain /?k=real_b /?k=real_a" {
-		t.Fatalf("server got %q", paths)
+		if got := serverPath(t, dec, f); got != want {
+			t.Fatalf("upstream request %d: got %q, want %q", i, got, want)
+		}
+		switch i {
+		case 0:
+			g.release("b")
+		case 1:
+			g.release("a")
+		}
 	}
 }
 

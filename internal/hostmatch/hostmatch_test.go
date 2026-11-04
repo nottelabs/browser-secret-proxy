@@ -91,3 +91,24 @@ func TestSameHost(t *testing.T) {
 		}
 	}
 }
+
+func TestHost(t *testing.T) {
+	cases := map[string]string{
+		"api.example.com":               "api.example.com",
+		"API.Example.COM.:443":          "api.example.com",
+		"api.example.com.":              "api.example.com",
+		"10.0.0.1:8443":                 "10.0.0.1",
+		"[2001:DB8::1]:443":             "2001:db8::1",
+		"::1":                           "::1",
+		"":                              "",
+		"api.example.com:":              "",
+		"api.example.com:443@evil.test": "",
+		"api.example.com/x":             "",
+		"api .example.com":              "",
+	}
+	for authority, want := range cases {
+		if got := Host(authority); got != want {
+			t.Errorf("Host(%q) = %q, want %q", authority, got, want)
+		}
+	}
+}

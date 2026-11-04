@@ -20,9 +20,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
@@ -40,7 +43,16 @@ type Options struct {
 	// masked (default mask.DefaultMaxDecoded). A response past it is cut
 	// off.
 	MaxDecoded int64
-	Logger     *slog.Logger
+	// HeadTimeout bounds the time from the first byte of a request head to
+	// its end (zero: no limit), so a client cannot hold the connection by
+	// dripping a head. Waiting between requests is not counted.
+	HeadTimeout time.Duration
+	// Records is the connection beneath the client's TLS, wrapped by
+	// WatchRecords. When set, HeadTimeout counts from the first byte of the
+	// record that carries a head rather than from the head's decryption, so
+	// a client cannot put the deadline off by dripping an encrypted record.
+	Records *RecordConn
+	Logger  *slog.Logger
 }
 
 const (
@@ -79,7 +91,7 @@ func Serve(client, server net.Conn, opts Options) error {
 		done <- responses(bufio.NewReader(server), toClient, queue, progress, opts)
 	}()
 	go func() {
-		done <- requests(ctx, bufio.NewReader(client), server, toClient, queue, responsesDone, progress, opts)
+		done <- requests(ctx, bufio.NewReader(client), headTimer{conn: client, records: opts.Records, timeout: opts.HeadTimeout}, server, toClient, queue, responsesDone, progress, opts)
 	}()
 	err := <-done
 	cancel()
@@ -149,8 +161,8 @@ func (p *progress) wait(n int) bool {
 type exchange struct {
 	unsolicited bool // a response no request asked for, such as a 408
 	method      string
-	// switching requests (Upgrade, CONNECT) learn here whether the server
-	// switched the connection to another protocol.
+	// switching requests (a WebSocket upgrade, the only one sent) learn here
+	// whether the server switched the connection to another protocol.
 	switching bool
 	upgrade   bool // the request carried Upgrade, so a 101 may answer it
 	switched  chan bool
@@ -177,14 +189,18 @@ type header struct {
 // being sent.
 var errRefused = errors.New("request refused")
 
-func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
+func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
 	sent := 0 // requests forwarded so far
 	for {
-		requestLine, err := readLine(br, maxHeadBytes)
-		if err != nil {
+		if err := head.start(br); err != nil {
 			return err
 		}
+		requestLine, err := readLine(br, maxHeadBytes)
+		if err != nil {
+			return head.wrap(err)
+		}
 		if requestLine == "" {
+			head.stop()
 			continue // tolerated empty line between requests
 		}
 		parts := strings.SplitN(requestLine, " ", 3)
@@ -199,7 +215,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 				if errors.Is(err, errLineTooLong) {
 					return errors.New("request head too large")
 				}
-				return err
+				return head.wrap(err)
 			}
 			if line == "" {
 				break
@@ -210,10 +226,11 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			name, value, _ := strings.Cut(line, ":")
 			headers = append(headers, header{raw: line, name: strings.ToLower(name), value: trimOWS(value)})
 		}
+		head.stop()
 
 		host, contentType := "", ""
 		hosts := 0
-		upgrade, expectContinue := false, false
+		upgrade, otherUpgrade, expectContinue := false, false, false
 		for _, h := range headers {
 			switch h.name {
 			case "host":
@@ -223,9 +240,21 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 				contentType = h.value
 			case "upgrade":
 				upgrade = true
+				otherUpgrade = otherUpgrade || !websocketOnly(h.value)
 			case "expect":
 				expectContinue = strings.EqualFold(h.value, "100-continue")
 			}
+		}
+		// A tunnel passes the server's answer and the rest of the connection
+		// through raw, neither swapped nor masked. Only a WebSocket needs
+		// one; a CONNECT (which any catch-all handler answers 200) or
+		// another upgrade (h2c, after which the server answers this very
+		// request) is refused before anything is swapped.
+		switch {
+		case strings.EqualFold(parts[0], "CONNECT"):
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: CONNECT inside an intercepted connection", scope.ErrRefused))
+		case otherUpgrade:
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: an upgrade to another protocol than WebSocket", scope.ErrRefused))
 		}
 		// The body is framed as the server will frame it, and the head is
 		// split into the lines the server will see, or the request is
@@ -243,7 +272,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: more than one Host header", scope.ErrRefused))
 		}
 		authorities := []string{host}
-		if authority, ok := targetAuthority(parts[0], parts[1]); ok {
+		if authority, ok := targetAuthority(parts[1]); ok {
 			authorities = append(authorities, authority)
 		}
 		if err := opts.Session.CheckAuthority(authorities...); err != nil {
@@ -272,8 +301,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		case chunked:
 			body, trailer, err = readChunked(br, opts.MaxBody)
 		case contentLength > 0:
-			body = make([]byte, contentLength)
-			_, err = io.ReadFull(br, body)
+			body, err = readBody(br, contentLength)
 		}
 		if err != nil {
 			return err
@@ -357,7 +385,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			opts.Logger.Info("swapped stand-ins in a request", "host", host, "parts", swapped)
 		}
 		ex := &exchange{method: strings.ToUpper(parts[0]), upgrade: upgrade}
-		if upgrade || ex.method == "CONNECT" {
+		if upgrade {
 			ex.switching, ex.switched = true, make(chan bool, 1)
 		}
 		// Queued before the request is sent, so its response finds it.
@@ -372,7 +400,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		}
 		if ex.switching {
 			// Wait for the server's answer: only a switch makes the rest
-			// of the connection a raw stream (a WebSocket, a tunnel). After
+			// of the connection a raw stream (a WebSocket). After
 			// a refusal the client sends HTTP requests again, which are
 			// swapped as usual.
 			select {
@@ -386,6 +414,171 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			}
 		}
 	}
+}
+
+// headTimer puts a read deadline on the client while a request head
+// arrives, from its first byte.
+type headTimer struct {
+	conn    net.Conn
+	records *RecordConn // nil: the head's first byte is its first plaintext byte
+	timeout time.Duration
+}
+
+// start waits for the first byte of the next head, then sets the deadline.
+// With records, the deadline is set as soon as the first byte of the record
+// carrying the head arrives, while the record is still being decrypted.
+func (h headTimer) start(br *bufio.Reader) error {
+	if h.timeout <= 0 {
+		return nil
+	}
+	if h.records != nil && br.Buffered() == 0 {
+		h.records.arm(h.timeout)
+	}
+	if _, err := br.Peek(1); err != nil {
+		return err
+	}
+	// The head was already buffered, or the deadline was set when its
+	// record arrived.
+	if h.records == nil || !h.records.fired() {
+		_ = h.conn.SetReadDeadline(time.Now().Add(h.timeout))
+	}
+	return nil
+}
+
+func (h headTimer) stop() {
+	if h.timeout > 0 {
+		if h.records != nil {
+			h.records.disarm()
+		}
+		_ = h.conn.SetReadDeadline(time.Time{})
+	}
+}
+
+// RecordConn is the connection a client's TLS records arrive on. Armed, its
+// next read that receives bytes sets its read deadline, which is how a
+// request head is timed from the first byte of its record.
+//
+// It follows the stream's record framing, so that whole records that give
+// the head no bytes, such as a KeyUpdate or an empty record, do not count:
+// when the TLS stack asks for more after them, the deadline is cleared and
+// set again by the next record. A record that is still arriving keeps it.
+type RecordConn struct {
+	net.Conn
+	mu      sync.Mutex
+	timeout time.Duration // nonzero while armed
+	set     bool          // the armed deadline was set
+
+	header  [5]byte // the current record's header, as far as it has come
+	headerN int
+	body    int // bytes of the current record's body still to come
+}
+
+// WatchRecords wraps conn for Options.Records; pass the result to
+// tls.Server. It must see the client's TLS stream from its first byte.
+func WatchRecords(conn net.Conn) *RecordConn { return &RecordConn{Conn: conn} }
+
+func (c *RecordConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.set && c.headerN == 0 && c.body == 0 {
+		// The TLS stack reads again having taken every whole record that
+		// came since the deadline was set, and the head has no bytes yet:
+		// the client is waiting between requests, which is not counted.
+		_ = c.SetReadDeadline(time.Time{})
+		c.set = false
+	}
+	c.mu.Unlock()
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		if c.timeout > 0 && !c.set {
+			_ = c.SetReadDeadline(time.Now().Add(c.timeout))
+			c.set = true
+		}
+		c.follow(p[:n])
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+// follow moves the record framing past b.
+func (c *RecordConn) follow(b []byte) {
+	for len(b) > 0 {
+		if c.body > 0 {
+			k := min(c.body, len(b))
+			c.body -= k
+			b = b[k:]
+			continue
+		}
+		k := copy(c.header[c.headerN:], b)
+		c.headerN += k
+		b = b[k:]
+		if c.headerN == len(c.header) {
+			c.body = int(c.header[3])<<8 | int(c.header[4])
+			c.headerN = 0
+		}
+	}
+}
+
+// arm sets the read deadline to timeout from the next bytes received.
+func (c *RecordConn) arm(timeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timeout, c.set = timeout, false
+}
+
+// fired reports whether the armed deadline was set, and disarms it.
+func (c *RecordConn) fired() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set := c.set
+	c.timeout, c.set = 0, false
+	return set
+}
+
+func (c *RecordConn) disarm() { _ = c.fired() }
+
+// wrap names a deadline error as a head that came too slowly.
+func (h headTimer) wrap(err error) error {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("request head not received within %s: %w", h.timeout, err)
+	}
+	return err
+}
+
+// readBody reads an n-byte body. Memory follows the bytes received, so a
+// head that declares a large body reserves nothing until the body comes.
+func readBody(r io.Reader, n int) ([]byte, error) {
+	body := make([]byte, 0, min(n, 64<<10))
+	for len(body) < n {
+		if len(body) == cap(body) {
+			body = slices.Grow(body, min(len(body), n-len(body)))
+		}
+		m, err := r.Read(body[len(body):min(cap(body), n)])
+		body = body[:len(body)+m]
+		if err != nil && len(body) < n {
+			if errors.Is(err, io.EOF) && len(body) > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return body, nil
+}
+
+// websocketOnly reports whether an Upgrade value offers WebSocket and no
+// other protocol (RFC 6455 4.1: the token is case-insensitive).
+func websocketOnly(value string) bool {
+	offered := false
+	for token := range strings.SplitSeq(value, ",") {
+		switch token = strings.TrimSpace(token); {
+		case token == "": // an empty list element (RFC 9110 5.6.1)
+		case strings.EqualFold(token, "websocket"):
+			offered = true
+		default:
+			return false
+		}
+	}
+	return offered
 }
 
 // framing checks a request head that a server could read differently from
@@ -542,16 +735,13 @@ func swappableText(target string, headers []header, contentType string, body []b
 }
 
 // targetAuthority returns the authority a request target names, if any: the
-// target of a CONNECT (authority-form), or the authority of an absolute-form
-// target ("https://host/path"). An origin-form ("/path") or asterisk-form
-// ("*") target names none. Any other target names an empty authority, which
-// no connection is opened to.
-func targetAuthority(method, target string) (string, bool) {
-	switch {
-	case strings.HasPrefix(target, "/") || target == "*":
+// authority of an absolute-form target ("https://host/path"). An origin-form
+// ("/path") or asterisk-form ("*") target names none. Any other target
+// (authority-form is CONNECT's, which is refused) names an empty authority,
+// which no connection is opened to.
+func targetAuthority(target string) (string, bool) {
+	if strings.HasPrefix(target, "/") || target == "*" {
 		return "", false
-	case method == "CONNECT":
-		return target, true
 	}
 	_, rest, ok := strings.Cut(target, "://")
 	if !ok {
@@ -603,14 +793,16 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 		}
 		// A 101 turns the rest of the connection into a raw stream that is
 		// neither swapped nor masked, so only a request that asked to
-		// upgrade may get one (RFC 9110 15.2.2). Any other 101 is refused.
+		// upgrade (to a WebSocket, the only upgrade sent) may get one (RFC
+		// 9110 15.2.2). Any other 101 is refused. Nothing else switches: a
+		// 2xx is an ordinary response, masked like any other.
 		if status == 101 && !current.upgrade {
 			opts.Logger.Warn("refusing a 101 to a request that did not ask to upgrade")
 			body := "secret-proxy: unrequested protocol switch\n"
 			_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 			return errRefused
 		}
-		switched := status == 101 || current.method == "CONNECT" && status >= 200 && status < 300
+		switched := status == 101
 		// Values resolved before this response's request was sent are on
 		// record by now.
 		masker := opts.Session.Masker()
