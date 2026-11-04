@@ -126,7 +126,8 @@ func (r *relay) runLookup(ctx context.Context, p pendingLookup) {
 // a stream error of type STREAM_CLOSED (RFC 9113 5.1), which resets the
 // stream on both sides, and cancels its lookup. Such a frame never starts
 // another lookup or reaches the server. Past maxStreamErrors, the
-// connection ends with PROTOCOL_ERROR.
+// connection ends with PROTOCOL_ERROR; the drop also counts toward the
+// reset limit (clientDropped).
 func (r *relay) endedStream(s *stream, credit int) error {
 	r.streamErrors++
 	if r.streamErrors > maxStreamErrors {
@@ -146,6 +147,9 @@ func (r *relay) endedStream(s *stream, credit int) error {
 		r.forgetResetLocked(s)
 	}
 	r.mu.Unlock()
+	if err := r.clientDropped(); err != nil {
+		return err
+	}
 	if serverID != 0 {
 		if err := r.writeServer(Frame{Type: FrameRSTStream, Stream: serverID, Payload: binary.BigEndian.AppendUint32(nil, errCodeCancel)}); err != nil {
 			return err
@@ -182,6 +186,10 @@ func (r *relay) openResolved(s *stream, fields []hpack.HeaderField, priority *Pr
 	if err := r.swapFields(swapper, fields, s.authority); err != nil {
 		// Nothing went upstream, so the client may retry elsewhere.
 		r.opts.Logger.Error("refusing a request whose swapped headers cannot be sent", "stream", s.clientID, "error", err)
+		return r.abort(s, errCodeRefusedStream)
+	}
+	if !r.recountFields(s, fields, nil) {
+		r.opts.Logger.Error("refusing a request whose swapped headers pass the connection buffer limit", "stream", s.clientID, "connection_limit_bytes", r.opts.MaxBuffered)
 		return r.abort(s, errCodeRefusedStream)
 	}
 	return r.open(s, fields, priority, endStream)

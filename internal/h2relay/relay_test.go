@@ -289,11 +289,12 @@ func TestStreamLimitRefusesNewStreams(t *testing.T) {
 	h.quiet(h.toServer, 50*time.Millisecond, isType(FrameHeaders))
 }
 
-// Buffered bodies share one budget per connection: the stream that would
-// pass it is refused, the others carry on, and nothing stays held.
+// Buffered bodies share one budget per connection, with the header lists
+// of their requests: the stream that would pass it is refused, the others
+// carry on, and nothing stays held.
 func TestBufferedBodiesShareABudget(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.MaxBuffered = 1000 })
 	post := request("POST", hpack.HeaderField{Name: "content-type", Value: "application/json"})
+	h := newHarness(t, func(o *Options) { o.MaxBuffered = 1000 + 2*int(fieldsSize(post)) })
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(post...)},
 		Frame{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("a"), 600)},
@@ -301,8 +302,8 @@ func TestBufferedBodiesShareABudget(t *testing.T) {
 		Frame{Type: FrameData, Stream: 3, Payload: bytes.Repeat([]byte("b"), 600)},
 	)
 	h.expect(h.toClient, "client", isRefusal(3))
-	if _, _, held := h.state(); held != 600 {
-		t.Fatalf("relay holds %d bytes, want the 600 of stream 1", held)
+	if _, _, held := h.state(); held != 600+fieldsSize(post) {
+		t.Fatalf("relay holds %d bytes, want the 600 of stream 1 and its headers", held)
 	}
 	h.clientSend(Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte("tok_standin")})
 	headers := h.expect(h.toServer, "server", isType(FrameHeaders))
@@ -386,7 +387,12 @@ func TestGoAwayRefusesUnsentRequests(t *testing.T) {
 
 // Finished requests leave no state behind on a long-lived connection.
 func TestCompletedStreamsAreForgotten(t *testing.T) {
-	h := newHarness(t, nil)
+	// The resets below come one reset period apart, as the reset limit
+	// allows; the clock is read on the client loop only.
+	clock := time.Now()
+	h := newHarnessWith(t, nil, func(r *relay) {
+		r.now = func() time.Time { clock = clock.Add(resetWindow); return clock }
+	})
 	const requests = 200
 	for i := 0; i < requests; i++ {
 		id := uint32(2*i + 1)
@@ -653,6 +659,8 @@ func TestStreamedUploadsShareTheBudget(t *testing.T) {
 	h.expect(h.toServer, "server", func(f Frame) bool {
 		return f.Type == FrameRSTStream && f.Stream == streamHeaders.Stream && binary.BigEndian.Uint32(f.Payload) == errCodeCancel
 	})
+	// Both header blocks have reached the server and released their budget;
+	// only stream 3's queued body remains after stream 5 is reset.
 	if _, _, held := h.state(); held != 10000 {
 		t.Fatalf("relay holds %d bytes, want stream 3's 10000", held)
 	}
@@ -674,15 +682,15 @@ func TestLargeServerHeaderTableSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 4 || got[0] != (Setting{ID: 3, Value: 100}) || got[1].ID != SettingHeaderTableSize || got[2] != (Setting{ID: SettingInitialWindowSize, Value: 1 << 20}) ||
+	if len(got) != 4 || got[0] != (Setting{ID: 3, Value: 100}) || got[1] != (Setting{ID: SettingHeaderTableSize, Value: decoderTableSize}) || got[2] != (Setting{ID: SettingInitialWindowSize, Value: 1 << 20}) ||
 		got[3] != (Setting{ID: SettingMaxFrameSize, Value: 1 << 20}) {
 		t.Fatalf("client settings %v", got)
 	}
 	// The client follows what it received: a table size update to it,
-	// then a header large enough to need a table above 4096 bytes.
+	// then a header that fills the table.
 	h.clientEnc.SetMaxDynamicTableSizeLimit(got[1].Value)
 	h.clientEnc.SetMaxDynamicTableSize(got[1].Value)
-	big := hpack.HeaderField{Name: "x-big", Value: strings.Repeat("v", 20000)}
+	big := hpack.HeaderField{Name: "x-big", Value: strings.Repeat("v", 4000)}
 	for _, id := range []uint32{1, 3} {
 		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: id, Payload: h.clientBlock(request("GET", big)...)})
 		if f := h.expect(h.toServer, "server", isType(FrameHeaders)); f.Stream != id {
@@ -1257,11 +1265,11 @@ func TestServerMustStartWithSettings(t *testing.T) {
 
 // Frames held for the server's SETTINGS are bounded by the buffer budget.
 func TestHeldFramesAreBounded(t *testing.T) {
-	h := newRawHarness(t, func(o *Options) { o.MaxStreams = 1; o.MaxBuffered = 200 }, nil)
+	h := newRawHarness(t, func(o *Options) { o.MaxStreams = 1; o.MaxBuffered = 300 }, nil)
 	h.clientSend(Frame{Type: FrameSettings})
 	// Stream 1 goes upstream; every later one is refused, and each refusal
 	// waits for the server's SETTINGS. The relay closes the connection once
-	// they pass 200 bytes, so writes stop succeeding.
+	// they pass 300 bytes, so writes stop succeeding.
 	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 	for i := uint32(0); i < 40; i++ {
 		frame := Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 2*i + 1, Payload: h.clientBlock(request("GET")...)}

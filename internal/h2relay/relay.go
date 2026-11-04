@@ -23,9 +23,16 @@
 // response headers, bodies and trailers.
 //
 // Memory is bounded per connection: header blocks (encoded and decoded),
-// each buffered body, all held request bytes together, and the number of open
-// streams. A stream over a limit is refused with REFUSED_STREAM, which tells
-// the client it never reached the server and may be retried.
+// each buffered body, all held request bytes together (header lists
+// included), and the number of open streams. A stream over the body, buffer
+// or stream limit is refused with REFUSED_STREAM, which tells the client it
+// never reached the server and may be retried; a header block over its
+// limit ends the connection.
+//
+// Abuse that costs the client little and the destination or the resolver
+// much is limited too: the client's HPACK table is no larger than the
+// relay's upstream one (decoderTableSize), and a client that resets streams
+// faster than it could use them (rapid reset) loses the connection.
 package h2relay
 
 import (
@@ -61,11 +68,14 @@ type Options struct {
 	// MaxBody caps one buffered request body (default 32 MiB).
 	MaxBody int
 	// MaxBuffered caps the request bytes the relay holds for the whole
-	// connection: buffered bodies and data waiting for the server's flow
-	// control (default 64 MiB).
+	// connection: buffered bodies, data waiting for the server's flow
+	// control, and the decoded header and trailer lists of requests not sent
+	// upstream yet (default 64 MiB).
 	MaxBuffered int
 	// MaxStreams caps the client streams open at once (default 256).
-	// Streams waiting for a lookup count toward it.
+	// Streams waiting for a lookup count toward it. A client that resets
+	// more than twice as many streams within 10 seconds loses the
+	// connection.
 	MaxStreams int
 	// MaxLookups caps the resolver lookups running at once on the
 	// connection, each on a goroutine (default DefaultMaxLookups); more wait
@@ -102,8 +112,16 @@ const (
 	errCodeRefusedStream = 0x7
 	errCodeCancel        = 0x8
 	errCodeCalm          = 0xb // ENHANCE_YOUR_CALM
-	decoderTableSize     = 1 << 16
-	maxWindow            = 1<<31 - 1
+	// decoderTableSize is the largest HPACK table the relay's request
+	// decoder accepts, and so the largest the client is told it may use: the
+	// HPACK default, which is the table of the relay's upstream encoder too.
+	// With a larger client table, references to entries the encoder cannot
+	// index would go upstream as literals, a few bytes becoming kilobytes.
+	// Equal tables cut this but do not stop it: a literal the client does
+	// not index, which the encoder does, can evict an entry the client still
+	// refers to, so the ratio is not bounded.
+	decoderTableSize = 4096
+	maxWindow        = 1<<31 - 1
 	// maxResetStreams bounds how many client-reset streams are remembered
 	// so late server frames on them can still be passed on.
 	maxResetStreams = 1024
@@ -112,6 +130,9 @@ const (
 	// maxPriorityValue caps the Priority Field Value of a PRIORITY_UPDATE
 	// frame. RFC 9218 values are a few bytes ("u=3, i").
 	maxPriorityValue = 1024
+	// resetWindow is the period over which client resets are counted
+	// (clientDropped).
+	resetWindow = 10 * time.Second
 )
 
 type relay struct {
@@ -132,6 +153,13 @@ type relay struct {
 	// streamErrors counts the client's stream errors (frames on a stream it
 	// ended); past maxStreamErrors they end the connection. clientLoop only.
 	streamErrors int
+	// resets counts the streams the client reset or had dropped since
+	// resetsSince (clientDropped). clientLoop only.
+	resets      int
+	resetsSince time.Time
+	now         func() time.Time // time.Now; tests replace it
+	// decAllowed is the table size dec accepts (clientLoop only).
+	decAllowed uint32
 	// The largest frame each side may send: the client, what the server's
 	// SETTINGS told it; the server, what the client's told it. A longer one
 	// ends the connection with FRAME_SIZE_ERROR.
@@ -180,13 +208,18 @@ type relay struct {
 	// client may have applied any prefix of them.
 	ackedInitial   int64
 	unackedInitial []int64
+	// The same for the HPACK table size the client's encoder may use, as
+	// forwarded (capped at decoderTableSize; -1: frame without one).
+	ackedTable   int64
+	unackedTable []int64
 	// settingsOverflow is set once unackedInitial overflowed: from then on
 	// the largest value ever sent is enforced.
 	settingsOverflow bool
 	maxInitialSent   int64
+	maxTableSent     int64
 	initialWindow    int64
 	maxFrame         int
-	held             int64 // request bytes held: buffered bodies plus unsent data
+	held             int64 // request bytes held: buffered bodies, unsent data and held header lists
 	// creditOwed is connection credit owed to the client for streamed bytes
 	// the relay discarded unsent; sendLoop returns it.
 	creditOwed int64
@@ -246,6 +279,11 @@ type stream struct {
 	priority  *Priority
 	body      bytes.Buffer
 	trailers  []hpack.HeaderField
+	// heldHeaders and heldTrailers are the decoded sizes of the request's
+	// header and trailer lists while the relay holds them (buffering,
+	// waiting for a lookup or a slot), counted in relay.held. Guarded by
+	// relay.mu.
+	heldHeaders, heldTrailers int64
 	// Control frames for a stream that has no server ID yet, combined so a
 	// client cannot grow them: the summed WINDOW_UPDATE increment and the
 	// latest PRIORITY_UPDATE.
@@ -311,6 +349,8 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 
 		nextServerID: 1, connWindow: defaultWindow, initialWindow: defaultWindow, maxFrame: defaultMaxFrame,
 		recvConn: defaultWindow, clientInitial: defaultWindow, maxConcurrent: -1, ackedInitial: defaultWindow, maxInitialSent: defaultWindow,
+		decAllowed: decoderTableSize, ackedTable: decoderTableSize, maxTableSent: decoderTableSize,
+		now: time.Now,
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.asyncErrs = make(chan error, 1)
@@ -648,6 +688,18 @@ func (r *relay) clientLoop() error {
 // (RFC 9113 accounting: name, value and 32 bytes per field) passes the limit.
 // HPACK can expand a small block into a large list through table references.
 func (r *relay) decode(block []byte) ([]hpack.HeaderField, error) {
+	r.mu.Lock()
+	allowed := uint32(r.possibleTableLocked())
+	r.mu.Unlock()
+	if allowed != r.decAllowed {
+		if allowed < r.decAllowed {
+			// The client acknowledged a lower size, so its encoder no longer
+			// uses entries past it (RFC 7541 4.2): neither does the decoder.
+			r.dec.SetMaxDynamicTableSize(allowed)
+		}
+		r.dec.SetAllowedMaxDynamicTableSize(allowed)
+		r.decAllowed = allowed
+	}
 	var fields []hpack.HeaderField
 	size, overflow := 0, false
 	r.dec.SetEmitFunc(func(f hpack.HeaderField) {
@@ -703,15 +755,47 @@ func (r *relay) forStream(f Frame) error {
 				// RFC 9113 6.9.1: a window above 2^31-1 is an error for the stream.
 				r.dropLocked(s)
 				r.mu.Unlock()
+				if err := r.clientDropped(); err != nil {
+					return err
+				}
 				return r.writeClient(refusal(s.clientID))
 			}
+			r.mu.Unlock()
+			return nil
 		}
 		r.mu.Unlock()
-		return nil
+		return r.clientDropped()
 	}
 	f.Stream = s.serverID
 	r.mu.Unlock()
+	if f.Type == FrameRSTStream {
+		if err := r.clientDropped(); err != nil {
+			return err
+		}
+	}
 	return r.writeServer(f)
+}
+
+// errTooManyResets is a client that reset too many streams in a period.
+var errTooManyResets = errors.New("client reset too many streams")
+
+// clientDropped counts a stream the client reset, or made the relay drop,
+// while the relay still held it. Each such drop frees a stream slot and
+// cancels the stream's lookup at once, so without a bound a client could
+// have the destination open streams, and the resolver start lookups, as
+// fast as it sends frames (rapid reset, CVE-2023-44487). Past twice
+// MaxStreams within resetWindow, enough for a browser to cancel every open
+// request twice over, the connection ends with ENHANCE_YOUR_CALM.
+func (r *relay) clientDropped() error {
+	now := r.now()
+	if now.Sub(r.resetsSince) >= resetWindow {
+		r.resets, r.resetsSince = 0, now
+	}
+	r.resets++
+	if r.resets > 2*r.opts.MaxStreams {
+		return r.connectionError(errCodeCalm, errTooManyResets)
+	}
+	return nil
 }
 
 // openStreamsLocked counts the client streams the relay holds state for:
@@ -734,7 +818,8 @@ func (r *relay) openStreamsLocked() int {
 // decoding any header block; with masking, the response side ends here
 // (endRespLocked) and the server's remaining frames are absorbed.
 func (r *relay) dropLocked(s *stream) {
-	r.held -= int64(s.body.Len() + len(s.out))
+	r.held -= int64(s.body.Len()+len(s.out)) + s.heldHeaders + s.heldTrailers
+	s.heldHeaders, s.heldTrailers = 0, 0
 	if s.streaming && len(s.out) > 0 {
 		// Streamed bytes are credited once sent upstream; these never will
 		// be, so their connection credit is returned here. Buffered bodies
@@ -964,7 +1049,16 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		} else {
 			s.streaming = !endStream
 		}
+		// The header list counts toward MaxBuffered until it goes upstream.
+		size := fieldsSize(fields)
 		r.mu.Lock()
+		if r.held+size > int64(r.opts.MaxBuffered) {
+			r.mu.Unlock()
+			r.opts.Logger.Error("refusing a request whose headers pass the connection buffer limit", "stream", clientID, "connection_limit_bytes", r.opts.MaxBuffered)
+			return r.writeClient(refusal(clientID))
+		}
+		r.held += size
+		s.heldHeaders = size
 		s.recvWindow = r.clientInitial
 		r.streams[clientID] = s
 		if r.masking {
@@ -1021,11 +1115,27 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		r.opts.Logger.Warn("resetting a request with malformed trailers", "stream", clientID, "reason", cause.Error())
 		return r.abort(s, errCodeProtocol)
 	}
+	// Trailers count toward MaxBuffered until they go upstream, in place of
+	// any the stream sent before.
+	size := fieldsSize(fields)
+	r.mu.Lock()
+	if r.streams[clientID] != s {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.held-s.heldTrailers+size > int64(r.opts.MaxBuffered) {
+		r.mu.Unlock()
+		r.opts.Logger.Error("resetting a request whose trailers pass the connection buffer limit", "stream", clientID, "connection_limit_bytes", r.opts.MaxBuffered)
+		return r.clientAbort(s, errCodeCalm)
+	}
+	r.held += size - s.heldTrailers
+	s.heldTrailers = size
+	r.mu.Unlock()
 	if s.swap && !buffering {
 		lookup, err := r.opts.Session.Prepare(fieldText(fields)...)
 		if err != nil {
 			r.opts.Logger.Error("resetting a request whose trailers cannot be sent", "stream", clientID, "error", err)
-			return r.abort(s, errCodeCalm)
+			return r.clientAbort(s, errCodeCalm)
 		}
 		if lookup != nil {
 			r.mu.Lock()
@@ -1037,6 +1147,10 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 				}
 				if err != nil {
 					r.opts.Logger.Error("resetting a request whose trailers cannot be sent", "stream", s.clientID, "error", err)
+					return r.abort(s, errCodeCalm)
+				}
+				if !r.recountFields(s, nil, fields) {
+					r.opts.Logger.Error("resetting a request whose swapped trailers pass the connection buffer limit", "stream", s.clientID, "connection_limit_bytes", r.opts.MaxBuffered)
 					return r.abort(s, errCodeCalm)
 				}
 				r.mu.Lock()
@@ -1230,6 +1344,43 @@ func (r *relay) swapFields(swapper *swap.Swapper, fields []hpack.HeaderField, au
 	return nil
 }
 
+// recountFields charges the swapped size of a stream's held header and
+// trailer lists (nil: unchanged) in place of what was counted before the
+// swap: real values may be longer than their stand-ins. It reports false,
+// changing nothing, when that would pass MaxBuffered; a stream dropped
+// meanwhile holds nothing and is left alone.
+func (r *relay) recountFields(s *stream, headers, trailers []hpack.HeaderField) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.streams[s.clientID] != s {
+		return true
+	}
+	h, t := s.heldHeaders, s.heldTrailers
+	if headers != nil {
+		h = fieldsSize(headers)
+	}
+	if trailers != nil {
+		t = fieldsSize(trailers)
+	}
+	grow := h - s.heldHeaders + t - s.heldTrailers
+	if r.held+grow > int64(r.opts.MaxBuffered) {
+		return false
+	}
+	r.held += grow
+	s.heldHeaders, s.heldTrailers = h, t
+	return true
+}
+
+// fieldsSize is the decoded size of a header list as RFC 9113 counts it:
+// name, value and 32 bytes per field.
+func fieldsSize(fields []hpack.HeaderField) int64 {
+	n := int64(0)
+	for _, f := range fields {
+		n += int64(len(f.Name) + len(f.Value) + 32)
+	}
+	return n
+}
+
 // framingHeaders describe the message, not its content: a stand-in that
 // happens to match their value ("123" in content-length: 123) is not one.
 // content-length is set from the body that is actually sent.
@@ -1257,6 +1408,17 @@ func (r *relay) abort(s *stream, clientCode uint32) error {
 		return err
 	}
 	return r.writeClient(Frame{Type: FrameRSTStream, Stream: s.clientID, Payload: binary.BigEndian.AppendUint32(nil, clientCode)})
+}
+
+// clientAbort is abort for a stream the client's own frames made the relay
+// drop, on clientLoop. The drop frees a slot and cancels the stream's
+// lookup as a reset does, so it counts toward the reset limit
+// (clientDropped).
+func (r *relay) clientAbort(s *stream, clientCode uint32) error {
+	if err := r.abort(s, clientCode); err != nil {
+		return err
+	}
+	return r.clientDropped()
 }
 
 // open sends a request's HEADERS upstream under a new server stream ID,
@@ -1294,6 +1456,8 @@ func (r *relay) openStream(s *stream, fields []hpack.HeaderField, priority *Prio
 	s.serverID = r.nextServerID
 	r.nextServerID += 2
 	r.byServer[s.serverID] = s
+	r.held -= s.heldHeaders // the header list is on its way upstream
+	s.heldHeaders = 0
 	if rs := r.resp[s.clientID]; rs != nil {
 		rs.serverID = s.serverID
 	}
@@ -1428,6 +1592,9 @@ func (r *relay) onData(f Frame) error {
 			r.mu.Unlock()
 			r.opts.Logger.Error("refusing a request body over the buffer limit",
 				"stream", f.Stream, "body_limit_bytes", r.opts.MaxBody, "connection_limit_bytes", r.opts.MaxBuffered, "connection_limit_reached", overConn)
+			if err := r.clientDropped(); err != nil {
+				return err
+			}
 			if err := r.writeClient(refusal(f.Stream)); err != nil {
 				return err
 			}
@@ -1447,7 +1614,7 @@ func (r *relay) onData(f Frame) error {
 	if r.held+int64(len(data)) > int64(r.opts.MaxBuffered) {
 		r.mu.Unlock()
 		r.opts.Logger.Error("resetting a streamed upload over the connection buffer limit", "stream", f.Stream, "connection_limit_bytes", r.opts.MaxBuffered)
-		if err := r.abort(s, errCodeCalm); err != nil {
+		if err := r.clientAbort(s, errCodeCalm); err != nil {
 			return err
 		}
 		return r.creditClient(0, len(f.Payload), false)
@@ -1513,9 +1680,6 @@ func (r *relay) finish(s *stream) error {
 // finishSwapped swaps a buffered request's headers, trailers and body with
 // swapper (nil: nothing to swap) and sends the request upstream.
 func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.HeaderField, priority *Priority, trailers []hpack.HeaderField, original []byte, contentType string) error {
-	r.mu.Lock()
-	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
-	r.mu.Unlock()
 	var err error
 	body, changed := original, false
 	if swapper != nil {
@@ -1525,6 +1689,15 @@ func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.
 				return r.abort(s, errCodeRefusedStream)
 			}
 		}
+		if !r.recountFields(s, headers, trailers) {
+			r.opts.Logger.Error("refusing a request whose swapped headers pass the connection buffer limit", "stream", s.clientID, "connection_limit_bytes", r.opts.MaxBuffered)
+			return r.abort(s, errCodeRefusedStream)
+		}
+	}
+	r.mu.Lock()
+	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
+	r.mu.Unlock()
+	if swapper != nil {
 		body, changed, err = swapper.Body(contentType, original, int(max(limit, 0)))
 	}
 	if err != nil {
@@ -1664,6 +1837,8 @@ func (r *relay) sendLoop() error {
 		end := len(s.out) == 0 && s.outEnd
 		if end {
 			trailers = s.trailers
+			r.held -= s.heldTrailers
+			s.heldTrailers = 0
 			r.dequeue(s)
 			r.forgetIfDoneLocked(s)
 		}
@@ -1962,8 +2137,25 @@ func (r *relay) possibleInitialLocked() int64 {
 	if r.settingsOverflow {
 		return r.maxInitialSent
 	}
-	state, largest := r.ackedInitial, r.ackedInitial
-	for _, v := range r.unackedInitial {
+	return largestState(r.ackedInitial, r.unackedInitial)
+}
+
+// possibleTableLocked is the largest HPACK table the client's encoder may be
+// using, the same way: it grows as soon as a larger size is sent, and
+// shrinks only once the client acknowledged a smaller one.
+func (r *relay) possibleTableLocked() int64 {
+	if r.settingsOverflow {
+		return r.maxTableSent
+	}
+	return largestState(r.ackedTable, r.unackedTable)
+}
+
+// largestState is the largest value a setting may have for the client:
+// acked, or its value after any prefix of the unacknowledged frames, each
+// with its value or -1 for a frame without the setting.
+func largestState(acked int64, unacked []int64) int64 {
+	state, largest := acked, acked
+	for _, v := range unacked {
 		if v >= 0 {
 			state = v
 		}
@@ -1984,7 +2176,11 @@ func (r *relay) applyClientAck() error {
 	if v := r.unackedInitial[0]; v >= 0 {
 		r.ackedInitial = v
 	}
+	if v := r.unackedTable[0]; v >= 0 {
+		r.ackedTable = v
+	}
 	r.unackedInitial = r.unackedInitial[1:]
+	r.unackedTable = r.unackedTable[1:]
 	r.setClientInitialLocked(r.possibleInitialLocked())
 	topUp := r.topUpBufferingLocked()
 	r.mu.Unlock()
@@ -2029,17 +2225,23 @@ func (r *relay) onServerSettings(payload []byte) error {
 	// Before the client can read the frame, so its frames sized to the new
 	// value are let through.
 	r.clientFrames.sent(payload)
-	initial := int64(-1)
+	initial, table := int64(-1), int64(-1)
 	for _, s := range settings {
-		if s.ID == SettingInitialWindowSize {
+		switch s.ID {
+		case SettingInitialWindowSize:
 			initial = int64(s.Value)
+		case SettingHeaderTableSize:
+			table = int64(min(s.Value, decoderTableSize)) // as clientSettings forwards it
 		}
 	}
 	r.mu.Lock()
 	r.unackedInitial = append(r.unackedInitial, initial)
+	r.unackedTable = append(r.unackedTable, table)
 	r.maxInitialSent = max(r.maxInitialSent, initial)
+	r.maxTableSent = max(r.maxTableSent, table)
 	if len(r.unackedInitial) > maxUnackedSettings {
 		r.unackedInitial = r.unackedInitial[1:]
+		r.unackedTable = r.unackedTable[1:]
 		r.settingsOverflow = true
 	}
 	r.setClientInitialLocked(r.possibleInitialLocked())
@@ -2053,8 +2255,13 @@ func (r *relay) onServerSettings(payload []byte) error {
 	for _, s := range settings {
 		switch s.ID {
 		case SettingHeaderTableSize:
+			// The upstream table is as large as the client's may be, within
+			// what the server allows: after a lower value it grows back.
 			r.serverMu.Lock()
 			r.enc.SetMaxDynamicTableSizeLimit(s.Value)
+			if size := min(s.Value, decoderTableSize); r.enc.MaxDynamicTableSize() < size {
+				r.enc.SetMaxDynamicTableSize(size)
+			}
 			r.serverMu.Unlock()
 		case SettingInitialWindowSize:
 			if s.Value > 1<<31-1 {
