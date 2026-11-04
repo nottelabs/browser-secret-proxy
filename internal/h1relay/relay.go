@@ -19,9 +19,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
@@ -39,7 +42,11 @@ type Options struct {
 	// masked (default mask.DefaultMaxDecoded). A response past it is cut
 	// off.
 	MaxDecoded int64
-	Logger     *slog.Logger
+	// HeadTimeout bounds the time from the first byte of a request head to
+	// its end (zero: no limit), so a client cannot hold the connection by
+	// dripping a head. Waiting between requests is not counted.
+	HeadTimeout time.Duration
+	Logger      *slog.Logger
 }
 
 const (
@@ -78,7 +85,7 @@ func Serve(client, server net.Conn, opts Options) error {
 		done <- responses(bufio.NewReader(server), toClient, queue, progress, opts)
 	}()
 	go func() {
-		done <- requests(ctx, bufio.NewReader(client), server, toClient, queue, responsesDone, progress, opts)
+		done <- requests(ctx, bufio.NewReader(client), headTimer{conn: client, timeout: opts.HeadTimeout}, server, toClient, queue, responsesDone, progress, opts)
 	}()
 	err := <-done
 	cancel()
@@ -176,14 +183,18 @@ type header struct {
 // being sent.
 var errRefused = errors.New("request refused")
 
-func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
+func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
 	sent := 0 // requests forwarded so far
 	for {
-		requestLine, err := readLine(br, maxHeadBytes)
-		if err != nil {
+		if err := head.start(br); err != nil {
 			return err
 		}
+		requestLine, err := readLine(br, maxHeadBytes)
+		if err != nil {
+			return head.wrap(err)
+		}
 		if requestLine == "" {
+			head.stop()
 			continue // tolerated empty line between requests
 		}
 		parts := strings.SplitN(requestLine, " ", 3)
@@ -198,7 +209,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 				if errors.Is(err, errLineTooLong) {
 					return errors.New("request head too large")
 				}
-				return err
+				return head.wrap(err)
 			}
 			if line == "" {
 				break
@@ -210,6 +221,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			}
 			headers = append(headers, header{raw: line, name: strings.ToLower(strings.TrimSpace(name)), value: strings.TrimSpace(value)})
 		}
+		head.stop()
 
 		host, contentType := "", ""
 		hosts := 0
@@ -273,8 +285,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		case chunked:
 			body, trailer, err = readChunked(br, opts.MaxBody)
 		case contentLength > 0:
-			body = make([]byte, contentLength)
-			_, err = io.ReadFull(br, body)
+			body, err = readBody(br, contentLength)
 		}
 		if err != nil {
 			return err
@@ -387,6 +398,59 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			}
 		}
 	}
+}
+
+// headTimer puts a read deadline on the client while a request head
+// arrives, from its first byte.
+type headTimer struct {
+	conn    net.Conn
+	timeout time.Duration
+}
+
+// start waits for the first byte of the next head, then sets the deadline.
+func (h headTimer) start(br *bufio.Reader) error {
+	if h.timeout <= 0 {
+		return nil
+	}
+	if _, err := br.Peek(1); err != nil {
+		return err
+	}
+	_ = h.conn.SetReadDeadline(time.Now().Add(h.timeout))
+	return nil
+}
+
+func (h headTimer) stop() {
+	if h.timeout > 0 {
+		_ = h.conn.SetReadDeadline(time.Time{})
+	}
+}
+
+// wrap names a deadline error as a head that came too slowly.
+func (h headTimer) wrap(err error) error {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("request head not received within %s: %w", h.timeout, err)
+	}
+	return err
+}
+
+// readBody reads an n-byte body. Memory follows the bytes received, so a
+// head that declares a large body reserves nothing until the body comes.
+func readBody(r io.Reader, n int) ([]byte, error) {
+	body := make([]byte, 0, min(n, 64<<10))
+	for len(body) < n {
+		if len(body) == cap(body) {
+			body = slices.Grow(body, min(len(body), n-len(body)))
+		}
+		m, err := r.Read(body[len(body):min(cap(body), n)])
+		body = body[:len(body)+m]
+		if err != nil && len(body) < n {
+			if errors.Is(err, io.EOF) && len(body) > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return body, nil
 }
 
 // swappableText is the text of a request that stand-ins are swapped in,

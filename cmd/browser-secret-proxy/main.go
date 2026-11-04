@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/certs"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
@@ -39,6 +40,9 @@ func run() error {
 	resolverOpts := registerResolverFlags(flag.CommandLine)
 	parent := flag.String("upstream-proxy", os.Getenv("SECRET_PROXY_UPSTREAM"), "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
 	maskResponses := flag.Bool("mask-responses", true, "replace real values with their stand-ins in responses from allowlisted hosts")
+	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "close a connection after this long without traffic either way (0 never)")
+	headerTimeout := flag.Duration("header-timeout", 10*time.Second, "longest time to receive the CONNECT head, and each HTTP/1.1 request head from its first byte")
+	maxConns := flag.Int("max-conns", 1024, "most client connections handled at once (0 no limit)")
 	verbose := flag.Bool("v", false, "debug logging")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -59,6 +63,9 @@ func run() error {
 	if *caCert == "" || *caKey == "" || *hosts == "" {
 		flag.Usage()
 		return fmt.Errorf("-ca-cert, -ca-key and -hosts are required")
+	}
+	if *idleTimeout < 0 || *headerTimeout <= 0 || *maxConns < 0 {
+		return fmt.Errorf("-idle-timeout and -max-conns cannot be negative, and -header-timeout must be positive")
 	}
 	authority, err := certs.LoadFiles(*caCert, *caKey)
 	if err != nil {
@@ -98,6 +105,9 @@ func run() error {
 		Logger:         logger,
 		// Real values in responses are replaced by their stand-ins.
 		MaskResponses: *maskResponses,
+		HeaderTimeout: *headerTimeout,
+		IdleTimeout:   *idleTimeout,
+		MaxConns:      *maxConns,
 	})
 	if err != nil {
 		return err
@@ -109,7 +119,7 @@ func run() error {
 	parentDescription := describeParent(parentURL)
 	attrs := append([]any{"address", ln.Addr().String(), "hosts", *hosts}, values.logAttrs...)
 	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed",
-		"mask_responses", *maskResponses)
+		"mask_responses", *maskResponses, "idle_timeout", idleTimeout.String(), "max_conns", *maxConns)
 	logger.Info("listening", attrs...)
 
 	ctx, cancel := context.WithCancel(context.Background())

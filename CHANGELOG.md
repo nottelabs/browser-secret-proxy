@@ -15,6 +15,13 @@ First release, planned as 0.1.0.
   query strings and bodies.
 - Plain CONNECT tunnels, without decryption, for every other host.
 - HTTP/2 and HTTP/1.1 relays.
+- Idle and header timeouts and a connection cap. A connection with no
+  traffic either way for `-idle-timeout` (default `5m`) is closed, the
+  CONNECT head and each HTTP/1.1 request head must arrive within
+  `-header-timeout` (default `10s`), and past `-max-conns` (default `1024`)
+  connections a new one is answered `503`. An HTTP/1.1 request body takes
+  memory as it arrives instead of all at once when its head declares its
+  length.
 - Optional Basic authentication on CONNECT
   (`SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD`). The proxy refuses to
   start with a password but no username, which would leave authentication
