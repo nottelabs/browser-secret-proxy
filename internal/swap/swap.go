@@ -33,7 +33,11 @@ type Swapper struct {
 	literal    *strings.Replacer // raw text: header values and bodies other than forms and JSON
 	query      *strings.Replacer // query strings and form bodies, real values query-escaped
 	jsonString *strings.Replacer // inside JSON strings, real values JSON-escaped
-	keys       []string
+	// unsafeHeader drops the stand-ins whose real values hold a line break
+	// or NUL and keeps the others, matching as literal does; nil when no
+	// real value holds one.
+	unsafeHeader *strings.Replacer
+	keys         []string
 }
 
 // Load reads a JSON object mapping each stand-in to its real value.
@@ -68,9 +72,16 @@ func New(values map[string]string) (*Swapper, error) {
 		}
 		return keys[i] < keys[j]
 	})
-	var literal, query, jsonString []string
+	var literal, query, jsonString, unsafeHeader []string
+	unsafe := false
 	for _, k := range keys {
 		literal = append(literal, k, values[k])
+		if strings.ContainsAny(values[k], headerBreaks) {
+			unsafe = true
+			unsafeHeader = append(unsafeHeader, k, "")
+		} else {
+			unsafeHeader = append(unsafeHeader, k, k)
+		}
 		// In a query string or form body the real value must arrive as one
 		// query value ("a&b+c" becomes "a%26b%2Bc"), whichever form the
 		// stand-in took there.
@@ -78,12 +89,16 @@ func New(values map[string]string) (*Swapper, error) {
 		// In a JSON string it must decode to itself ("a\"b" for a"b).
 		jsonString = appendForms(jsonString, values[k], jsonEscape, k, jsonEscape(k))
 	}
-	return &Swapper{
+	sw := &Swapper{
 		literal:    strings.NewReplacer(literal...),
 		query:      strings.NewReplacer(query...),
 		jsonString: strings.NewReplacer(jsonString...),
 		keys:       keys,
-	}, nil
+	}
+	if unsafe {
+		sw.unsafeHeader = strings.NewReplacer(unsafeHeader...)
+	}
+	return sw, nil
 }
 
 // Forms returns the distinct forms in which a Swapper recognizes a
@@ -150,14 +165,20 @@ func replace(r *strings.Replacer, in string, limit int) (string, bool, error) {
 	return out, out != in, nil
 }
 
+// headerBreaks are the bytes a real value must not hold to go into a header.
+const headerBreaks = "\r\n\x00"
+
 // Header swaps stand-ins in a header value, inserting real values as is.
-// The result is at most limit bytes.
+// The result is at most limit bytes. A swap that would insert a real value
+// holding a line break or NUL is refused, whatever the value already holds.
 func (s *Swapper) Header(value string, limit int) (string, bool, error) {
 	out, changed, err := replace(s.literal, value, limit)
 	if err != nil || !changed {
 		return value, false, err
 	}
-	if strings.ContainsAny(out, "\r\n\x00") && !strings.ContainsAny(value, "\r\n\x00") {
+	// unsafeHeader matches the same stand-ins at the same places as literal
+	// and drops only the unsafe ones, so the value shrinks when one is there.
+	if s.unsafeHeader != nil && len(s.unsafeHeader.Replace(value)) != len(value) {
 		return value, false, ErrUnsafeHeader
 	}
 	return out, true, nil

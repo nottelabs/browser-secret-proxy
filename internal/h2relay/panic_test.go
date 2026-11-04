@@ -1,13 +1,11 @@
 package h2relay
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,23 +54,6 @@ func (h panicHandler) Handle(ctx context.Context, rec slog.Record) error {
 		panic(panicValue)
 	}
 	return h.Handler.Handle(ctx, rec)
-}
-
-type logBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *logBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *logBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }
 
 // panicking is a harness whose relay connections can be made to panic, and

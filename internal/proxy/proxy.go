@@ -198,7 +198,7 @@ func (s *Server) handle(conn net.Conn) {
 			writeStatus(conn, http.StatusRequestHeaderFieldsTooLarge, "proxy request head too large\n")
 			return
 		}
-		log.Debug("could not read a proxy request", "error", err)
+		log.Debug("could not read a proxy request", "reason", readFailure(err))
 		return
 	}
 	limited.disable() // what follows is tunneled or TLS, not a request head
@@ -329,6 +329,22 @@ func (l *headLimiter) Read(p []byte) (int, error) {
 }
 
 func (l *headLimiter) disable() { l.off = true }
+
+// readFailure names why a proxy request head could not be read. The error
+// itself is not logged: it quotes the offending line, which can be the
+// client's Proxy-Authorization.
+func readFailure(err error) string {
+	var netErr net.Error
+	switch {
+	case errors.Is(err, io.EOF):
+		return "closed before a request"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "closed during the request head"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	}
+	return "malformed request head"
+}
 
 // ReplayError is a ClientHello that cannot be copied exactly.
 type ReplayError struct{ Reason string }

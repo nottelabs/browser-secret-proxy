@@ -2,14 +2,12 @@ package h1relay
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,23 +38,6 @@ func (c *panicConn) Write(b []byte) (int, error) {
 		panic(panicValue)
 	}
 	return c.Conn.Write(b)
-}
-
-type logBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *logBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *logBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }
 
 // A panic on either of the relay's goroutines ends that connection only:
