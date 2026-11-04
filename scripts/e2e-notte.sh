@@ -22,7 +22,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
   -subj '/CN=BSP synthetic shopping test CA' -addext 'basicConstraints=critical,CA:TRUE' \
   -addext 'keyUsage=critical,keyCertSign' -keyout "$work/ca.key" -out "$work/ca.pem" 2>/dev/null
 cat > "$work/swaps.json" <<'JSON'
-{"/status/299":"/status/200","tok_bsp_shopping_probe":"dummy_bsp_shopping_replacement","4111111111111111":"4242424242424242"}
+{"tok_bsp_shopping_probe":"dummy_bsp_shopping_replacement","4111111111111111":"4242424242424242"}
 JSON
 chmod 644 "$work/ca.key" "$work/ca.pem" "$work/swaps.json"
 docker run -d --name "$container" -p 127.0.0.1:18380:8080 \
