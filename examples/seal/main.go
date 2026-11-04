@@ -76,9 +76,18 @@ func run(args []string, stdout io.Writer) error {
 	if len(payload.Values) == 0 {
 		return fmt.Errorf("%s: no values", flags.Arg(0))
 	}
+	for standIn := range payload.Values {
+		if standIn == "" {
+			return fmt.Errorf("%s: an empty stand-in", flags.Arg(0))
+		}
+	}
 	now := time.Now()
 	if payload.Exp == 0 {
 		payload.Exp = now.Add(*ttl).Unix()
+	}
+	// The proxy refuses such tokens; say so now rather than at first use.
+	if !now.Before(time.Unix(payload.Exp, 0)) {
+		return errors.New("the token would already be expired: give a positive -ttl or a future exp")
 	}
 	payload.Aud = jwt.Audience{*audience}
 	payload.Iat = now.Unix()

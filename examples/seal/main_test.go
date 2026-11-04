@@ -67,6 +67,18 @@ func TestSealedTokenOpensInTheProxy(t *testing.T) {
 	if err := run([]string{payload}, &out); err == nil {
 		t.Fatal("ran without a public key")
 	}
+	for name, c := range map[string]struct{ payload, ttl string }{
+		"empty stand-in": {`{"values": {"": "real_a"}}`, "10m"},
+		"negative ttl":   {`{"values": {"tok_a": "real_a"}}`, "-1m"},
+		"past exp":       {`{"values": {"tok_a": "real_a"}, "exp": 1}`, "10m"},
+	} {
+		if err := os.WriteFile(payload, []byte(c.payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := run([]string{"-public-key", pub, "-issuer-key", issuer, "-audience", "proxy-1", "-ttl", c.ttl, payload}, &out); err == nil {
+			t.Errorf("%s: sealed a token the proxy would refuse", name)
+		}
+	}
 	if err := run([]string{"-public-key", pub, "-audience", "proxy-1", payload}, &out); err == nil {
 		t.Fatal("ran without an issuer key")
 	}
