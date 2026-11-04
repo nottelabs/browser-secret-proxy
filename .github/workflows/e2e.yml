@@ -1,0 +1,54 @@
+name: E2E
+
+# Runs the proxy image against Notte staging: a real browser session sends one
+# host through the proxy, exposed on a public address with an ngrok TCP tunnel, and
+# the job checks that host receives the real value (scripts/e2e-notte.sh).
+#
+# Needs the NOTTE_API_KEY (a staging key) and NGROK_AUTHTOKEN repository
+# secrets. Pull requests from forks get no secrets, so the job skips them.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # ngrok's static binary, copied out of its image pinned by digest.
+  NGROK_IMAGE: ngrok/ngrok:3.39.12-debian@sha256:2658b5ad05e1111e3ff07caa38d2eea742407b8de9a5978b88b87516debc0d2f
+
+jobs:
+  staging:
+    name: swap through a Notte staging session
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the image
+        run: make docker
+      - name: Install ngrok
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          container="$(docker create --platform linux/amd64 "$NGROK_IMAGE")"
+          docker cp -L "$container:/bin/ngrok" "$RUNNER_TEMP/bin/ngrok"
+          docker rm "$container" >/dev/null
+          "$RUNNER_TEMP/bin/ngrok" version
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Run against staging
+        env:
+          NOTTE_API_KEY: ${{ secrets.NOTTE_API_KEY }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          NOTTE_API_URL: https://us-staging.notte.cc
+        run: scripts/e2e-notte.sh
