@@ -109,7 +109,7 @@ func newRawHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *har
 		_ = clientTest.Close()
 		_ = serverTest.Close()
 		select {
-		case <-h.done:
+		case <-h.done: //nolint:errcheck // only waits for the relay to stop
 		case <-time.After(waitFor):
 			t.Error("relay did not stop")
 		}
@@ -603,7 +603,7 @@ func TestStreamWindowViolationClosesTheConnection(t *testing.T) {
 	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 	_, _ = h.client.Write(encodeFrames([]Frame{{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("x"), 200)}}))
 	h.expect(h.toClient, "client", isGoAway(errCodeFlowControl))
-	if err := h.result(); err != errFlowControl {
+	if err := h.result(); !errors.Is(err, errFlowControl) {
 		t.Fatalf("relay error %v, want %v", err, errFlowControl)
 	}
 }
@@ -619,7 +619,7 @@ func TestConnectionWindowViolationClosesTheConnection(t *testing.T) {
 	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 	_, _ = h.client.Write(encodeFrames([]Frame{{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("x"), 70000)}}))
 	h.expect(h.toClient, "client", isGoAway(errCodeFlowControl))
-	if err := h.result(); err != errFlowControl {
+	if err := h.result(); !errors.Is(err, errFlowControl) {
 		t.Fatalf("relay error %v, want %v", err, errFlowControl)
 	}
 }
@@ -1197,7 +1197,7 @@ func TestSilentServerTimesOut(t *testing.T) {
 	h := newRawHarness(t, func(o *Options) { o.PrefaceTimeout = 100 * time.Millisecond }, nil)
 	h.clientSend(Frame{Type: FrameSettings})
 	checkFailurePreface(t, h.drainClient(), errCodeInternal)
-	if err := h.result(); err != errNoServerPreface {
+	if err := h.result(); !errors.Is(err, errNoServerPreface) {
 		t.Fatalf("relay error %v, want %v", err, errNoServerPreface)
 	}
 }
@@ -1226,7 +1226,7 @@ func TestHeldFramesAreBounded(t *testing.T) {
 			break
 		}
 	}
-	if err := h.result(); err != errHeldFrames {
+	if err := h.result(); !errors.Is(err, errHeldFrames) {
 		t.Fatalf("relay error %v, want %v", err, errHeldFrames)
 	}
 	frames := h.drainClient()
