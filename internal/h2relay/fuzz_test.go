@@ -79,6 +79,7 @@ func FuzzFramePayloads(f *testing.F) {
 	f.Add(FlagPriority, []byte{0, 0, 0, 3, 15})
 	f.Add(FlagPadded, []byte{9})
 	f.Add(uint8(0), []byte{0, 1, 0, 1, 0, 0, 0, 5, 0, 0, 0x40, 0, 0, 1, 0, 0, 0, 0})
+	f.Add(uint8(0), []byte{0, 1, 0, 1, 0, 0, 0, 8, 0, 0, 0, 1, 0, 4, 0, 1, 0, 0})
 	f.Fuzz(func(t *testing.T, flags uint8, b []byte) {
 		data, err := unpad(flags, b)
 		switch {
@@ -141,20 +142,21 @@ func FuzzFramePayloads(f *testing.F) {
 			t.Fatalf("maxFrameSetting = %d, want %d", got, maxFrame)
 		}
 
-		// The client's copy only lowers SETTINGS_HEADER_TABLE_SIZE.
-		out := clientSettings(b)
-		if len(out) != len(b) {
-			t.Fatalf("clientSettings changed the length: %d to %d", len(b), len(out))
+		// The client's copy keeps every whole setting in order, except that
+		// it lowers SETTINGS_HEADER_TABLE_SIZE to what the relay decodes and
+		// drops SETTINGS_ENABLE_CONNECT_PROTOCOL.
+		var want []byte
+		for i := 0; i+6 <= len(b); i += 6 {
+			switch id, value := binary.BigEndian.Uint16(b[i:]), binary.BigEndian.Uint32(b[i+2:]); {
+			case id == SettingEnableConnectProtocol:
+			case id == SettingHeaderTableSize && value > decoderTableSize:
+				want = binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint16(want, id), decoderTableSize)
+			default:
+				want = append(want, b[i:i+6]...)
+			}
 		}
-		for i := range b {
-			if out[i] == b[i] {
-				continue
-			}
-			start := i - i%6
-			if start+6 > len(b) || binary.BigEndian.Uint16(b[start:]) != SettingHeaderTableSize ||
-				binary.BigEndian.Uint32(b[start+2:]) <= decoderTableSize || binary.BigEndian.Uint32(out[start+2:]) != decoderTableSize {
-				t.Fatalf("clientSettings changed byte %d of %x: %x", i, b, out)
-			}
+		if out := clientSettings(b); !bytes.Equal(out, want) {
+			t.Fatalf("clientSettings(%x) = %x, want %x", b, out, want)
 		}
 	})
 }
