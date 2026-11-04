@@ -281,6 +281,67 @@ func TestHTTPCacheIsPerHost(t *testing.T) {
 	}
 }
 
+// The service decides on the host as the allowlist matches it: in lower
+// case, without a port or a trailing dot. One host is one cache entry
+// however the CONNECT spelled it, and an authority that is not a plain host
+// and port is not sent.
+func TestHTTPSendsTheCanonicalHost(t *testing.T) {
+	d := startDetokenizer(t, answerFrom(map[string]map[string]any{"tok_a": {"real": "real_a"}}))
+	h := newTestHTTP(t, d.config())
+	lookup := func(host string) error {
+		t.Helper()
+		_, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: host, Principal: Principal{ID: "u"}})
+		return err
+	}
+	if err := lookup("API.Example.COM.:443"); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.lastRequest().Host; got != "api.example.com" {
+		t.Fatalf("the service was sent host %q", got)
+	}
+	if err := lookup("api.example.com"); err != nil || d.calls.Load() != 1 {
+		t.Fatalf("another spelling of the host was not answered from the cache: %v, %d calls", err, d.calls.Load())
+	}
+	if err := lookup("[::1]:443"); err != nil || d.lastRequest().Host != "::1" {
+		t.Fatalf("IPv6: %v, host %q", err, d.lastRequest().Host)
+	}
+	for _, host := range []string{"", "api.example.com:443@evil.test", "api.example.com/x"} {
+		if err := lookup(host); err == nil {
+			t.Errorf("host %q was looked up", host)
+		}
+	}
+	if d.calls.Load() != 2 {
+		t.Fatalf("%d calls, want 2", d.calls.Load())
+	}
+}
+
+// An empty host list is not the same as none: the value may go nowhere
+// (the scope refuses it), not wherever -hosts allows. The answer keeps
+// that, from the cache too.
+func TestHTTPKeepsAnEmptyHostList(t *testing.T) {
+	d := startDetokenizer(t, answerFrom(map[string]map[string]any{
+		"tok_a": {"real": "real_a", "hosts": []string{}},
+		"tok_b": {"real": "real_b"},
+		"tok_c": {"real": "real_c", "hosts": nil},
+	}))
+	h := newTestHTTP(t, d.config())
+	for range 2 {
+		res, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a", "tok_b", "tok_c"}, Host: "api.test", Principal: Principal{ID: "u"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a := res.Values["tok_a"].Hosts; a == nil || len(a) != 0 {
+			t.Fatalf("\"hosts\": [] gave %#v", a)
+		}
+		if res.Values["tok_b"].Hosts != nil || res.Values["tok_c"].Hosts != nil {
+			t.Fatal("no host list, or null, gave a host list")
+		}
+	}
+	if d.calls.Load() != 1 {
+		t.Fatalf("%d calls, want 1", d.calls.Load())
+	}
+}
+
 func TestHTTPCacheIsBounded(t *testing.T) {
 	d := startDetokenizer(t, func(req detokenizeRequest, w http.ResponseWriter) {
 		out := map[string]any{}
@@ -293,7 +354,7 @@ func TestHTTPCacheIsBounded(t *testing.T) {
 	cfg.CacheSize = 3
 	h := newTestHTTP(t, cfg)
 	for _, s := range []string{"a", "b", "c", "d", "e"} {
-		if _, err := h.Resolve(context.Background(), Request{StandIns: []string{s}}); err != nil {
+		if _, err := h.Resolve(context.Background(), Request{StandIns: []string{s}, Host: "api.test"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -311,7 +372,7 @@ func TestHTTPCacheCanBeDisabled(t *testing.T) {
 	cfg.CacheTTL = -1
 	h := newTestHTTP(t, cfg)
 	for range 2 {
-		if _, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}}); err != nil {
+		if _, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: "api.test"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -363,7 +424,7 @@ func TestHTTPNullRealIsUnresolved(t *testing.T) {
 		_, _ = w.Write([]byte(`{"values": {"tok_a": {"hosts": ["api.test"]}, "tok_b": {"real": ""}}}`))
 	})
 	h := newTestHTTP(t, d.config())
-	res, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a", "tok_b"}})
+	res, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a", "tok_b"}, Host: "api.test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +447,7 @@ func TestHTTPTimeout(t *testing.T) {
 	cfg.Timeout = 100 * time.Millisecond
 	h := newTestHTTP(t, cfg)
 	start := time.Now()
-	_, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}})
+	_, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: "api.test"})
 	if err == nil {
 		t.Fatal("a stalled service resolved")
 	}
@@ -402,7 +463,7 @@ func TestHTTPHonorsTheCallerContext(t *testing.T) {
 	h := newTestHTTP(t, d.config())
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := h.Resolve(ctx, Request{StandIns: []string{"tok_a"}}); err == nil {
+	if _, err := h.Resolve(ctx, Request{StandIns: []string{"tok_a"}, Host: "api.test"}); err == nil {
 		t.Fatal("a canceled lookup resolved")
 	}
 }
@@ -412,7 +473,7 @@ func TestHTTPBatchLimit(t *testing.T) {
 	cfg := d.config()
 	cfg.MaxBatch = 2
 	h := newTestHTTP(t, cfg)
-	if _, err := h.Resolve(context.Background(), Request{StandIns: []string{"a", "b", "c"}}); err == nil {
+	if _, err := h.Resolve(context.Background(), Request{StandIns: []string{"a", "b", "c"}, Host: "api.test"}); err == nil {
 		t.Fatal("a batch over the limit was sent")
 	}
 	if d.calls.Load() != 0 {
@@ -442,13 +503,13 @@ func TestHTTPRequiresMutualTLS(t *testing.T) {
 	other := newClientPKI(t, t.TempDir(), "stranger")
 	cfg := base
 	cfg.ClientCert, cfg.ClientKey = other.certFile, other.keyFile
-	if _, err := newTestHTTP(t, cfg).Resolve(context.Background(), Request{StandIns: []string{"tok_a"}}); err == nil {
+	if _, err := newTestHTTP(t, cfg).Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: "api.test"}); err == nil {
 		t.Fatal("a client certificate from another CA was accepted")
 	}
 	// The service's certificate must verify against the CA given.
 	cfg = base
 	cfg.CA = ""
-	if _, err := newTestHTTP(t, cfg).Resolve(context.Background(), Request{StandIns: []string{"tok_a"}}); err == nil {
+	if _, err := newTestHTTP(t, cfg).Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: "api.test"}); err == nil {
 		t.Fatal("the service's certificate was not verified")
 	}
 	if d.calls.Load() != 0 {

@@ -51,6 +51,14 @@ First release, planned as 0.1.0.
   `CONNECT` destination, and a request naming another host is refused. A
   request that breaks a scope, or whose lookup fails, is answered `502` and
   not sent.
+- Values' scopes are checked more strictly. An empty `hosts` list from the
+  `http` resolver or in a sealed token refuses the request instead of
+  allowing every host in `-hosts`, and `examples/seal` refuses to seal one.
+  The `http` resolver is sent, and caches by, the `CONNECT` host in lower
+  case without its port or trailing dot. A sealed token whose claims repeat
+  a member or spell a claim in another case (`"HOSTS"`) gets `407`. With
+  masking on, a request carrying more than 1,024 values is refused instead
+  of evicting some of its own values from the masking record.
 - Releases are published only after fmt, vet, lint, the race tests and
   govulncheck pass on the tagged commit, in a job without write or signing
   permissions. The README verifies signatures against the exact identity of

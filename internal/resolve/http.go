@@ -13,9 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 )
 
 // HTTPConfig configures an HTTP resolver.
@@ -53,6 +54,11 @@ type HTTPConfig struct {
 //
 //	200 OK
 //	{"values": {"tok_1": {"real": "...", "hosts": ["api.example.com"], "expires_at": "2026-01-02T15:04:05Z"}}}
+//
+// The host is the CONNECT destination as the allowlist matches it: in lower
+// case, without a port or a trailing dot. "hosts" restricts the value to
+// those hosts; without it, or with null, the value may go to any host in
+// the proxy's allowlist, and an empty list refuses the request.
 //
 // One call covers every stand-in of a request that is not cached. Any other
 // status, a malformed answer or a timeout is an error, and a stand-in left
@@ -165,8 +171,13 @@ func (h *HTTP) Resolve(ctx context.Context, req Request) (Result, error) {
 	if len(req.StandIns) > h.cfg.MaxBatch {
 		return out, fmt.Errorf("%d stand-ins in one request, more than the resolver batch limit of %d", len(req.StandIns), h.cfg.MaxBatch)
 	}
+	// The host as the allowlist matches it, so the service decides, and the
+	// cache keys, on one spelling of it.
+	host := hostmatch.Host(req.Host)
+	if host == "" {
+		return out, errors.New("the request's host is not a plain host name or address")
+	}
 	now := h.cfg.now()
-	host := hostOnly(req.Host)
 	var missing []string
 	h.mu.Lock()
 	for _, s := range req.StandIns {
@@ -279,11 +290,4 @@ func redactURLError(err error) error {
 		return urlErr.Err
 	}
 	return err
-}
-
-func hostOnly(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
-	}
-	return strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 }
