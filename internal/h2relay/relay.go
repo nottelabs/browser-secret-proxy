@@ -1697,16 +1697,30 @@ func (r *relay) serverLoop() error {
 
 // readServerFrame reads the server's next frame. One longer than the client
 // allowed is a connection error: the server gets GOAWAY with
-// FRAME_SIZE_ERROR, and the relay ends.
+// FRAME_SIZE_ERROR when it can, and the relay ends.
 func (r *relay) readServerFrame() (Frame, error) {
 	f, err := readFrame(r.server, r.serverFrames.size)
 	if errors.Is(err, ErrFrameSize) {
-		// Last stream 0: the relay accepts no stream the server opens.
-		payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), errCodeFrameSize)
-		_ = r.writeServer(Frame{Type: FrameGoAway, Payload: payload})
+		r.goAwayServer(errCodeFrameSize)
 		return Frame{}, fmt.Errorf("server: %w", err)
 	}
 	return f, err
+}
+
+// goAwayServer tells the server with GOAWAY that the connection ends for
+// code, without ever holding up the relay's end: a write to a server that
+// stopped reading (an upload) may hold serverMu, so the GOAWAY is skipped
+// then, and its own write is bounded in time. The relay closes the
+// connection either way.
+func (r *relay) goAwayServer(code uint32) {
+	if !r.serverMu.TryLock() {
+		return
+	}
+	defer r.serverMu.Unlock()
+	// Last stream 0: the relay accepts no stream the server opens.
+	payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), code)
+	_ = r.server.SetWriteDeadline(time.Now().Add(failureWriteTimeout))
+	_, _ = r.server.Write(encodeFrames([]Frame{{Type: FrameGoAway, Payload: payload}}))
 }
 
 // serverStreamLocked finds the stream for a server stream ID: an open one,

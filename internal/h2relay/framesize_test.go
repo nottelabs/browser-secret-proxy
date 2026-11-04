@@ -92,6 +92,19 @@ func TestOversizedServerFrameEndsTheConnection(t *testing.T) {
 	}
 }
 
+// A write stuck on a server that stopped reading (an upload) holds serverMu.
+// An oversized frame from that server still ends the relay, without the
+// GOAWAY it cannot be sent.
+func TestOversizedServerFrameEndsTheConnectionWhileAWriteIsStuck(t *testing.T) {
+	h := newHarness(t, nil)
+	h.r.serverMu.Lock() // the stuck write
+	defer h.r.serverMu.Unlock()
+	h.sendRaw(h.server, unknownFrame(defaultMaxFrame+1))
+	if err := h.result(); !errors.Is(err, ErrFrameSize) {
+		t.Fatalf("relay error %v, want %v", err, ErrFrameSize)
+	}
+}
+
 // The server's limit follows the client's SETTINGS the same way.
 func TestServerFrameSizeFollowsTheClientsSettings(t *testing.T) {
 	h := newHarness(t, nil)
