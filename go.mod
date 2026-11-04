@@ -3,7 +3,7 @@ module github.com/nottelabs/browser-secret-proxy
 go 1.26.0
 
 require (
-	github.com/andybalholm/brotli v1.0.6
+	github.com/andybalholm/brotli v1.2.7
 	github.com/go-jose/go-jose/v4 v4.1.8
 	github.com/klauspost/compress v1.18.7
 	github.com/refraction-networking/utls v1.8.2
