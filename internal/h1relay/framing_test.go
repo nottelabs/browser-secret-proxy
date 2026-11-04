@@ -214,6 +214,10 @@ func TestUnclearResponseHeadsAreAnswered502(t *testing.T) {
 		"a CR before the empty line":           "HTTP/1.1 200 OK\r\nX-A: a\r\nContent-Length: 2\r\n\r",
 		"a bare CR in the status line":         "HTTP/1.1 200 OK\rTransfer-Encoding: chunked\r\nContent-Length: 2\r\nX-A: a\r\n",
 		"a NUL in the status line":             "HTTP/1.1 200 OK\x00\r\nX-A: a\r\nContent-Length: 2\r\n",
+		"chunked on HTTP/1.0":                  "HTTP/1.0 200 OK\r\nX-A: a\r\nTransfer-Encoding: chunked\r\n",
+		"chunked on HTTP/0.1 in a 1xx":         "HTTP/0.1 100 \r\nX-A: a\r\nTransfer-Encoding: chunked\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n",
+		"chunked on HTTP/1.2":                  "HTTP/1.2 200 OK\r\nX-A: a\r\nTransfer-Encoding: chunked\r\n",
+		"another coding on HTTP/1.0":           "HTTP/1.0 200 OK\r\nX-A: a\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n",
 	} {
 		for _, masked := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s, masked %t", name, masked), func(t *testing.T) {
@@ -227,6 +231,23 @@ func TestUnclearResponseHeadsAreAnswered502(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// An HTTP/1.0 response without Transfer-Encoding is passed on as it came,
+// masked or not.
+func TestHTTP10ResponsesAreRelayed(t *testing.T) {
+	response := "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"
+	for _, masked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("masked %t", masked), func(t *testing.T) {
+			o := options(t)
+			if masked {
+				o = maskedOptions(t, true)
+			}
+			if got := rawRoundTrip(t, o, "GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n", response); got != response {
+				t.Fatalf("client got %q, want %q", got, response)
+			}
+		})
 	}
 }
 

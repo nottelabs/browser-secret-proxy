@@ -881,9 +881,11 @@ How a masked response changes:
   follows each response's framing to find where the next one, which it may
   mask, begins (RFC 9112): a folded (obs-fold) header line, a header name
   that is not a token (`Name : value`), a line without a colon, a bare CR
-  or NUL in the status line or a header line, or a `Content-Length` that
-  is not a decimal number (only spaces and tabs may surround it). A trailer
-  line like that cuts the response off before any trailer is passed on.
+  or NUL in the status line or a header line, a `Content-Length` that is
+  not a decimal number (only spaces and tabs may surround it), or a
+  `Transfer-Encoding` on a response that is not HTTP/1.1, which a browser
+  ignores and reads the body to the close (RFC 9112 6.1). A trailer line
+  like that cuts the response off before any trailer is passed on.
 - Over HTTP/2, DATA before the final response head (none yet, or only a
   `1xx`), and content in DATA on a response that cannot have any (to a
   `HEAD`, or a `204` or `304`), are malformed (RFC 9113 8.1): the stream is
