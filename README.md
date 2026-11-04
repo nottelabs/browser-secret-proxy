@@ -221,7 +221,7 @@ Your service answers `200` with the values it releases:
 - Leave out any stand-in you do not release for this host or principal. The
   request is then refused, as it is for any other status, a malformed answer,
   a redirect or a timeout (`-resolver-timeout`, 2 seconds by default).
-- Values are cached in memory per principal and stand-in until the earlier
+- Values are cached in memory per principal, host and stand-in until the earlier
   of `expires_at` and `-resolver-cache-ttl` (1 minute by default). Refusals
   and errors are not cached. A request with more than 256 stand-ins is
   refused without a call.
@@ -261,16 +261,22 @@ algorithm is accepted). Its payload carries the values:
 - `sub` (optional) names the principal in logs; the username is used when it
   is empty.
 
-The proxy decrypts the token on every `CONNECT`: that both authenticates the
-client and gives the values, with no lookup and nothing stored. A token that
+The proxy decrypts the token on every `CONNECT`: that both admits the client
+and gives the values, with no lookup and nothing stored. A token that
 does not decrypt with the proxy's key, was altered, or has expired gets `407`.
 The token's own stand-ins are what the proxy looks for, so no pattern is
 needed. To rotate the key, put the new and the old key in the `-sealed-key`
 file until the old tokens have expired.
 
-Whoever holds the public key can seal values for the proxy, and the token is
-as sensitive as the values it carries. Create tokens where the real values
-already are, and give them a short `exp`. For testing,
+A token proves only that it was made for this proxy, not who made it: anyone
+who holds the public key can seal values of their own and use the proxy
+with them on the `-hosts` allowlist. That gives them nothing they did not
+already have (a token cannot reveal another token's values), but it is
+access to the proxy, so share the public key only with the systems that
+create tokens and restrict who can reach the proxy (see
+[Exposing the proxy](#exposing-the-proxy)). The token is as sensitive as the
+values it carries: create tokens where the real values already are, and give
+them a short `exp`. For testing,
 [`examples/seal`](examples/seal) seals a payload file:
 
 ```sh
@@ -359,7 +365,7 @@ host.
 - **Values are isolated by principal.** The principal is the proxy
   credential of the `CONNECT` (`SECRET_PROXY_USERNAME` or the resolver's own
   credential check). Every request is looked up again for its connection's
-  principal. The `http` resolver's cache is keyed by principal and stand-in,
+  principal. The `http` resolver's cache is keyed by principal, host and stand-in,
   and the other modes keep no cache of their own, so a value looked up for
   one principal is never used for another.
 
