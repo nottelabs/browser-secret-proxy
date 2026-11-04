@@ -27,7 +27,7 @@ GORELEASER    ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 .DEFAULT_GOAL := build
-.PHONY: help build test race vet lint vuln fmt fmt-check check docker cross snapshot release-notes release-check clean
+.PHONY: help build test race fuzz vet lint vuln fmt fmt-check check docker cross snapshot release-notes release-check clean
 
 help: ## List targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -40,6 +40,18 @@ test: ## Run the tests
 
 race: ## Run the tests with the race detector
 	CGO_ENABLED=1 go test -race -count=1 ./...
+
+# How long `make fuzz` runs each fuzz target.
+FUZZTIME ?= 20s
+
+fuzz: ## Run each fuzz target for FUZZTIME (default 20s)
+	@for file in $$(grep -rl --include='*_test.go' '^func Fuzz' cmd internal | sort); do \
+	  dir=./$$(dirname $$file); \
+	  for target in $$(sed -n 's/^func \(Fuzz[A-Za-z0-9_]*\)(.*/\1/p' $$file); do \
+	    echo "fuzzing $$target in $$dir"; \
+	    go test -run='^$$' -fuzz="^$$target\$$" -fuzztime=$(FUZZTIME) $$dir || exit 1; \
+	  done; \
+	done
 
 vet: ## Run go vet
 	go vet ./...

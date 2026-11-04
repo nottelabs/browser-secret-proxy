@@ -16,6 +16,9 @@ First release, planned as 0.1.0.
 - Forward proxy that decrypts traffic to allowlisted hosts with a CA you
   provide and replaces stand-in values with real ones in request headers,
   query strings and bodies.
+- Fuzz targets for the HTTP/1.1 and HTTP/2 parsers and relays, JSON-string
+  escaping, stand-in matching, content decoding and host matching, run by
+  `make fuzz` and briefly on every pull request.
 - Plain CONNECT tunnels, without decryption, for every other host.
 - HTTP/1.1 header lines that the other side could read differently from
   the proxy are refused. A request with a control character other than a
