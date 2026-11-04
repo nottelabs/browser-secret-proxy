@@ -53,9 +53,25 @@ chmod 600 ca.key
 A short lifetime (30 days here) limits the damage if the key leaks. Rotate it
 before it expires.
 
-### 2. List the stand-ins
+### 2. Choose where real values come from
 
-`swaps.json` maps each stand-in to its real value:
+The proxy looks up the real value of each stand-in it finds. Where it looks
+is the resolver, set with `-resolver`:
+
+- `file` (the default): a JSON file next to the proxy. Use it for quick tests,
+  or when a secret manager can write the file for you (Vault Agent
+  templates, the Kubernetes Secrets Store CSI driver).
+- `http`: a detokenize service you run, called over mutual TLS. Use it when
+  your values already live in a vault or tokenization service with an API.
+- `sealed`: the values travel in the proxy password, signed by your issuer
+  and encrypted to the proxy. Use it for short-lived, per-session values
+  with no lookup service and no storage.
+
+Each mode is described in full under
+[Production setup](#production-setup-where-real-values-come-from). To try
+one locally:
+
+**file.** `swaps.json` maps each stand-in to its real value:
 
 ```json
 {
@@ -65,10 +81,85 @@ before it expires.
 ```
 
 Pick stand-ins that cannot appear by accident in other traffic. When one
-stand-in contains another, the longer one wins. This file holds your real
-secrets: restrict its permissions (`chmod 600 swaps.json`) and never commit it.
+stand-in contains another, the longer one wins. The proxy reloads the file
+when it changes. It holds your real secrets: restrict its permissions
+(`chmod 600 swaps.json`) and never commit it. Step 3 runs this mode.
+
+**http.** [`examples/http-resolver`](examples/http-resolver) is a reference
+detokenize service. Create a CA that issues its server certificate and the
+proxy's client certificate (OpenSSL 3):
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -subj "/CN=detokenize CA" -keyout resolver-ca.key -out resolver-ca.pem
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,DNS:host.docker.internal" \
+  -CA resolver-ca.pem -CAkey resolver-ca.key \
+  -keyout service.key -out service.pem
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -subj "/CN=browser-secret-proxy" \
+  -CA resolver-ca.pem -CAkey resolver-ca.key \
+  -keyout proxy-client.key -out proxy-client.pem
+```
+
+Give the service its values in `values.json`, as a plain string or with the
+hosts a value may go to:
+
+```json
+{
+  "tok_standin_123": "<real API token>",
+  "tok_card_1": {"real": "<real card number>", "hosts": ["api.payments.example"]}
+}
+```
+
+```sh
+go run ./examples/http-resolver -cert service.pem -key service.key \
+  -client-ca resolver-ca.pem -values values.json
+```
+
+In step 3, replace `-swaps swaps.json` with:
+
+```sh
+  -resolver http -resolver-url https://localhost:8443/v1/detokenize \
+  -resolver-cert proxy-client.pem -resolver-key proxy-client.key \
+  -resolver-ca resolver-ca.pem -standin-prefixes tok_
+```
+
+The proxy does not know this mode's stand-ins in advance, so
+`-standin-prefixes` or `-standin-pattern` tells it what to look up (see
+[Finding stand-ins](#finding-stand-ins)).
+
+**sealed.** Create the proxy's key pair and an issuer key pair with the
+`openssl` commands under [sealed](#sealed). Put the values in
+`payload.json`:
+
+```json
+{"values": {"tok_standin_123": "<real API token>"}, "hosts": ["api.example.com"], "sub": "session-42"}
+```
+
+Then sign and seal it into a token that expires in one hour:
+
+```sh
+go run ./examples/seal -public-key sealed-public.pem -issuer-key issuer.key \
+  -audience proxy-eu-1 -ttl 1h payload.json > token.txt
+```
+
+In step 3, replace `-swaps swaps.json` with:
+
+```sh
+  -resolver sealed -sealed-key sealed.key \
+  -sealed-issuer-key issuer-public.pem -sealed-audience proxy-eu-1
+```
+
+The client sends the token as its proxy password. Do not set
+`SECRET_PROXY_USERNAME` or `SECRET_PROXY_PASSWORD` in this mode.
 
 ### 3. Run the proxy
+
+These commands use the `file` mode. For `http` or `sealed`, replace
+`-swaps swaps.json` with that mode's flags from step 2 (with Docker, mount
+that mode's files instead of `swaps.json`, and drop the `-e` credentials in
+`sealed` mode).
 
 From source:
 
@@ -98,6 +189,17 @@ docker run --rm -p 8080:8080 \
 
 The image runs as UID 65532, so mounted files must be readable by that user.
 
+In `http` mode, `localhost` inside the container is the container itself,
+so the proxy cannot reach a resolver running on your machine at
+`localhost:8443`:
+
+- Docker Desktop and OrbStack: use
+  `-resolver-url https://host.docker.internal:8443/v1/detokenize`. The
+  service certificate from step 2 already lists `host.docker.internal`.
+- Linux: run the container with `--network host` (drop `-p 8080:8080` and
+  add `-listen 127.0.0.1:8080`), so `https://localhost:8443` works as in
+  step 2.
+
 ### 4. Try it locally
 
 Point a Chromium-based browser at the proxy, for example
@@ -114,6 +216,15 @@ Or check a single request with curl:
 curl --proxy http://127.0.0.1:8080 --cacert ca.pem \
   "https://api.example.com/echo?token=tok_standin_123"
 ```
+
+With proxy authentication on, add `--proxy-user proxy-user:change-me`. In
+`sealed` mode, send the token as the password:
+`--proxy-user "session:$(cat token.txt)"`.
+
+An echo endpoint shows the stand-in, not the real value: response masking
+(on by default) replaces the value on the way back. The proxy's log line
+`swapped stand-ins` confirms the swap, and `-mask-responses=false` shows the
+real value in the echo.
 
 ## Configuration
 
@@ -137,10 +248,13 @@ curl --proxy http://127.0.0.1:8080 --cacert ca.pem \
 | `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
 | `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
 | `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
-| `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty. Not used in `sealed` mode, where the sealed password authenticates each client. |
+| `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
 | `-version` | Print the version and exit. |
+
+A mode's flags cannot be combined with another `-resolver`: the proxy then
+refuses to start.
 
 The process stops on `SIGINT` or `SIGTERM`: it closes open connections, then
 waits at most 10 seconds for them to finish.
@@ -183,7 +297,7 @@ browser-secret-proxy -ca-cert ca.pem -ca-key ca.key -hosts api.example.com \
 ```
 
 The file maps each stand-in to its real value, as in the
-[quick start](#2-list-the-stand-ins). The proxy checks it every
+[quick start](#2-choose-where-real-values-come-from). The proxy checks it every
 `-swaps-reload` (2 seconds by default) and, when its content changed,
 replaces the whole map in one step: a request uses either the old values or
 the new ones, never a mix. Both rewrites in place and symlink swaps (how
@@ -361,7 +475,7 @@ in the entry go through your proxy; every other host keeps using the exit.
       "type": "secret",
       "server": "https://browser-secret-proxy.example.com:8443",
       "username": "proxy-user",
-      "password": "<the SECRET_PROXY_PASSWORD value>",
+      "password": "<the SECRET_PROXY_PASSWORD value, or a sealed token>",
       "hosts": ["api.example.com", "*.payments.example"],
       "ca_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
     }
@@ -371,6 +485,8 @@ in the entry go through your proxy; every other host keeps using the exit.
 
 - `hosts` should match the proxy's `-hosts` list. A host in the entry but not
   in `-hosts` is tunneled without swaps.
+- In `sealed` mode, `password` is the session's sealed token. `username` is
+  then free: it names the principal when the token has no `sub`.
 - `ca_certificate` is the PEM of `ca.pem`, never the key. The session's
   browser trusts it. If the proxy's own `https://` endpoint uses a
   certificate from a private CA, include that CA in the bundle too.
