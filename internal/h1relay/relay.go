@@ -220,18 +220,16 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 				break
 			}
 			remaining -= len(line)
-			name, value, ok := strings.Cut(line, ":")
-			if !ok {
-				return fmt.Errorf("malformed header line")
-			}
+			// A line without a colon or otherwise malformed is refused by
+			// framing below.
+			name, value, _ := strings.Cut(line, ":")
 			headers = append(headers, header{raw: line, name: strings.ToLower(strings.TrimSpace(name)), value: strings.TrimSpace(value)})
 		}
 		head.stop()
 
 		host, contentType := "", ""
 		hosts := 0
-		chunked, upgrade, expectContinue := false, false, false
-		contentLength := -1
+		upgrade, expectContinue := false, false
 		for _, h := range headers {
 			switch h.name {
 			case "host":
@@ -239,19 +237,19 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 				hosts++
 			case "content-type":
 				contentType = h.value
-			case "transfer-encoding":
-				chunked = strings.Contains(strings.ToLower(h.value), "chunked")
-			case "content-length":
-				n, err := strconv.Atoi(h.value)
-				if err != nil || n < 0 {
-					return fmt.Errorf("invalid content-length")
-				}
-				contentLength = n
 			case "upgrade":
 				upgrade = true
 			case "expect":
 				expectContinue = strings.EqualFold(h.value, "100-continue")
 			}
+		}
+		// The body is framed as the server will frame it, and the head is
+		// split into the lines the server will see, or the request is
+		// refused: otherwise bytes swapped here as body could reach the
+		// server as another request, whose Host was never checked.
+		chunked, contentLength, err := framing(requestLine, parts[2], headers)
+		if err != nil {
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: %w", scope.ErrRefused, err))
 		}
 		// Every request goes to the CONNECT host: one naming another host is
 		// refused, so no value scoped to that host goes with it. A server
@@ -350,7 +348,7 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 					swapped++
 				}
 			}
-			if h.name == "content-length" && !chunked && bodyChanged {
+			if h.name == "content-length" && bodyChanged {
 				colon := strings.IndexByte(line, ':')
 				spacing := line[colon+1 : colon+1+len(line[colon+1:])-len(strings.TrimLeft(line[colon+1:], " \t"))]
 				line = line[:colon+1] + spacing + strconv.Itoa(len(body))
@@ -552,6 +550,123 @@ func readBody(r io.Reader, n int) ([]byte, error) {
 		}
 	}
 	return body, nil
+}
+
+// framing checks a request head that a server could read differently from
+// the relay, and returns how its body is framed: chunked, or its
+// Content-Length (-1 when absent). It refuses, as RFC 9112 allows or
+// requires (2.2, 5, 6.1, 6.3): a bare CR or a NUL in any line, a folded
+// (obs-fold) header line, a header name that is not a token (such as one
+// with a space before the colon), Transfer-Encoding with Content-Length,
+// Transfer-Encoding other than a single chunked or on a request that is not
+// HTTP/1.1, and more than one Content-Length or one that is not a decimal
+// number.
+func framing(requestLine, version string, headers []header) (chunked bool, contentLength int, err error) {
+	contentLength = -1
+	if strings.ContainsAny(requestLine, "\r\x00") {
+		return false, 0, errors.New("a bare CR or NUL in the request line")
+	}
+	encodings, lengths := 0, 0
+	for _, h := range headers {
+		if err := checkFieldLine(h.raw); err != nil {
+			return false, 0, err
+		}
+		// Only SP and HTAB are whitespace around a value (RFC 9110 5.6.3).
+		// h.value is trimmed of more, such as VT and FF, which a server may
+		// keep: "chunked\v" is then not chunked to it.
+		_, value, _ := strings.Cut(h.raw, ":")
+		value = strings.Trim(value, " \t")
+		switch h.name {
+		case "transfer-encoding":
+			encodings++
+			chunked = isChunked(value)
+		case "content-length":
+			lengths++
+			if !isDigits(value) {
+				return false, 0, errors.New("an invalid Content-Length")
+			}
+			if contentLength, err = strconv.Atoi(value); err != nil {
+				return false, 0, errors.New("an invalid Content-Length")
+			}
+		}
+	}
+	switch {
+	case encodings > 0 && lengths > 0:
+		return false, 0, errors.New("both Transfer-Encoding and Content-Length")
+	case encodings > 1 || encodings == 1 && !chunked:
+		return false, 0, errors.New("a Transfer-Encoding other than a single chunked")
+	case chunked && version != "HTTP/1.1":
+		return false, 0, errors.New("Transfer-Encoding on a request that is not HTTP/1.1")
+	case lengths > 1:
+		return false, 0, errors.New("more than one Content-Length")
+	}
+	return chunked, contentLength, nil
+}
+
+// checkFieldLine refuses a header or trailer line that a server could split
+// or unfold into other lines than the relay reads, or whose name it could
+// read as another: a bare CR or a NUL, a folded (obs-fold) line, and a name
+// that is not a token.
+func checkFieldLine(line string) error {
+	if strings.ContainsAny(line, "\r\x00") {
+		return errors.New("a bare CR or NUL in a header line")
+	}
+	if line != "" && (line[0] == ' ' || line[0] == '\t') {
+		return errors.New("a folded header line")
+	}
+	name, _, ok := strings.Cut(line, ":")
+	if !ok || !isToken(name) {
+		return errors.New("a malformed header name")
+	}
+	return nil
+}
+
+// isToken reports whether s is an RFC 9110 5.6.2 token, the syntax of a
+// header name.
+func isToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !isTchar(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isTchar(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
+}
+
+// isChunked reports whether s is the coding name chunked, in any ASCII case
+// (RFC 9112 7). strings.EqualFold is not used: it also folds non-ASCII
+// letters, such as the Kelvin sign to k.
+func isChunked(s string) bool {
+	const name = "chunked"
+	if len(s) != len(name) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i]|0x20 != name[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isDigits reports whether s is one or more ASCII digits, the syntax of a
+// Content-Length.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // swappableText is the text of a request that stand-ins are swapped in,
@@ -845,6 +960,9 @@ func readChunked(br *bufio.Reader, limit int) ([]byte, []byte, error) {
 		}
 		if line == "" {
 			return body.Bytes(), trailer.Bytes(), nil
+		}
+		if err := checkFieldLine(line); err != nil {
+			return nil, nil, fmt.Errorf("malformed trailer line: %w", err)
 		}
 		trailer.WriteString(line + "\r\n")
 	}

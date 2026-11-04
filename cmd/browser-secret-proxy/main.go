@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -33,60 +34,54 @@ func main() {
 }
 
 func run() error {
-	listen := flag.String("listen", "127.0.0.1:8080", "address to listen on")
-	caCert := flag.String("ca-cert", "", "PEM CA certificate used to issue leaf certificates (required)")
-	caKey := flag.String("ca-key", "", "PEM private key of the CA (required)")
-	hosts := flag.String("hosts", "", "comma-separated hosts to intercept: exact names or a leading \"*.\" (required)")
-	resolverOpts := registerResolverFlags(flag.CommandLine)
-	parent := flag.String("upstream-proxy", os.Getenv("SECRET_PROXY_UPSTREAM"), "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
-	maskResponses := flag.Bool("mask-responses", true, "replace real values with their stand-ins in responses from allowlisted hosts")
-	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "close a connection after this long without traffic either way (0 never)")
-	headerTimeout := flag.Duration("header-timeout", 10*time.Second, "longest time to receive the CONNECT head, and each HTTP/1.1 request head from its first byte")
-	maxConns := flag.Int("max-conns", 1024, "most client connections handled at once (0 no limit)")
-	verbose := flag.Bool("v", false, "debug logging")
-	showVersion := flag.Bool("version", false, "print the version and exit")
-	flag.Parse()
-	resolverOpts.set = map[string]bool{}
-	flag.Visit(func(f *flag.Flag) { resolverOpts.set[f.Name] = true })
+	fs, opts := newFlagSet(os.Args[0], flag.ExitOnError)
+	_ = fs.Parse(os.Args[1:]) // ExitOnError: a bad flag exits here
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	opts.resolver.set = set
 
-	if *showVersion {
+	if opts.showVersion {
 		fmt.Println(version)
 		return nil
 	}
 
 	level := slog.LevelInfo
-	if *verbose {
+	if opts.verbose {
 		level = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	if *caCert == "" || *caKey == "" || *hosts == "" {
-		flag.Usage()
+	if opts.caCert == "" || opts.caKey == "" || opts.hosts == "" {
+		fs.Usage()
 		return fmt.Errorf("-ca-cert, -ca-key and -hosts are required")
 	}
-	if *idleTimeout < 0 || *headerTimeout <= 0 || *maxConns < 0 {
+	if opts.idleTimeout < 0 || opts.headerTimeout <= 0 || opts.maxConns < 0 {
 		return fmt.Errorf("-idle-timeout and -max-conns cannot be negative, and -header-timeout must be positive")
 	}
-	authority, err := certs.LoadFiles(*caCert, *caKey)
+	authority, err := certs.LoadFiles(opts.caCert, opts.caKey)
 	if err != nil {
 		return err
 	}
-	allow, err := hostmatch.New(strings.Split(*hosts, ","))
+	allow, err := hostmatch.New(strings.Split(opts.hosts, ","))
 	if err != nil {
 		return err
 	}
-	values, err := resolverOpts.build(os.Getenv("SECRET_PROXY_USERNAME"), logger)
+	values, err := opts.resolver.build(os.Getenv("SECRET_PROXY_USERNAME"), logger)
 	if err != nil {
 		return err
 	}
 	if values.close != nil {
 		defer values.close()
 	}
-	var parentURL *url.URL
-	if *parent != "" {
-		if parentURL, err = url.Parse(*parent); err != nil {
-			return fmt.Errorf("upstream proxy: %w", err)
-		}
+	// The variable is read here, not as the flag's default: the usage text
+	// prints defaults, and this one carries credentials.
+	parent := opts.parent
+	if !set["upstream-proxy"] {
+		parent = os.Getenv("SECRET_PROXY_UPSTREAM")
+	}
+	parentURL, err := parseParent(parent)
+	if err != nil {
+		return err
 	}
 	dialer, err := upstream.New(parentURL, nil, nil)
 	if err != nil {
@@ -104,22 +99,22 @@ func run() error {
 		Password:       os.Getenv("SECRET_PROXY_PASSWORD"),
 		Logger:         logger,
 		// Real values in responses are replaced by their stand-ins.
-		MaskResponses: *maskResponses,
-		HeaderTimeout: *headerTimeout,
-		IdleTimeout:   *idleTimeout,
-		MaxConns:      *maxConns,
+		MaskResponses: opts.maskResponses,
+		HeaderTimeout: opts.headerTimeout,
+		IdleTimeout:   opts.idleTimeout,
+		MaxConns:      opts.maxConns,
 	})
 	if err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp", *listen)
+	ln, err := net.Listen("tcp", opts.listen)
 	if err != nil {
 		return err
 	}
 	parentDescription := describeParent(parentURL)
-	attrs := append([]any{"address", ln.Addr().String(), "hosts", *hosts}, values.logAttrs...)
+	attrs := append([]any{"address", ln.Addr().String(), "hosts", opts.hosts}, values.logAttrs...)
 	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed",
-		"mask_responses", *maskResponses, "idle_timeout", idleTimeout.String(), "max_conns", *maxConns)
+		"mask_responses", opts.maskResponses, "idle_timeout", opts.idleTimeout.String(), "max_conns", opts.maxConns)
 	logger.Info("listening", attrs...)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -145,4 +140,80 @@ func describeParent(u *url.URL) string {
 		return "none"
 	}
 	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+}
+
+// options are the command-line flags.
+type options struct {
+	listen, caCert, caKey, hosts, parent string
+	resolver                             *resolverFlags
+	maskResponses, verbose, showVersion  bool
+	idleTimeout, headerTimeout           time.Duration
+	maxConns                             int
+}
+
+// newFlagSet defines the command line. No default comes from the
+// environment: the usage text prints every default, and the environment
+// holds credentials.
+func newFlagSet(name string, handling flag.ErrorHandling) (*flag.FlagSet, *options) {
+	fs := flag.NewFlagSet(name, handling)
+	o := &options{}
+	fs.StringVar(&o.listen, "listen", "127.0.0.1:8080", "address to listen on")
+	fs.StringVar(&o.caCert, "ca-cert", "", "PEM CA certificate used to issue leaf certificates (required)")
+	fs.StringVar(&o.caKey, "ca-key", "", "PEM private key of the CA (required)")
+	fs.StringVar(&o.hosts, "hosts", "", "comma-separated hosts to intercept: exact names or a leading \"*.\" (required)")
+	o.resolver = registerResolverFlags(fs)
+	fs.StringVar(&o.parent, "upstream-proxy", "", "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
+	fs.BoolVar(&o.maskResponses, "mask-responses", true, "replace real values with their stand-ins in responses from allowlisted hosts")
+	fs.DurationVar(&o.idleTimeout, "idle-timeout", 5*time.Minute, "close a connection after this long without traffic either way (0 never)")
+	fs.DurationVar(&o.headerTimeout, "header-timeout", 10*time.Second, "longest time to receive the CONNECT head, and each HTTP/1.1 request head from its first byte")
+	fs.IntVar(&o.maxConns, "max-conns", 1024, "most client connections handled at once (0 no limit)")
+	fs.BoolVar(&o.verbose, "v", false, "debug logging")
+	fs.BoolVar(&o.showVersion, "version", false, "print the version and exit")
+	fs.Usage = func() {
+		out := fs.Output()
+		_, _ = fmt.Fprintf(out, "Usage of %s:\n", fs.Name())
+		fs.PrintDefaults()
+		_, _ = fmt.Fprint(out, usageEnvironment)
+	}
+	return fs, o
+}
+
+// usageEnvironment ends the usage text. It names the variables, never their
+// values.
+const usageEnvironment = `
+Environment:
+  SECRET_PROXY_USERNAME, SECRET_PROXY_PASSWORD
+    	Basic credentials every CONNECT must carry; authentication is off
+    	when SECRET_PROXY_USERNAME is empty (not used with -resolver sealed)
+  SECRET_PROXY_UPSTREAM
+    	parent proxy URL, used when -upstream-proxy is not given
+`
+
+// parseParent parses the parent proxy URL; an empty one is no parent. Its
+// errors never quote the URL, as url.Parse's do, credentials included.
+func parseParent(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		if strings.Contains(raw, "@") {
+			// The cause can quote part of the password: an invalid escape,
+			// or a "port" that is the start of it.
+			return nil, errors.New("upstream proxy: the URL does not parse; percent-encode special characters in its user and password")
+		}
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return nil, fmt.Errorf("upstream proxy: the URL does not parse: %w", err)
+	}
+	// A "/", "?" or "#" in an unencoded password ends the host early: the
+	// rest would parse as a path, query or fragment, and the user and the
+	// start of the password as the host, which logs name. A missing scheme
+	// leaves the credentials opaque.
+	if u.Opaque != "" || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, errors.New("upstream proxy: want scheme://[user:password@]host:port with nothing after the port; percent-encode special characters in the user and password")
+	}
+	return u, nil
 }
