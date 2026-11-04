@@ -1707,20 +1707,31 @@ func (r *relay) readServerFrame() (Frame, error) {
 	return f, err
 }
 
+// goAwayWait bounds how long the relay waits to tell the server with GOAWAY
+// that the connection ends, lock and write included.
+const goAwayWait = time.Second
+
 // goAwayServer tells the server with GOAWAY that the connection ends for
-// code, without ever holding up the relay's end: a write to a server that
-// stopped reading (an upload) may hold serverMu, so the GOAWAY is skipped
-// then, and its own write is bounded in time. The relay closes the
-// connection either way.
+// code, waiting at most goAwayWait: a write to a server that stopped reading
+// (an upload) may hold serverMu, and must not keep the relay from ending.
+// Other writes hold serverMu only briefly, so the GOAWAY still goes out
+// after them. The relay closes the connection either way, which ends a
+// write still waiting.
 func (r *relay) goAwayServer(code uint32) {
-	if !r.serverMu.TryLock() {
-		return
-	}
-	defer r.serverMu.Unlock()
 	// Last stream 0: the relay accepts no stream the server opens.
 	payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), code)
-	_ = r.server.SetWriteDeadline(time.Now().Add(failureWriteTimeout))
-	_, _ = r.server.Write(encodeFrames([]Frame{{Type: FrameGoAway, Payload: payload}}))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.serverMu.Lock()
+		defer r.serverMu.Unlock()
+		_ = r.server.SetWriteDeadline(time.Now().Add(goAwayWait))
+		_, _ = r.server.Write(encodeFrames([]Frame{{Type: FrameGoAway, Payload: payload}}))
+	}()
+	select {
+	case <-done:
+	case <-time.After(goAwayWait):
+	}
 }
 
 // serverStreamLocked finds the stream for a server stream ID: an open one,
