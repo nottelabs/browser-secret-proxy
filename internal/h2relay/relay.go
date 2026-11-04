@@ -2204,7 +2204,6 @@ func (r *relay) onServerSettings(payload []byte) error {
 		}
 	}
 	r.mu.Lock()
-	r.settingsSentLocked(time.Now())
 	r.unackedInitial = append(r.unackedInitial, initial)
 	r.unackedTable = append(r.unackedTable, table)
 	r.maxInitialSent = max(r.maxInitialSent, initial)
@@ -2217,11 +2216,6 @@ func (r *relay) onServerSettings(payload []byte) error {
 	r.setClientInitialLocked(r.possibleInitialLocked())
 	topUp := r.topUpBufferingLocked()
 	r.mu.Unlock()
-	if len(topUp) > 0 {
-		if err := r.writeClient(topUp...); err != nil {
-			return err
-		}
-	}
 	for _, s := range settings {
 		switch s.ID {
 		case SettingHeaderTableSize:
@@ -2259,6 +2253,18 @@ func (r *relay) onServerSettings(payload []byte) error {
 			r.maxFrame = int(s.Value)
 			r.mu.Unlock()
 		}
+	}
+	// The ACK clock starts only now, as forwarding begins: the serverMu wait
+	// above lasts as long as an upload's write to a destination that is slow
+	// to read, which is no fault of the client. The client cannot
+	// acknowledge the frame before the caller writes it, so no ACK comes
+	// ahead of this record. Writes to the client from here on are timed: a
+	// client that stops reading does not hold the connection.
+	r.mu.Lock()
+	r.settingsSentLocked(time.Now())
+	r.mu.Unlock()
+	if len(topUp) > 0 {
+		return r.writeClient(topUp...)
 	}
 	return nil
 }

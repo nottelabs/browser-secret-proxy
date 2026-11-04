@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/big"
@@ -123,6 +124,42 @@ func TestUnacknowledgedSettingsTimeOut(t *testing.T) {
 		h.expect(h.toClient, "client", isGoAway(errCodeSettingsTimeout))
 		checkEndedAfter(t, h, start, errSettingsTimeout)
 	})
+}
+
+// The SETTINGS ACK clock starts when the relay forwards the frame, not when
+// it reads it. A SETTINGS_HEADER_TABLE_SIZE waits for serverMu, which an
+// upload holds for as long as its write to a destination that is slow to
+// read lasts; before, the relay timed out a client that kept reading and
+// had not yet been sent the frame it was to acknowledge.
+func TestSettingsAckClockStartsWhenForwarded(t *testing.T) {
+	for name, mutate := range map[string]func(*Options){
+		"plain":  func(*Options) {},
+		"masked": masking(t, true),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, timeouts(mutate, func(o *Options) { o.SettingsTimeout = stepTimeout }))
+			// Hold serverMu as sendLoop does while a write to the
+			// destination blocks.
+			h.r.serverMu.Lock()
+			h.serverSend(settingsFrame(Setting{ID: SettingHeaderTableSize, Value: 0}))
+			time.Sleep(3 * stepTimeout)
+			h.r.serverMu.Unlock()
+			h.expect(h.toClient, "client", func(f Frame) bool {
+				if f.Type == FrameGoAway {
+					t.Fatalf("client got GOAWAY with code %d before the SETTINGS frame", binary.BigEndian.Uint32(f.Payload[4:]))
+				}
+				return f.Type == FrameSettings && f.Flags&FlagAck == 0
+			})
+			h.clientSend(Frame{Type: FrameSettings, Flags: FlagAck})
+			h.expect(h.toServer, "server", func(f Frame) bool { return f.Type == FrameSettings && f.Flags&FlagAck != 0 })
+			h.quiet(h.toClient, 2*stepTimeout, isType(FrameGoAway))
+			select {
+			case err := <-h.done:
+				t.Fatalf("the relay ended: %v", err)
+			default:
+			}
+		})
+	}
 }
 
 // A client that acknowledges every SETTINGS frame at once, as browsers do,
