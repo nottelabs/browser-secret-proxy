@@ -3,8 +3,11 @@ package h2relay
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,8 +38,22 @@ func newHarness(t *testing.T, mutate func(*Options)) *harness {
 	return newHarnessWith(t, mutate, nil)
 }
 
-// newHarnessWith also lets setup adjust the relay before it starts.
+// newHarnessWith also lets setup adjust the relay before it starts. Like a
+// real one, the server starts with an (empty) SETTINGS frame, which the
+// client receives and acknowledges.
 func newHarnessWith(t *testing.T, mutate func(*Options), setup func(*relay)) *harness {
+	t.Helper()
+	h := newRawHarness(t, mutate, setup)
+	h.serverSend(Frame{Type: FrameSettings})
+	h.expect(h.toClient, "client", func(f Frame) bool { return f.Type == FrameSettings && f.Flags&FlagAck == 0 })
+	h.clientSend(Frame{Type: FrameSettings, Flags: FlagAck})
+	h.expect(h.toServer, "server", func(f Frame) bool { return f.Type == FrameSettings && f.Flags&FlagAck != 0 })
+	return h
+}
+
+// newRawHarness starts the relay with the client's preface sent and nothing
+// from the server yet.
+func newRawHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *harness {
 	t.Helper()
 	hosts, err := hostmatch.New([]string{"allowed.test"})
 	if err != nil {
@@ -1085,4 +1102,255 @@ func TestSettingsWhileUploadsOpen(t *testing.T) {
 		_, fragment, err := HeadersPayload(f.Flags, f.Payload)
 		return err == nil && len(fragment) > 0 && f.Flags&FlagEndStream != 0
 	})
+}
+
+// drainClient returns every frame the client gets until the relay closes
+// the connection.
+func (h *harness) drainClient() []Frame {
+	h.t.Helper()
+	var frames []Frame
+	deadline := time.After(waitFor)
+	for {
+		select {
+		case f, ok := <-h.toClient:
+			if !ok {
+				return frames
+			}
+			frames = append(frames, f)
+		case <-deadline:
+			h.t.Fatalf("the relay kept the client connection open; frames so far: %d", len(frames))
+			return nil
+		}
+	}
+}
+
+// checkFailurePreface checks what a client gets when the server never sent
+// its SETTINGS: a SETTINGS frame first, a GOAWAY last, then the close.
+func checkFailurePreface(t *testing.T, frames []Frame, wantCode uint32) {
+	t.Helper()
+	if len(frames) < 2 || frames[0].Type != FrameSettings || frames[0].Flags&FlagAck != 0 {
+		t.Fatalf("client frames %v, want a SETTINGS frame first", frameTypes(frames))
+	}
+	last := frames[len(frames)-1]
+	if last.Type != FrameGoAway || len(last.Payload) < 8 || binary.BigEndian.Uint32(last.Payload[4:]) != wantCode {
+		t.Fatalf("client frames %v, want a GOAWAY with code %d last", frameTypes(frames), wantCode)
+	}
+}
+
+func frameTypes(frames []Frame) []uint8 {
+	out := make([]uint8, len(frames))
+	for i, f := range frames {
+		out[i] = f.Type
+	}
+	return out
+}
+
+// RFC 9113 3.4: the server's SETTINGS must be the first frame the client
+// gets. A buffered upload with a swapped body makes the relay credit the
+// client on its own while the server's SETTINGS are still on their way;
+// that credit must wait for them.
+func TestServerSettingsReachTheClientFirst(t *testing.T) {
+	h := newRawHarness(t, nil, nil)
+	h.clientSend(
+		Frame{Type: FrameSettings},
+		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST",
+			hpack.HeaderField{Name: "content-type", Value: "application/x-www-form-urlencoded"})...)},
+		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte("k=tok_standin")},
+	)
+	time.Sleep(50 * time.Millisecond) // the server's SETTINGS come later, as over a network
+	serverSettings := settingsFrame(Setting{ID: SettingMaxConcurrentStreams, Value: 100})
+	h.serverSend(serverSettings)
+	first := h.next(h.toClient, "client")
+	if first.Type != FrameSettings || first.Flags&FlagAck != 0 || !bytes.Equal(first.Payload, serverSettings.Payload) {
+		t.Fatalf("the client's first frame has type %d (payload %x), want the server's SETTINGS", first.Type, first.Payload)
+	}
+	h.expect(h.toClient, "client", func(f Frame) bool { return f.Type == FrameWindowUpdate && f.Stream == 0 })
+	headers := h.expect(h.toServer, "server", isType(FrameHeaders))
+	f := h.expect(h.toServer, "server", func(f Frame) bool { return f.Type == FrameData && f.Stream == headers.Stream })
+	if string(f.Payload) != "k=real_value" {
+		t.Fatalf("server body %q", f.Payload)
+	}
+}
+
+// A server that closes before its SETTINGS: the client still gets a valid
+// connection error (a SETTINGS frame, the relay's held frames, a GOAWAY)
+// instead of a bare close.
+func TestServerClosingBeforeSettingsFailsTheClientCleanly(t *testing.T) {
+	h := newRawHarness(t, nil, nil)
+	h.clientSend(
+		Frame{Type: FrameSettings},
+		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
+		Frame{Type: FrameData, Stream: 1, Payload: []byte("partial")}, // credited: a held WINDOW_UPDATE
+	)
+	time.Sleep(50 * time.Millisecond)
+	_ = h.server.Close()
+	frames := h.drainClient()
+	checkFailurePreface(t, frames, errCodeInternal)
+	if !slices.Contains(frameTypes(frames), FrameWindowUpdate) {
+		t.Fatalf("client frames %v: the held credit was dropped", frameTypes(frames))
+	}
+}
+
+// A server that stays silent: past the preface timeout the client gets the
+// same connection error.
+func TestSilentServerTimesOut(t *testing.T) {
+	h := newRawHarness(t, func(o *Options) { o.PrefaceTimeout = 100 * time.Millisecond }, nil)
+	h.clientSend(Frame{Type: FrameSettings})
+	checkFailurePreface(t, h.drainClient(), errCodeInternal)
+	if err := h.result(); err != errNoServerPreface {
+		t.Fatalf("relay error %v, want %v", err, errNoServerPreface)
+	}
+}
+
+// A server whose first frame is not SETTINGS breaks the HTTP/2 preface.
+func TestServerMustStartWithSettings(t *testing.T) {
+	h := newRawHarness(t, nil, nil)
+	h.serverSend(Frame{Type: FramePing, Payload: make([]byte, 8)})
+	checkFailurePreface(t, h.drainClient(), errCodeInternal)
+	if err := h.result(); err == nil || !strings.Contains(err.Error(), "not SETTINGS") {
+		t.Fatalf("relay error %v", err)
+	}
+}
+
+// Frames held for the server's SETTINGS are bounded by the buffer budget.
+func TestHeldFramesAreBounded(t *testing.T) {
+	h := newRawHarness(t, func(o *Options) { o.MaxStreams = 1; o.MaxBuffered = 200 }, nil)
+	h.clientSend(Frame{Type: FrameSettings})
+	// Stream 1 goes upstream; every later one is refused, and each refusal
+	// waits for the server's SETTINGS. The relay closes the connection once
+	// they pass 200 bytes, so writes stop succeeding.
+	_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
+	for i := uint32(0); i < 40; i++ {
+		frame := Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 2*i + 1, Payload: h.clientBlock(otherRequest("GET")...)}
+		if _, err := h.client.Write(encodeFrames([]Frame{frame})); err != nil {
+			break
+		}
+	}
+	if err := h.result(); err != errHeldFrames {
+		t.Fatalf("relay error %v, want %v", err, errHeldFrames)
+	}
+	frames := h.drainClient()
+	if len(frames) == 0 || frames[0].Type != FrameSettings {
+		t.Fatalf("client frames %v, want a SETTINGS frame first", frameTypes(frames))
+	}
+}
+
+// bareRelay runs a relay between pipes the test drives by hand. The
+// server's end is drained in the background; serverClosed closes once the
+// relay closes it.
+func bareRelay(t *testing.T) (client, server net.Conn, done <-chan error, serverClosed <-chan struct{}) {
+	t.Helper()
+	hosts, err := hostmatch.New([]string{"allowed.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapper, err := swap.New(map[string]string{"tok_standin": "real_value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTest, clientRelay := net.Pipe()
+	serverRelay, serverTest := net.Pipe()
+	result := make(chan error, 1)
+	go func() { result <- newRelay(clientRelay, serverRelay, Options{Hosts: hosts, Swapper: swapper}).run() }()
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		_, _ = io.Copy(io.Discard, serverTest)
+	}()
+	t.Cleanup(func() {
+		_ = clientTest.Close()
+		_ = serverTest.Close()
+	})
+	return clientTest, serverTest, result, closed
+}
+
+// writeAsync writes frames from another goroutine, since a pipe write
+// blocks until the relay reads it.
+func writeAsync(conn net.Conn, frames ...Frame) {
+	go func() { _, _ = conn.Write(encodeFrames(frames)) }()
+}
+
+// checkPromptShutdown checks that the relay ended within a second of a
+// client protocol error and closed both connections.
+func checkPromptShutdown(t *testing.T, client net.Conn, done <-chan error, serverClosed <-chan struct{}) {
+	t.Helper()
+	// A client protocol error makes clientLoop return and starts shutdown.
+	if _, err := client.Write(encodeFrames([]Frame{{Type: FramePushPromise, Stream: 1, Payload: make([]byte, 4)}})); err != nil {
+		t.Fatalf("send the protocol error: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "PUSH_PROMISE") {
+			t.Fatalf("relay error %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited on a stuck writer")
+	}
+	select {
+	case <-serverClosed:
+	case <-time.After(time.Second):
+		t.Fatal("the server connection stayed open")
+	}
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 64)
+	for {
+		if _, err := client.Read(buf); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatal("the client connection stayed open")
+			}
+			return
+		}
+	}
+}
+
+// startConnection exchanges the prefaces: the server's SETTINGS reach the
+// client, which reads them.
+func startConnection(t *testing.T, client, server net.Conn) {
+	t.Helper()
+	_ = client.SetDeadline(time.Now().Add(waitFor))
+	if _, err := client.Write([]byte(Preface)); err != nil {
+		t.Fatal(err)
+	}
+	writeAsync(server, Frame{Type: FrameSettings})
+	if f, err := ReadFrame(client); err != nil || f.Type != FrameSettings {
+		t.Fatalf("client got %+v, %v; want the server's SETTINGS", f, err)
+	}
+	_ = client.SetDeadline(time.Time{})
+}
+
+// A client that stops reading during a response leaves serverLoop blocked
+// in a client write with the client write lock held; another loop failing
+// must still shut the relay down and close both sockets.
+func TestShutdownWithAStuckClientWrite(t *testing.T) {
+	client, server, done, serverClosed := bareRelay(t)
+	startConnection(t, client, server)
+	writeAsync(server, Frame{Type: FramePing, Payload: make([]byte, 8)}) // the client never reads it
+	time.Sleep(50 * time.Millisecond)
+	checkPromptShutdown(t, client, done, serverClosed)
+}
+
+// The same while serverLoop holds the client write lock waiting for the
+// rest of a response header block the server never sends.
+func TestShutdownDuringAnUnfinishedHeaderBlock(t *testing.T) {
+	client, server, done, serverClosed := bareRelay(t)
+	startConnection(t, client, server)
+	var encBuf bytes.Buffer
+	enc := hpack.NewEncoder(&encBuf)
+	for _, f := range otherRequest("GET") {
+		_ = enc.WriteField(f)
+	}
+	if _, err := client.Write(encodeFrames([]Frame{{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: encBuf.Bytes()}})); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // the request reaches the server as stream 1
+	encBuf.Reset()
+	_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	writeAsync(server, Frame{Type: FrameHeaders, Stream: 1, Payload: encBuf.Bytes()}) // no END_HEADERS
+	_ = client.SetReadDeadline(time.Now().Add(waitFor))
+	if f, err := ReadFrame(client); err != nil || f.Type != FrameHeaders {
+		t.Fatalf("client got %+v, %v; want the response HEADERS", f, err)
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	time.Sleep(50 * time.Millisecond)
+	checkPromptShutdown(t, client, done, serverClosed)
 }

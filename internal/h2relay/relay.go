@@ -30,6 +30,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -52,6 +54,9 @@ type Options struct {
 	// MaxHeaderBytes caps a client header block, encoded and decoded
 	// (default 1 MiB).
 	MaxHeaderBytes int
+	// PrefaceTimeout bounds the wait for the server's first SETTINGS frame
+	// (default 30 s); past it the client gets a connection error.
+	PrefaceTimeout time.Duration
 	Logger         *slog.Logger
 }
 
@@ -61,6 +66,7 @@ type Options struct {
 var continueBlock = []byte{0x08, 0x03, '1', '0', '0'}
 
 const (
+	errCodeInternal      = 0x2
 	errCodeFlowControl   = 0x3
 	errCodeRefusedStream = 0x7
 	errCodeCancel        = 0x8
@@ -79,10 +85,17 @@ type relay struct {
 	client, server net.Conn
 
 	clientMu sync.Mutex // serializes writes to the client
-	serverMu sync.Mutex // serializes writes to the server and owns enc
-	enc      *hpack.Encoder
-	encBuf   bytes.Buffer
-	dec      *hpack.Decoder // used by the client reader only
+	// The server's first SETTINGS must be the first frame the client gets
+	// (RFC 9113 3.4). Until it has been forwarded (prefaceSent), frames the
+	// relay itself writes (WINDOW_UPDATE credit, RST_STREAM, GOAWAY, a local
+	// 100) wait in early, bounded by MaxBuffered bytes; guarded by clientMu.
+	prefaceSent atomic.Bool // written under clientMu; read without it by shutdown and the timer
+	early       []Frame
+	earlyBytes  int
+	serverMu    sync.Mutex // serializes writes to the server and owns enc
+	enc         *hpack.Encoder
+	encBuf      bytes.Buffer
+	dec         *hpack.Decoder // used by the client reader only
 
 	mu           sync.Mutex
 	cond         *sync.Cond
@@ -183,6 +196,9 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	if opts.MaxHeaderBytes <= 0 {
 		opts.MaxHeaderBytes = 1 << 20
 	}
+	if opts.PrefaceTimeout <= 0 {
+		opts.PrefaceTimeout = 30 * time.Second
+	}
 	r := &relay{
 		opts: opts, client: client, server: server,
 		dec:      hpack.NewDecoder(decoderTableSize, nil),
@@ -199,28 +215,94 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	return r
 }
 
+// errNoServerPreface is a server that sent no SETTINGS in time.
+var errNoServerPreface = errors.New("server sent no SETTINGS frame in time")
+
+// errHeldFrames is more relay frames waiting for the server's SETTINGS
+// than the buffer budget allows.
+var errHeldFrames = errors.New("too many frames waiting for the server's SETTINGS")
+
 func (r *relay) run() error {
 	errs := make(chan error, 3)
+	timeout := make(chan error, 1)
+	timer := time.AfterFunc(r.opts.PrefaceTimeout, func() {
+		// No clientMu here: a writer stuck on a client that stopped reading
+		// may hold it.
+		if !r.prefaceSent.Load() {
+			timeout <- errNoServerPreface
+		}
+	})
+	defer timer.Stop()
 	go func() { errs <- r.clientLoop() }()
 	go func() { errs <- r.serverLoop() }()
 	go func() { errs <- r.sendLoop() }()
-	first := <-errs
+	var first error
+	pending := 3
+	select {
+	case first = <-errs:
+		pending--
+	case first = <-timeout:
+	}
 	r.shutdown()
-	<-errs
-	<-errs
+	for ; pending > 0; pending-- {
+		<-errs
+	}
 	if errors.Is(first, io.EOF) || errors.Is(first, net.ErrClosed) {
 		return nil
 	}
 	return first
 }
 
+// shutdown ends the relay. It must not wait on a goroutine stuck in I/O
+// while holding clientMu: client writes block when the client stops reading,
+// and serverLoop holds clientMu while it reads the rest of a response header
+// block from the server. So the server socket closes first (ending those
+// reads and any blocked server write), and clientMu is taken only before
+// the server's SETTINGS were forwarded, after a client write deadline that
+// also ends a write in progress. After them, the client socket closes
+// without the lock, which ends any client write.
 func (r *relay) shutdown() {
 	r.mu.Lock()
 	r.closed = true
 	r.cond.Broadcast()
 	r.mu.Unlock()
-	_ = r.client.Close()
 	_ = r.server.Close()
+	if !r.prefaceSent.Load() {
+		_ = r.client.SetWriteDeadline(time.Now().Add(failureWriteTimeout))
+		r.failBeforePreface()
+	}
+	_ = r.client.Close()
+}
+
+// failureWriteTimeout bounds the connection error written to a client
+// before the server's SETTINGS, and any write in progress then.
+const failureWriteTimeout = 5 * time.Second
+
+// failBeforePreface gives the client a connection error when the relay ends
+// before the server's SETTINGS were forwarded (the server closed or failed
+// early, or never answered): a SETTINGS frame of the relay's own as the
+// server preface, the frames held so far, then a GOAWAY unless one of those
+// already is. Without it the client would only see the connection close, or
+// wait. The write is bounded in time in case the client does not read.
+func (r *relay) failBeforePreface() {
+	r.clientMu.Lock()
+	defer r.clientMu.Unlock()
+	if r.prefaceSent.Load() {
+		return
+	}
+	r.prefaceSent.Store(true)
+	frames := append([]Frame{{Type: FrameSettings}}, r.early...)
+	goaway := false
+	for _, f := range r.early {
+		goaway = goaway || f.Type == FrameGoAway
+	}
+	if !goaway {
+		// Last stream 0: the server processed nothing, so the client may retry.
+		payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), errCodeInternal)
+		frames = append(frames, Frame{Type: FrameGoAway, Payload: payload})
+	}
+	r.early, r.earlyBytes = nil, 0
+	_, _ = r.client.Write(encodeFrames(frames)) // bounded by shutdown's write deadline
 }
 
 func encodeFrames(frames []Frame) []byte {
@@ -232,10 +314,39 @@ func encodeFrames(frames []Frame) []byte {
 }
 
 func (r *relay) writeClient(frames ...Frame) error {
-	b := encodeFrames(frames)
 	r.clientMu.Lock()
 	defer r.clientMu.Unlock()
-	_, err := r.client.Write(b)
+	if !r.prefaceSent.Load() {
+		return r.holdLocked(frames)
+	}
+	_, err := r.client.Write(encodeFrames(frames))
+	return err
+}
+
+// holdLocked keeps relay frames until the server's SETTINGS go out.
+func (r *relay) holdLocked(frames []Frame) error {
+	for _, f := range frames {
+		r.earlyBytes += frameHeaderLength + len(f.Payload)
+	}
+	if r.earlyBytes > r.opts.MaxBuffered {
+		return errHeldFrames
+	}
+	r.early = append(r.early, frames...)
+	return nil
+}
+
+// writeServerPreface forwards the server's first SETTINGS frame, then the
+// relay frames that waited for it, in order.
+func (r *relay) writeServerPreface(settings Frame) error {
+	r.clientMu.Lock()
+	defer r.clientMu.Unlock()
+	if r.prefaceSent.Load() {
+		return errors.New("server SETTINGS arrived after the relay ended the connection")
+	}
+	r.prefaceSent.Store(true)
+	frames := append([]Frame{settings}, r.early...)
+	r.early, r.earlyBytes = nil, 0
+	_, err := r.client.Write(encodeFrames(frames))
 	return err
 }
 
@@ -1151,6 +1262,7 @@ func (r *relay) serverLoop() error {
 	}()
 	var block *stream // stream of the response header block in progress
 	blockEnds := false
+	sawPreface := false
 	for {
 		f, err := ReadFrame(r.server)
 		if err != nil {
@@ -1158,6 +1270,10 @@ func (r *relay) serverLoop() error {
 		}
 		if block != nil && f.Type != FrameContinuation {
 			return errors.New("server interrupted a header block")
+		}
+		if !sawPreface && (f.Type != FrameSettings || f.Flags&FlagAck != 0) {
+			// RFC 9113 3.4: the server preface is a SETTINGS frame.
+			return fmt.Errorf("server's first frame has type %d, not SETTINGS", f.Type)
 		}
 		switch f.Type {
 		case FrameSettings:
@@ -1167,7 +1283,12 @@ func (r *relay) serverLoop() error {
 				}
 				f.Payload = clientSettings(f.Payload)
 			}
-			err = r.writeClient(f)
+			if !sawPreface {
+				sawPreface = true
+				err = r.writeServerPreface(f)
+			} else {
+				err = r.writeClient(f)
+			}
 		case FrameWindowUpdate:
 			// Credit for request bodies, which the relay sends itself.
 			if len(f.Payload) != 4 {
