@@ -42,6 +42,10 @@ async function extendToCard() {
   // The observed Birkenstock payment UI uses a Cards accordion, not a radio.
   // This exact row was visible in run41867915431; never click an order control.
   const cardRow=page.getByText(/^Cards$/).filter({visible:true}).first();
+  if(siteKey==='birkenstock-us'){
+    emit('waitingForCardsAccordion',{timeoutMs:45000});
+    await cardRow.waitFor({state:'visible',timeout:45000});
+  }
   if(await cardRow.isVisible().catch(()=>false)){
     const descriptor=await cardRow.evaluate((e:any)=>({text:e.innerText,tag:e.tagName,ancestorButtonType:e.closest('button')?.getAttribute('type')||null}));
     if(descriptor.ancestorButtonType==='submit')throw Error('Cards row unexpectedly belongs to a submit control');
@@ -126,7 +130,9 @@ try{
 }catch(e){result.error=safe(e);emit('error',{message:result.error});process.exitCode=1;}
 finally{
   if(page&&!page.isClosed()){
-    result.finalUrl=safe(page.url());result.finalTitle=await page.title().catch(()=>'');result.finalInventory=await inventory().catch(()=>[]);emit('finalPage',{url:result.finalUrl,title:result.finalTitle,frames:result.finalInventory});
+    result.finalUrl=safe(page.url());result.finalTitle=await page.title().catch(()=>'');result.finalInventory=await inventory().catch(()=>[]);
+    result.paymentControls=await page.locator('button,label,[role=button],summary').evaluateAll((els:any[])=>els.map(e=>({tag:e.tagName,role:e.getAttribute('role'),type:e.getAttribute('type'),id:e.id,text:(e.innerText||e.textContent||'').trim().slice(0,160),visible:!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length)})).filter(e=>/\bcards?\b|payment/i.test(e.text))).catch(()=>[]);
+    emit('finalPage',{url:result.finalUrl,title:result.finalTitle,frames:result.finalInventory,paymentControls:result.paymentControls});
     const image=await page.screenshot({type:'jpeg',quality:40,timeout:10000}).catch(()=>null);if(image)console.log('BSP_SCREENSHOT '+image.toString('base64'));
   }
   await cleanup();clearTimeout(killTimer);result.durationS=Math.round((Date.now()-started)/1000);console.log('BSP_RESULT '+JSON.stringify(result));
