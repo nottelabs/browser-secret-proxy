@@ -90,3 +90,8 @@ First release, planned as 0.1.0.
   memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value
   over 1 KiB ends the connection with `PROTOCOL_ERROR`. Before, one client
   could make the relay hold gigabytes on one connection.
+- Real values with a line break or NUL are refused in every header, also
+  when the client's header already holds such a byte (a NUL after a
+  stand-in let a multi-line value through). Over HTTP/2, a request whose
+  field values hold a NUL, CR or LF, or start or end with a space or tab
+  (malformed, RFC 9113 8.2.1), is answered `502` and not sent.

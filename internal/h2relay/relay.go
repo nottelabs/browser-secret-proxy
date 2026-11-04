@@ -964,6 +964,19 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 	if ended {
 		return r.endedStream(s, 0)
 	}
+	// Malformed trailers end the request: a buffered one is answered 502, a
+	// streamed one, already upstream, is reset.
+	if name := malformedValue(fields); name != "" {
+		cause := fmt.Errorf("%w: trailer %q has a malformed value", scope.ErrRefused, name)
+		if buffering {
+			r.mu.Lock()
+			s.clientEnded = s.clientEnded || endStream
+			r.mu.Unlock()
+			return r.refuseLookup(s, cause)
+		}
+		r.opts.Logger.Warn("resetting a request with malformed trailers", "stream", clientID, "reason", cause.Error())
+		return r.abort(s, errCodeProtocol)
+	}
 	if s.swap && !buffering {
 		lookup, err := r.opts.Session.Prepare(fieldText(fields)...)
 		if err != nil {
@@ -1014,10 +1027,12 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // uppercase character, which the relay would not take for the framing field
 // it is ("Content-Length" would keep its length after a body swap), or more
 // than one :authority or host, of which a server may use another than the
-// one checked. Session.CheckAuthority refuses a host that disagrees with
+// one checked, or a field value a server could split or read differently
+// (malformedValue). Session.CheckAuthority refuses a host that disagrees with
 // :authority.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
 	authorityFields, hostFields, uppercase := 0, 0, ""
+	malformed := malformedValue(fields)
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
@@ -1038,8 +1053,25 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
 	case authorityFields > 1 || hostFields > 1:
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
+	case malformed != "":
+		err = fmt.Errorf("%w: field %q has a malformed value", scope.ErrRefused, malformed)
 	}
 	return method, authorities, err
+}
+
+// malformedValue returns the name of the first field whose value RFC 9113
+// 8.2.1 forbids: one holding a NUL, CR or LF, which a server or a later
+// HTTP/1.1 hop could split the field on, or starting or ending with a space
+// or tab. It returns "" when every value is well formed.
+func malformedValue(fields []hpack.HeaderField) string {
+	for _, f := range fields {
+		v := f.Value
+		if strings.ContainsAny(v, "\x00\r\n") ||
+			v != "" && (v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
+			return f.Name
+		}
+	}
+	return ""
 }
 
 // fieldText is the text of a header list that stand-ins are swapped in: the
