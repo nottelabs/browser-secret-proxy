@@ -172,6 +172,38 @@ func TestResolveIsBoundedByTheTimeout(t *testing.T) {
 	}
 }
 
+// Every authority a request names must be the CONNECT host, and all must be
+// the same one: a server may route by any of them.
+func TestCheckAuthority(t *testing.T) {
+	cases := []struct {
+		name        string
+		authorities []string
+		ok          bool
+	}{
+		{"the CONNECT host", []string{"api.example.com"}, true},
+		{"with a port, another case, a trailing dot", []string{"API.example.com.:443"}, true},
+		{"two that agree", []string{"api.example.com", "API.EXAMPLE.COM"}, true},
+		{"none", nil, false},
+		{"empty", []string{""}, false},
+		{"another host", []string{"x.pay.example"}, false},
+		{"userinfo", []string{"api.example.com:443@x.pay.example"}, false},
+		{"a second one naming another host", []string{"api.example.com", "x.pay.example"}, false},
+		{"a first one naming another host", []string{"x.pay.example", "api.example.com"}, false},
+		{"two that disagree on the port", []string{"api.example.com", "api.example.com:8443"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := session(t, one(resolve.Value{Real: "r"}), resolve.Principal{}).CheckAuthority(c.authorities...)
+			if c.ok != (err == nil) {
+				t.Fatalf("got %v, want ok %v", err, c.ok)
+			}
+			if err != nil && !errors.Is(err, scope.ErrRefused) {
+				t.Fatalf("got %v, want a refusal", err)
+			}
+		})
+	}
+}
+
 type blockingResolver struct{ scopetest.Resolver }
 
 func (blockingResolver) Resolve(ctx context.Context, _ resolve.Request) (resolve.Result, error) {

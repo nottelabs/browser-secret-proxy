@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"unicode"
 )
 
 // List is a host allowlist. An entry is an exact host name, or "*." followed
@@ -54,12 +55,13 @@ func validate(name string) error {
 	return nil
 }
 
-// Match reports whether host (with or without a port) is on the list.
+// Match reports whether host (with or without a port) is on the list. An
+// authority that is not a plain host and port (see SameHost) is not.
 func (l *List) Match(host string) bool {
 	if l == nil {
 		return false
 	}
-	name := canonical(stripPort(host))
+	name := hostOf(host)
 	if name == "" {
 		return false
 	}
@@ -76,9 +78,11 @@ func (l *List) Match(host string) bool {
 
 // SameHost reports whether a and b (each with or without a port) name the
 // same host: ports are ignored, case and a trailing dot too. An empty name
-// matches nothing.
+// matches nothing, and so does an authority that is not a plain host and
+// port: one with userinfo, a path, query or fragment, whitespace, or a port
+// that is empty or not a number.
 func SameHost(a, b string) bool {
-	x, y := canonical(stripPort(a)), canonical(stripPort(b))
+	x, y := hostOf(a), hostOf(b)
 	return x != "" && x == y
 }
 
@@ -86,9 +90,37 @@ func canonical(s string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s)), ".")
 }
 
-func stripPort(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
+// hostOf returns the canonical host of an authority: a name or an IPv4
+// address, or an IPv6 address in brackets, each with or without ":" and a
+// port, or a bare IPv6 address (as net.SplitHostPort returns it). It returns
+// "" for anything else: "allowed.test:443@evil.test", for one, names
+// evil.test under RFC 3986, so it must not count as allowed.test.
+func hostOf(authority string) string {
+	if strings.ContainsAny(authority, "@/?#") || strings.ContainsFunc(authority, unicode.IsSpace) {
+		return ""
 	}
-	return strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	host, port, hasPort := authority, "", false
+	switch {
+	case strings.HasPrefix(authority, "["):
+		inner, rest, ok := strings.Cut(authority[1:], "]")
+		if !ok || !strings.Contains(inner, ":") || net.ParseIP(inner) == nil {
+			return ""
+		}
+		host = inner
+		if rest != "" {
+			if port, hasPort = strings.CutPrefix(rest, ":"); !hasPort {
+				return ""
+			}
+		}
+	case strings.Count(authority, ":") == 1:
+		host, port, hasPort = strings.Cut(authority, ":")
+	case strings.Contains(authority, ":"):
+		if net.ParseIP(authority) == nil {
+			return ""
+		}
+	}
+	if hasPort && (port == "" || strings.Trim(port, "0123456789") != "") {
+		return ""
+	}
+	return canonical(host)
 }
