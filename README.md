@@ -18,6 +18,35 @@ When it connects to an allowlisted destination, the proxy keeps the TLS and
 HTTP/2 parameters the client offered, and it refuses a connection it cannot
 reproduce instead of substituting its own.
 
+## Use cases
+
+- **Cards:** a card number and CVC at checkout, swapped into the request to
+  the payment host ([recipe](docs/cookbook/card.md)).
+- **Passwords:** a login form or a JSON login call
+  ([form](docs/cookbook/password-form.md),
+  [JSON](docs/cookbook/password-json.md)).
+- **2FA codes:** a TOTP code computed when the request goes out, from a seed
+  that only your service holds ([recipe](docs/cookbook/totp.md)).
+- **API keys and tokens:** in an `Authorization` header or a query string
+  ([header](docs/cookbook/bearer-token.md),
+  [query](docs/cookbook/api-key-query.md)).
+
+In every case, real values that the site echoes back are replaced by their
+stand-ins before they reach the browser ([masking](docs/cookbook/masking.md)).
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Concepts and threat model](docs/concepts.md)
+- [Deployment](docs/deployment.md): Docker, systemd, Kubernetes, CA
+  rotation, TLS, logs and sizing
+- [Resolvers](docs/resolvers.md): `file`, `http` and `sealed` in depth
+- [Security and hardening](docs/security.md)
+- [Cookbook](docs/cookbook/README.md): one recipe per use case, each
+  exercised end to end against a real Notte browser session
+
+This README stays the reference for every flag, format and limit.
+
 ## How it works
 
 1. The client sends `CONNECT host:443`. If `host` is not on the allowlist, the
@@ -465,6 +494,11 @@ reads the file and each request as strictly as the proxy reads its answer:
 go run ./examples/http-resolver -cert service.pem -key service.key \
   -client-ca resolver-ca.pem -values values.json
 ```
+
+[`examples/totp-resolver`](examples/totp-resolver) answers with TOTP codes
+(RFC 6238) computed from seeds it holds, each valid until the end of its time
+step: see the [2FA recipe](docs/cookbook/totp.md). The full service contract
+is in [docs/resolvers.md](docs/resolvers.md#http).
 
 ### sealed
 
