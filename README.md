@@ -270,7 +270,12 @@ What is masked:
   path-escaped, HTML-escaped, as decimal or hexadecimal character references,
   and, for 13 to 19 digit card numbers, grouped in fours (or 4-6-5 and 4-6-4)
   with spaces or dashes. Each form is replaced by the same form of the
-  stand-in, so the response stays valid;
+  stand-in, so the response stays valid. Where the value has nothing to
+  escape, so several forms look alike, the stand-in is escaped for where it
+  lands, as the request side does: JSON-escaped in JSON and JavaScript
+  bodies, query-escaped in form bodies and in `Location`, `Content-Location`,
+  `Link`, `Refresh` and `Set-Cookie`, HTML-escaped in HTML and XML bodies,
+  as is elsewhere;
 - values split across HTTP/1.1 chunks or HTTP/2 DATA frames. The proxy holds
   back at most the length of the longest form, and only bytes that could
   begin a value, so streamed responses keep flowing.
@@ -287,8 +292,12 @@ How a masked response changes:
   card stand-in, say) and the body is not compressed, the length and framing
   stay as they are. Otherwise `Content-Length` is dropped, and an HTTP/1.1
   body is sent chunked.
+- A response ends with its own framing (the HTTP/1.1 zero chunk and
+  trailers, the HTTP/2 end of stream), never earlier because the compressed
+  data ended; bytes after the end of the compressed data are dropped.
 - A response that cannot be masked gets a `502` from the proxy instead: an
-  unknown or stacked content-coding (`compress`, `gzip, br`), a
+  unknown or stacked content-coding (`compress`, `gzip, br`, or several
+  `Content-Encoding` headers), a folded (obs-fold) HTTP/1.1 header line, a
   transfer-coding other than `chunked`, or a `206` partial response whose
   ranges masking would shift.
 - Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
@@ -313,8 +322,9 @@ How a masked response changes:
   destination already had on file before the principal sent its stand-in,
   is not masked. Values looked up for another principal
   are not masked on this one's connections.
-- WebSocket and other upgraded connections, and responses on hosts that are
-  not allowlisted (they are never decrypted).
+- WebSockets and other tunnels (an HTTP/1.1 upgrade or an accepted HTTP/2
+  `CONNECT`), whose frames pass through untouched, and responses on hosts
+  that are not allowlisted (they are never decrypted).
 
 Allowlist only the endpoints that need the values, and check what they
 return.

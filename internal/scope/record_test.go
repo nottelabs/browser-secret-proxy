@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 type staticFor map[string]map[string]string // principal ID -> stand-in -> real
@@ -48,20 +50,20 @@ func TestMaskersFollowPrincipals(t *testing.T) {
 	if alice.Masker() != nil {
 		t.Fatal("nothing resolved yet, nothing to mask")
 	}
-	if _, err := alice.Swapper(context.Background(), "tok_alice"); err != nil {
+	if _, err := alice.Swapper(context.Background(), swap.Part{Text: "tok_alice"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := aliceAgain.Masker().String("x alice_real_1"); got != "x tok_alice" {
+	if got := aliceAgain.Masker().String(mask.Text, "x alice_real_1"); got != "x tok_alice" {
 		t.Fatalf("another connection of alice got %q", got)
 	}
 	if aliceOtherSecret.Masker() != nil || bob.Masker() != nil {
 		t.Fatal("alice's values reached another principal")
 	}
 	// A value refused for its host is still on record: it is alice's.
-	if _, err := bob.Swapper(context.Background(), "tok_bob"); err == nil {
+	if _, err := bob.Swapper(context.Background(), swap.Part{Text: "tok_bob"}); err == nil {
 		t.Fatal("expected a refusal")
 	}
-	if got := bob.Masker().String("bob_real_22"); got != "tok_bob" {
+	if got := bob.Masker().String(mask.Text, "bob_real_22"); got != "tok_bob" {
 		t.Fatalf("bob got %q", got)
 	}
 	now = now.Add(Retention + time.Second)
@@ -71,7 +73,7 @@ func TestMaskersFollowPrincipals(t *testing.T) {
 	// Masking off: nothing is kept.
 	off, _ := New(Config{Resolver: r, Detector: detector, Hosts: hosts})
 	s := off.Session(resolve.Principal{ID: "alice"}, "api.example.com")
-	_, _ = s.Swapper(context.Background(), "tok_alice")
+	_, _ = s.Swapper(context.Background(), swap.Part{Text: "tok_alice"})
 	if s.Masker() != nil || s.Masking() {
 		t.Fatal("masking is off")
 	}
@@ -89,11 +91,11 @@ func TestRecordFollowsExpiry(t *testing.T) {
 		"s_none":    {Real: "real_none_1"},
 		"s_expired": {Real: "real_expired_1", ExpiresAt: now.Add(-time.Second)},
 	})
-	if got := rec.masker(p).String("real_soon_1 real_later_1 real_none_1 real_expired_1"); got != "s_soon s_later s_none real_expired_1" {
+	if got := rec.masker(p).String(mask.Text, "real_soon_1 real_later_1 real_none_1 real_expired_1"); got != "s_soon s_later s_none real_expired_1" {
 		t.Fatalf("got %q", got)
 	}
 	now = now.Add(time.Minute)
-	if got := rec.masker(p).String("real_soon_1 real_later_1"); got != "real_soon_1 s_later" {
+	if got := rec.masker(p).String(mask.Text, "real_soon_1 real_later_1"); got != "real_soon_1 s_later" {
 		t.Fatalf("after its expiry: %q", got)
 	}
 	now = now.Add(Retention)
@@ -133,7 +135,7 @@ func TestRecordIsBounded(t *testing.T) {
 	if n := len(rec.principals[keyOf(p)].values); n != MaxValuesPerPrincipal {
 		t.Fatalf("%d values kept", n)
 	}
-	if rec.masker(p).String("real_value_0 ") != "real_value_0 " {
+	if rec.masker(p).String(mask.Text, "real_value_0 ") != "real_value_0 " {
 		t.Fatal("the oldest value should have been dropped")
 	}
 	for i := 0; i < MaxPrincipals+5; i++ {

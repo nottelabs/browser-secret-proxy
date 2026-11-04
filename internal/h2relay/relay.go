@@ -182,6 +182,9 @@ type relay struct {
 	respList          []*respState
 	respHeld          int64
 	debt              int64
+	// serverCreditDue is connection credit to give the server at once for
+	// response bytes the client will never receive; clientSendLoop sends it.
+	serverCreditDue int64
 }
 
 type stream struct {
@@ -631,6 +634,19 @@ func (r *relay) forStream(f Frame) error {
 	return r.writeServer(f)
 }
 
+// openStreamsLocked counts the client streams the relay holds state for:
+// open requests, and, with masking, responses still waiting to reach the
+// client after the server ended them.
+func (r *relay) openStreamsLocked() int {
+	n := len(r.streams)
+	for id := range r.resp {
+		if r.streams[id] == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // dropLocked forgets the request side of a stream and releases what it held.
 // The server mapping stays until the server ends the stream, so its
 // remaining frames still reach the client.
@@ -788,7 +804,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		r.maxClientID = clientID
 	}
 	goingAway := r.goaway
-	refuse := newStream && (goingAway || len(r.streams) >= r.opts.MaxStreams)
+	refuse := newStream && (goingAway || r.openStreamsLocked() >= r.opts.MaxStreams)
 	r.mu.Unlock()
 
 	if s == nil && !newStream {

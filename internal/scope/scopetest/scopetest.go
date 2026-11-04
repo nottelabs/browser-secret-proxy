@@ -8,6 +8,7 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 // Static returns a session, for the empty principal, over a fixed map of
@@ -95,7 +96,11 @@ func Masked(t testing.TB, hosts *hostmatch.List, resolver resolve.Resolver, prin
 	}
 	session := s.Session(principal, host)
 	if len(known) > 0 {
-		if _, err := session.Swapper(context.Background(), known...); err != nil {
+		parts := make([]swap.Part, len(known))
+		for i, k := range known {
+			parts[i] = swap.Part{Place: swap.Literal, Text: k}
+		}
+		if _, err := session.Swapper(context.Background(), parts...); err != nil {
 			t.Fatal(err)
 		}
 	}

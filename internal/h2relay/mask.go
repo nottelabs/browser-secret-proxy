@@ -62,11 +62,15 @@ type respState struct {
 	window             int64 // what the client lets the relay send on the stream
 	queue              []respItem
 	queued             int64 // data bytes in queue
-	listed             bool  // in relay.respList
-	sending            bool  // a frame of this stream is being written
-	final              bool  // the final (non-1xx) response head arrived
-	done               bool  // the stream ended toward the client
-	pipe               *maskPipe
+	// For a masked stream: DATA bytes received from the server (padding
+	// included) and masked bytes sent to the client, settled with the
+	// server's connection window when the stream ends.
+	maskIn, maskOut int64
+	listed          bool // in relay.respList
+	sending         bool // a frame of this stream is being written
+	final           bool // the final (non-1xx) response head arrived
+	done            bool // the stream ended toward the client
+	pipe            *maskPipe
 }
 
 // respItem is one thing waiting to go to the client on a stream, in order.
@@ -89,8 +93,9 @@ type maskPipe struct {
 
 // respPlan says how a masked response's body is handled.
 type respPlan struct {
-	body   bool
-	decode mask.Encoding
+	body    bool
+	decode  mask.Encoding
+	context mask.Context // of the body, from its content-type
 }
 
 // newRespLocked creates the response state of a new client stream.
@@ -121,6 +126,24 @@ func (r *relay) endRespLocked(rs *respState) {
 		return
 	}
 	rs.done = true
+	// Connection credit the server is owed now that the client will never
+	// receive (and so never credit) these bytes: queued passthrough frames,
+	// and what a masked stream received beyond what it sent. A masked stream
+	// that sent more than it received leaves that in debt, withheld later.
+	var due int64
+	for _, item := range rs.queue {
+		if item.frame != nil {
+			due += int64(len(item.frame.Payload))
+		}
+	}
+	if rs.pipe != nil {
+		if balance := rs.maskIn - rs.maskOut; balance > 0 {
+			due += balance
+			r.debt += balance
+		}
+		rs.maskIn, rs.maskOut = 0, 0
+	}
+	r.serverCreditDue += due
 	r.respHeld -= rs.queued
 	rs.queue, rs.queued = nil, 0
 	if rs.pipe != nil {
@@ -533,7 +556,19 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 			encodings = append(encodings, f.Value)
 		}
 	}
-	plan := respPlan{body: !ends && method != "HEAD" && status != "204" && status != "304"}
+	contentType := ""
+	for _, f := range fields {
+		if f.Name == "content-type" {
+			contentType = f.Value
+		}
+	}
+	// An accepted CONNECT (a WebSocket over extended CONNECT) carries a
+	// tunnel, not a body: its frames pass through untouched, like an
+	// HTTP/1.1 upgrade.
+	plan := respPlan{
+		body:    !ends && method != "HEAD" && method != "CONNECT" && status != "204" && status != "304",
+		context: mask.ContextOf(contentType),
+	}
 	enc, err := mask.ParseEncoding(encodings)
 	if err != nil {
 		if plan.body {
@@ -541,13 +576,13 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 		}
 		enc = "" // no body to decode: the header stays as it is
 	}
-	if plan.body && status == "206" && (enc != "" || !m.SameLength()) {
+	if plan.body && status == "206" && (enc != "" || !m.SameLength(plan.context)) {
 		return nil, plan, fmt.Errorf("%w: a partial response whose content masking would change", errUnmaskable)
 	}
 	if plan.body {
 		plan.decode = enc
 	}
-	dropLength := plan.body && (enc != "" || !m.SameLength()) || method == "HEAD" && enc != ""
+	dropLength := plan.body && (enc != "" || !m.SameLength(plan.context)) || method == "HEAD" && enc != ""
 	out := make([]hpack.HeaderField, 0, len(fields))
 	for _, f := range fields {
 		switch {
@@ -574,7 +609,7 @@ func maskFields(fields []hpack.HeaderField, m *mask.Masker) ([]hpack.HeaderField
 		if strings.HasPrefix(f.Name, ":") || f.Name == "content-length" {
 			continue
 		}
-		masked := m.String(f.Value)
+		masked := m.String(mask.HeaderContext(f.Name), f.Value)
 		if masked != f.Value && strings.ContainsAny(masked, "\r\n\x00") {
 			return nil, false
 		}
@@ -613,6 +648,7 @@ func (r *relay) onServerDataMasked(f Frame) error {
 			return err
 		}
 		r.debt -= int64(len(f.Payload))
+		rs.maskIn += int64(len(f.Payload))
 		rs.pipe.in.Write(data)
 		r.respHeld += int64(len(data))
 		rs.pipe.uncredited += len(f.Payload) - len(data) // padding
@@ -693,9 +729,17 @@ func (r *relay) runMask(rs *respState, plan respPlan, m *mask.Masker) {
 	if plan.decode == "" {
 		body = in // identity bodies are not capped: they are streamed as they come
 	}
-	w := m.NewWriter(&pipeWriter{r: r, rs: rs})
-	if _, err = io.CopyBuffer(w, body, make([]byte, 32<<10)); err == nil {
+	w := m.NewWriter(&pipeWriter{r: r, rs: rs}, plan.context)
+	buf := make([]byte, 32<<10)
+	if _, err = io.CopyBuffer(w, body, buf); err == nil {
 		err = w.Close()
+	}
+	if err == nil {
+		// A compressed stream can end before the HTTP/2 stream does: the
+		// response ends with the server's END_STREAM (and its trailers),
+		// never with the decoder. Bytes after the end of the compressed
+		// stream are not content and are dropped.
+		_, err = io.CopyBuffer(io.Discard, in, buf)
 	}
 	if err != nil {
 		r.failMasked(rs, err)
@@ -817,6 +861,15 @@ func (r *relay) clientSendLoop() error {
 				r.mu.Unlock()
 				return net.ErrClosed
 			}
+			if due := r.serverCreditDue; due > 0 {
+				r.serverCreditDue = 0
+				r.mu.Unlock()
+				if err := r.writeServer(windowUpdate(0, int(min(due, maxWindow)))); err != nil {
+					return err
+				}
+				r.mu.Lock()
+				continue
+			}
 			kept := r.respList[:0]
 			for _, c := range r.respList {
 				if c.done || len(c.queue) == 0 {
@@ -866,6 +919,7 @@ func (r *relay) clientSendLoop() error {
 				c.window -= n
 				if head.frame == nil {
 					r.debt += n // masked output the server did not send
+					c.maskOut += n
 				}
 				break
 			}
