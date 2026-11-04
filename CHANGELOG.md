@@ -14,6 +14,16 @@ First release, planned as 0.1.0.
   provide and replaces stand-in values with real ones in request headers,
   query strings and bodies.
 - Plain CONNECT tunnels, without decryption, for every other host.
+- HTTP/1.1 requests whose body a server could frame differently, or whose
+  head it could split into other lines, are answered `502` and not sent:
+  `Transfer-Encoding` with `Content-Length`, a `Transfer-Encoding` other
+  than a single `chunked` or on an HTTP/1.0 request, more than one
+  `Content-Length` or one that is not a decimal number, a folded header
+  line, a header name that is not a token, and a bare CR or NUL in the
+  request line or a header line. A chunked trailer line like that closes
+  the connection. Before, a `Content-Length` sent with `chunked` was
+  forwarded next to the swapped, re-chunked body, so a server that framed
+  by it could read part of the body as another request.
 - HTTP/2 and HTTP/1.1 relays.
 - Optional Basic authentication on CONNECT
   (`SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD`). The proxy refuses to
