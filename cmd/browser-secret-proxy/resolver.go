@@ -23,7 +23,9 @@ type resolverFlags struct {
 	url, cert, key, ca string
 	timeout, cacheTTL  time.Duration
 
-	sealedKey string
+	sealedKey        string
+	sealedIssuerKeys stringList
+	sealedAudience   string
 
 	patterns stringList
 	prefixes string
@@ -42,7 +44,7 @@ func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
 var modeFlags = map[string][]string{
 	"file":   {"swaps", "swaps-reload"},
 	"http":   {"resolver-url", "resolver-cert", "resolver-key", "resolver-ca", "resolver-timeout", "resolver-cache-ttl"},
-	"sealed": {"sealed-key"},
+	"sealed": {"sealed-key", "sealed-issuer-key", "sealed-audience"},
 }
 
 func registerResolverFlags(fs *flag.FlagSet) *resolverFlags {
@@ -57,6 +59,8 @@ func registerResolverFlags(fs *flag.FlagSet) *resolverFlags {
 	fs.DurationVar(&f.timeout, "resolver-timeout", 2*time.Second, "http mode: timeout of one lookup")
 	fs.DurationVar(&f.cacheTTL, "resolver-cache-ttl", time.Minute, "http mode: longest a looked-up value is kept in memory (0: no cache)")
 	fs.StringVar(&f.sealedKey, "sealed-key", "", "sealed mode: PEM EC private key that sealed proxy passwords are encrypted to")
+	fs.Var(&f.sealedIssuerKeys, "sealed-issuer-key", "sealed mode: PEM public key (Ed25519 or P-256) of an issuer allowed to sign tokens (repeatable)")
+	fs.StringVar(&f.sealedAudience, "sealed-audience", "", "sealed mode: this proxy's identity; a token's aud must contain it")
 	fs.Var(&f.patterns, "standin-pattern", "regular expression that matches stand-ins (repeatable)")
 	fs.StringVar(&f.prefixes, "standin-prefixes", "", "comma-separated prefixes that start stand-ins, such as tok_")
 	fs.BoolVar(&f.luhn, "standin-luhn", false, "drop card-like pattern matches whose Luhn check digit is wrong")
@@ -135,17 +139,18 @@ func (f *resolverFlags) build(fixedUsername string, logger *slog.Logger) (*resol
 			logger.Warn("proxy authentication is off: every client shares one principal for the detokenize service")
 		}
 	case "sealed":
-		if f.sealedKey == "" {
-			return nil, errors.New("-resolver sealed needs -sealed-key")
-		}
 		if fixedUsername != "" {
 			return nil, errors.New("SECRET_PROXY_USERNAME and SECRET_PROXY_PASSWORD are not used with -resolver sealed: the sealed password authenticates each client")
 		}
-		s, err := resolve.LoadSealed(f.sealedKey)
+		if f.sealedKey == "" || len(f.sealedIssuerKeys) == 0 || f.sealedAudience == "" {
+			return nil, errors.New("-resolver sealed needs -sealed-key, -sealed-issuer-key and -sealed-audience")
+		}
+		s, err := resolve.LoadSealed(f.sealedKey, f.sealedIssuerKeys, f.sealedAudience)
 		if err != nil {
 			return nil, err
 		}
 		setup.resolver = s
+		setup.logAttrs = append(setup.logAttrs, "issuer_key_files", len(f.sealedIssuerKeys), "audience", f.sealedAudience)
 	}
 
 	var prefixes []string
