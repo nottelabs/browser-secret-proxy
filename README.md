@@ -122,6 +122,7 @@ curl --proxy http://127.0.0.1:8080 --cacert ca.pem \
 | `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty. |
 | `-v` | Debug logging. |
+| `-version` | Print the version and exit. |
 
 The process stops on `SIGINT` or `SIGTERM`: it closes open connections, then
 waits at most 10 seconds for them to finish.

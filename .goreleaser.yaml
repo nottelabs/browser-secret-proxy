@@ -25,7 +25,7 @@ builds:
       - arm64
     flags:
       - -trimpath
-    # main.version takes effect once cmd/secret-proxy declares it.
+    # Sets the version that `-version` prints.
     ldflags:
       - -s -w -X main.version={{ .Version }}
     mod_timestamp: "{{ .CommitTimestamp }}"

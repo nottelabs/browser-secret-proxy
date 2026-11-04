@@ -21,3 +21,4 @@ First release, planned as 0.1.0.
   `http://`, `https://` and `socks5://`.
 - Static binaries for linux and darwin (amd64, arm64) and a multi-arch
   container image, with checksums, SBOMs and cosign signatures.
+- `-version` prints the build's version.
