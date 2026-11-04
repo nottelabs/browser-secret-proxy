@@ -84,7 +84,8 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 	}
 	if p.hasBody {
 		if len(transferCodings) > 0 && (len(transferCodings) != 1 || !isChunked(transferCodings[0])) {
-			return nil, p, fmt.Errorf("%w: transfer-codings %q", errUnmaskable, strings.Join(transferCodings, ", "))
+			// Not quoted: a destination can echo a real value into it.
+			return nil, p, fmt.Errorf("%w: a transfer-coding other than chunked", errUnmaskable)
 		}
 		p.decode = enc
 		p.inChunked = chunked
