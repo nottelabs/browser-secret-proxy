@@ -56,10 +56,13 @@ type clientView struct {
 	dec        *hpack.Decoder
 	connWindow int64
 	windows    map[uint32]int64
+	streams    map[uint32]*response // responses being received, by stream
+	block      []byte               // header block in progress
+	blockEnds  bool
 }
 
 func newClientView(h *harness) *clientView {
-	return &clientView{h: h, dec: hpack.NewDecoder(4096, nil), connWindow: defaultWindow, windows: map[uint32]int64{}}
+	return &clientView{h: h, dec: hpack.NewDecoder(4096, nil), connWindow: defaultWindow, windows: map[uint32]int64{}, streams: map[uint32]*response{}}
 }
 
 // response is one stream's response as the client saw it.
@@ -69,6 +72,7 @@ type response struct {
 	body           []byte
 	reset          uint32 // RST_STREAM error code, or 0
 	resetSeen      bool
+	ended          bool
 }
 
 // readHead returns the next response head on stream.
@@ -98,75 +102,76 @@ func (c *clientView) readHead(stream uint32) map[string]string {
 // more than the windows allow.
 func (c *clientView) read(stream uint32, credit bool) *response {
 	c.h.t.Helper()
-	if _, ok := c.windows[stream]; !ok {
-		c.windows[stream] = defaultWindow
-	}
-	resp := &response{}
-	var block []byte
 	for {
-		f := c.h.next(c.h.toClient, "client")
-		switch f.Type {
-		case FrameHeaders, FrameContinuation:
-			if f.Type == FrameHeaders {
-				_, fragment, err := HeadersPayload(f.Flags, f.Payload)
-				if err != nil {
-					c.h.t.Fatal(err)
-				}
-				block = append(block[:0], fragment...)
-			} else {
-				block = append(block, f.Payload...)
-			}
-			if f.Flags&FlagEndHeaders == 0 {
-				continue
-			}
-			fields, err := c.dec.DecodeFull(block)
-			if err != nil {
-				c.h.t.Fatalf("client cannot decode a header block: %v", err)
-			}
-			if f.Stream != stream {
-				continue
-			}
-			m := map[string]string{}
-			var names []string
-			for _, field := range fields {
-				m[field.Name] = field.Value
-				names = append(names, field.Name)
-			}
-			if resp.head == nil && !strings.HasPrefix(m[":status"], "1") {
-				resp.head, resp.headNames = m, names
-			} else if resp.head != nil {
-				resp.trailers = m
-			}
-			if f.Flags&FlagEndStream != 0 && (f.Type == FrameHeaders) {
-				return resp
-			}
-			if f.Type == FrameContinuation && resp.head != nil && resp.trailers != nil {
-				return resp
-			}
-		case FrameData:
-			n := int64(len(f.Payload))
-			c.connWindow -= n
-			c.windows[f.Stream] -= n
-			if c.connWindow < 0 || c.windows[f.Stream] < 0 {
-				c.h.t.Fatalf("relay sent past the client's window: connection %d, stream %d", c.connWindow, c.windows[f.Stream])
-			}
-			if f.Stream == stream {
-				resp.body = append(resp.body, f.Payload...)
-			}
-			if credit && n > 0 {
-				c.connWindow += n
-				c.windows[f.Stream] += n
-				c.h.clientSend(windowUpdate(0, int(n)), windowUpdate(f.Stream, int(n)))
-			}
-			if f.Stream == stream && f.Flags&FlagEndStream != 0 {
-				return resp
-			}
-		case FrameRSTStream:
-			if f.Stream == stream {
-				resp.reset, resp.resetSeen = binary.BigEndian.Uint32(f.Payload), true
-				return resp
-			}
+		if r := c.streams[stream]; r != nil && r.ended {
+			delete(c.streams, stream)
+			return r
 		}
+		c.step(credit)
+	}
+}
+
+// step takes one frame the client receives and adds it to its stream's
+// response, crediting DATA when credit is true and failing if the relay
+// sends past the client's windows.
+func (c *clientView) step(credit bool) {
+	c.h.t.Helper()
+	f := c.h.next(c.h.toClient, "client")
+	resp := c.streams[f.Stream]
+	if resp == nil && f.Stream != 0 {
+		resp = &response{}
+		c.streams[f.Stream] = resp
+	}
+	switch f.Type {
+	case FrameHeaders, FrameContinuation:
+		if f.Type == FrameHeaders {
+			_, fragment, err := HeadersPayload(f.Flags, f.Payload)
+			if err != nil {
+				c.h.t.Fatal(err)
+			}
+			c.block = append(c.block[:0], fragment...)
+			c.blockEnds = f.Flags&FlagEndStream != 0
+		} else {
+			c.block = append(c.block, f.Payload...)
+		}
+		if f.Flags&FlagEndHeaders == 0 {
+			return
+		}
+		fields, err := c.dec.DecodeFull(c.block)
+		if err != nil {
+			c.h.t.Fatalf("client cannot decode a header block: %v", err)
+		}
+		m := map[string]string{}
+		var names []string
+		for _, field := range fields {
+			m[field.Name] = field.Value
+			names = append(names, field.Name)
+		}
+		if resp.head == nil && !strings.HasPrefix(m[":status"], "1") {
+			resp.head, resp.headNames = m, names
+		} else if resp.head != nil {
+			resp.trailers = m
+		}
+		resp.ended = resp.ended || c.blockEnds
+	case FrameData:
+		if _, ok := c.windows[f.Stream]; !ok {
+			c.windows[f.Stream] = defaultWindow
+		}
+		n := int64(len(f.Payload))
+		c.connWindow -= n
+		c.windows[f.Stream] -= n
+		if c.connWindow < 0 || c.windows[f.Stream] < 0 {
+			c.h.t.Fatalf("relay sent past the client's window: connection %d, stream %d", c.connWindow, c.windows[f.Stream])
+		}
+		resp.body = append(resp.body, f.Payload...)
+		if credit && n > 0 {
+			c.connWindow += n
+			c.windows[f.Stream] += n
+			c.h.clientSend(windowUpdate(0, int(n)), windowUpdate(f.Stream, int(n)))
+		}
+		resp.ended = resp.ended || f.Flags&FlagEndStream != 0
+	case FrameRSTStream:
+		resp.reset, resp.resetSeen, resp.ended = binary.BigEndian.Uint32(f.Payload), true, true
 	}
 }
 

@@ -23,6 +23,11 @@ const (
 	// MaxPrincipals bounds the principals with values on record; the least
 	// recently active go first.
 	MaxPrincipals = 4096
+	// SweepEvery is the shortest time between two expiry sweeps: a value is
+	// dropped from memory at most this long after it expires, even when no
+	// request comes, and a sweep (a walk over every value on record) runs at
+	// most this often.
+	SweepEvery = 5 * time.Second
 )
 
 // record keeps, per principal, the real values resolved for it, so that
@@ -31,6 +36,13 @@ type record struct {
 	mu         sync.Mutex
 	principals map[principalKey]*principalValues
 	now        func() time.Time
+	// The expiry sweep: a timer armed for the earliest expiry on record, no
+	// sooner than sweepEvery after the previous sweep, and stopped by close.
+	sweepEvery time.Duration
+	timer      *time.Timer
+	next       time.Time // when the timer fires; zero when it is not armed
+	lastSweep  time.Time
+	closed     bool
 }
 
 // principalKey identifies a principal by its ID and a hash of its secret, so
@@ -58,7 +70,65 @@ type entry struct {
 }
 
 func newRecord(now func() time.Time) *record {
-	return &record{principals: map[principalKey]*principalValues{}, now: now}
+	return &record{principals: map[principalKey]*principalValues{}, now: now, sweepEvery: SweepEvery}
+}
+
+// armLocked makes sure the sweep runs by until, or sweepEvery after the
+// previous sweep if that is later.
+func (r *record) armLocked(until time.Time) {
+	if r.closed {
+		return
+	}
+	at := until
+	if earliest := r.lastSweep.Add(r.sweepEvery); at.Before(earliest) {
+		at = earliest
+	}
+	if !r.next.IsZero() && !at.Before(r.next) {
+		return // already armed for that time or sooner
+	}
+	r.next = at
+	d := max(at.Sub(r.now()), 0)
+	if r.timer == nil {
+		r.timer = time.AfterFunc(d, r.sweep)
+	} else {
+		r.timer.Reset(d)
+	}
+}
+
+// sweep drops expired values, and the maskers built from them, then arms the
+// next sweep for the earliest expiry left.
+func (r *record) sweep() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	now := r.now()
+	r.next, r.lastSweep = time.Time{}, now
+	r.pruneLocked(now)
+	var earliest time.Time
+	for _, pv := range r.principals {
+		for _, e := range pv.values {
+			if earliest.IsZero() || e.until.Before(earliest) {
+				earliest = e.until
+			}
+		}
+	}
+	if !earliest.IsZero() {
+		r.armLocked(earliest)
+	}
+}
+
+// close stops the sweep and drops every value on record.
+func (r *record) close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	r.next = time.Time{}
+	r.principals = map[principalKey]*principalValues{}
 }
 
 // add records values resolved for p, each until its expiry or Retention
@@ -93,6 +163,7 @@ func (r *record) add(p resolve.Principal, values map[string]resolve.Value) {
 			pv.stale = true
 		}
 		pv.values[v.Real] = entry{standIn: standIn, seen: now, until: until}
+		r.armLocked(until)
 	}
 	pv.dropExpired(now)
 	for len(pv.values) > MaxValuesPerPrincipal {
@@ -104,6 +175,7 @@ func (r *record) add(p resolve.Principal, values map[string]resolve.Value) {
 		}
 		delete(pv.values, oldest)
 		pv.stale = true
+		pv.masker = nil
 	}
 }
 
@@ -125,11 +197,14 @@ func (r *record) pruneLocked(now time.Time) {
 	}
 }
 
+// dropExpired drops expired values, and the masker built with them, which
+// would otherwise keep them in memory; the next lookup builds a new one.
 func (pv *principalValues) dropExpired(now time.Time) {
 	for real, e := range pv.values {
 		if !now.Before(e.until) {
 			delete(pv.values, real)
 			pv.stale = true
+			pv.masker = nil
 		}
 	}
 }

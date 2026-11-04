@@ -78,6 +78,10 @@ func New(cfg Config) (*Scope, error) {
 	return &Scope{cfg: cfg, record: newRecord(cfg.Now)}, nil
 }
 
+// Close stops the expiry sweep of the values kept for masking and drops
+// them. The Scope must not be used afterwards.
+func (s *Scope) Close() { s.record.close() }
+
 // Session is the scope of one connection: the principal its CONNECT
 // authenticated as, and the host it CONNECTed to.
 func (s *Scope) Session(p resolve.Principal, host string) *Session {

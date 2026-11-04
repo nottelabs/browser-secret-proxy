@@ -156,3 +156,54 @@ func itoa(i int) string {
 	}
 	return string(b)
 }
+
+// Expired values leave memory without another lookup: the sweep drops them,
+// and the masker built with them, once traffic stops.
+func TestIdleValuesExpireWithoutALookup(t *testing.T) {
+	rec := newRecord(time.Now)
+	rec.sweepEvery = 10 * time.Millisecond
+	defer rec.close()
+	soon, later := resolve.Principal{ID: "soon"}, resolve.Principal{ID: "later"}
+	rec.add(soon, map[string]resolve.Value{"s": {Real: "real_soon_value", ExpiresAt: time.Now().Add(50 * time.Millisecond)}})
+	rec.add(later, map[string]resolve.Value{
+		"s1": {Real: "real_short_value", ExpiresAt: time.Now().Add(50 * time.Millisecond)},
+		"s2": {Real: "real_long_value"},
+	})
+	if rec.masker(soon) == nil || rec.masker(later) == nil {
+		t.Fatal("maskers should exist before expiry")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rec.mu.Lock()
+		_, soonKept := rec.principals[keyOf(soon)]
+		pv := rec.principals[keyOf(later)]
+		_, shortKept := pv.values["real_short_value"]
+		maskerKept := pv.masker != nil
+		rec.mu.Unlock()
+		if !soonKept && !shortKept && !maskerKept {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after expiry, with no lookup: principal kept %v, value kept %v, masker kept %v", soonKept, shortKept, maskerKept)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The value that has not expired is still masked.
+	if got := rec.masker(later).String(mask.Text, "real_long_value real_short_value"); got != "s2 real_short_value" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// close stops the sweep and drops everything.
+func TestCloseStopsTheSweep(t *testing.T) {
+	rec := newRecord(time.Now)
+	rec.add(resolve.Principal{ID: "p"}, map[string]resolve.Value{"s": {Real: "real_value_p"}})
+	rec.close()
+	if len(rec.principals) != 0 || rec.masker(resolve.Principal{ID: "p"}) != nil {
+		t.Fatal("close kept values")
+	}
+	rec.add(resolve.Principal{ID: "p"}, map[string]resolve.Value{"s": {Real: "real_value_p", ExpiresAt: time.Now().Add(time.Millisecond)}})
+	if !rec.next.IsZero() {
+		t.Fatal("a closed record armed its sweep")
+	}
+}

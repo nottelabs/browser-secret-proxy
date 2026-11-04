@@ -425,7 +425,8 @@ browser, its logs and recordings. That covers all of the principal's
 connections. To keep real values in memory no longer than needed, a value
 is masked for 15 minutes after its last lookup, or until it expires if that
 is sooner, and no longer once the principal's credential is reported
-invalid (at most 1,024 values per principal).
+invalid (at most 1,024 values per principal). Expired values leave memory
+within 5 seconds, whether or not more requests come.
 
 What is masked:
 

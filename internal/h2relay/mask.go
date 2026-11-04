@@ -128,8 +128,12 @@ func (r *relay) endRespLocked(rs *respState) {
 	rs.done = true
 	// Connection credit the server is owed now that the client will never
 	// receive (and so never credit) these bytes: queued passthrough frames,
-	// and what a masked stream received beyond what it sent. A masked stream
-	// that sent more than it received leaves that in debt, withheld later.
+	// which debt does not count, and what a masked stream received beyond
+	// what it sent. The latter is part of a negative debt, which other
+	// paths may already have paid back in part (an eager return, or a
+	// client WINDOW_UPDATE forwarded with more): only what the debt still
+	// owes is returned, so no credit is given twice. A masked stream that
+	// sent more than it received leaves that in debt, withheld later.
 	var due int64
 	for _, item := range rs.queue {
 		if item.frame != nil {
@@ -137,9 +141,10 @@ func (r *relay) endRespLocked(rs *respState) {
 		}
 	}
 	if rs.pipe != nil {
-		if balance := rs.maskIn - rs.maskOut; balance > 0 {
-			due += balance
-			r.debt += balance
+		if balance := rs.maskIn - rs.maskOut; balance > 0 && r.debt < 0 {
+			owed := min(balance, -r.debt)
+			due += owed
+			r.debt += owed
 		}
 		rs.maskIn, rs.maskOut = 0, 0
 	}
@@ -562,11 +567,13 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 			contentType = f.Value
 		}
 	}
-	// An accepted CONNECT (a WebSocket over extended CONNECT) carries a
+	// An accepted CONNECT (2xx: a WebSocket over extended CONNECT) carries a
 	// tunnel, not a body: its frames pass through untouched, like an
-	// HTTP/1.1 upgrade.
+	// HTTP/1.1 upgrade. A refused one has an ordinary body, masked like any
+	// other.
+	tunnel := method == "CONNECT" && len(status) == 3 && status[0] == '2'
 	plan := respPlan{
-		body:    !ends && method != "HEAD" && method != "CONNECT" && status != "204" && status != "304",
+		body:    !ends && !tunnel && method != "HEAD" && status != "204" && status != "304",
 		context: mask.ContextOf(contentType),
 	}
 	enc, err := mask.ParseEncoding(encodings)

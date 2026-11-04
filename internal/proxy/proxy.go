@@ -141,6 +141,7 @@ func (s *Server) untrack(c net.Conn) {
 }
 
 func (s *Server) shutdown() {
+	defer s.scope.Close()
 	s.mu.Lock()
 	s.closing = true
 	for c := range s.conns {

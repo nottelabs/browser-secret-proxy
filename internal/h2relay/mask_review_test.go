@@ -122,3 +122,79 @@ func TestWaitingResponsesCountTowardTheStreamLimit(t *testing.T) {
 	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 7, Payload: h.clientBlock(request("GET")...)})
 	h.expect(h.toServer, "server", isType(FrameHeaders))
 }
+
+// A masked response that shrinks (long real values, short stand-ins) and
+// crosses debtReturn, completing alongside another stream: the server gets
+// back exactly the connection credit for what it sent, never twice, so the
+// relay owes nothing afterwards and the other stream is not held back.
+func TestShrinkingResponseCreditsTheServerOnce(t *testing.T) {
+	h := newHarness(t, masking(t, false))
+	c := newClientView(h)
+	credit := 0
+	count := func(f Frame) {
+		if f.Type == FrameWindowUpdate && f.Stream == 0 {
+			credit += int(binary.BigEndian.Uint32(f.Payload))
+		}
+	}
+	expectHeaders := func() Frame {
+		for {
+			f := h.next(h.toServer, "server")
+			count(f)
+			if f.Type == FrameHeaders {
+				return f
+			}
+		}
+	}
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(request("GET")...)})
+	first := expectHeaders().Stream
+	sent := 0
+	chunk := bytes.Repeat([]byte(realToken+"\n"), 600) // 15,600 bytes, masked to 7,200
+	h.serverSend(status(h, first, false, field(":status", "200")))
+	for i := 0; i < 4; i++ {
+		h.serverSend(data(first, string(chunk), i == 3))
+		sent += len(chunk)
+	}
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 3, Payload: h.clientBlock(request("GET")...)})
+	second := expectHeaders().Stream
+	h.serverSend(status(h, second, false, field(":status", "200")), data(second, "hello, nothing to mask", true))
+	sent += len("hello, nothing to mask")
+	if got := c.read(1, true); len(got.body) != 4*600*(len(tokenSIn)+1) {
+		t.Fatalf("first stream got %d bytes", len(got.body))
+	}
+	if got := c.read(3, true); string(got.body) != "hello, nothing to mask" {
+		t.Fatalf("second stream got %q", got.body)
+	}
+	deadline := time.After(300 * time.Millisecond)
+	for done := false; !done; {
+		select {
+		case f := <-h.toServer:
+			count(f)
+		case <-deadline:
+			done = true
+		}
+	}
+	if credit != sent {
+		t.Fatalf("the server got %d bytes of connection credit for %d sent", credit, sent)
+	}
+	h.r.mu.Lock()
+	debt := h.r.debt
+	h.r.mu.Unlock()
+	if debt != 0 {
+		t.Fatalf("the relay still withholds %d bytes", debt)
+	}
+}
+
+// A refused extended CONNECT (a WebSocket handshake answered 403) has an
+// ordinary body: an echoed value in it is masked.
+func TestRefusedConnectBodyIsMasked(t *testing.T) {
+	h := newHarness(t, masking(t, false))
+	c := newClientView(h)
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
+		Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
+	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+	h.serverSend(status(h, id, false, field(":status", "403"), field("content-type", "text/plain")), data(id, "denied for "+realToken, true))
+	resp := c.read(1, true)
+	if string(resp.body) != "denied for "+tokenSIn {
+		t.Fatalf("client got %q", resp.body)
+	}
+}

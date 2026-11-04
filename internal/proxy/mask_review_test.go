@@ -243,3 +243,35 @@ func TestWebSocketFramesPassThroughUntouched(t *testing.T) {
 		t.Fatalf("echoed frame %q, %v", got, err)
 	}
 }
+
+// A refused upgrade (a WebSocket handshake answered 403) is an ordinary
+// response: a value its body echoes is masked.
+func TestRefusedUpgradeBodyIsMasked(t *testing.T) {
+	p := maskingSetup(t, "http/1.1", func(c *tls.Conn) {
+		br := bufio.NewReader(c)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		body := "denied for " + req.Header.Get("X-Token")
+		_, _ = io.WriteString(c, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: "+strconv.Itoa(len(body))+"\r\n\r\n"+body)
+	}, map[string]string{"tok_alice": "real_alice"})
+	conn, resp := connect(t, p.addr, allowedHost+":443", "")
+	_ = resp.Body.Close()
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: allowedHost, RootCAs: p.ca, NextProtos: []string{"http/1.1"}})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(tlsConn, "GET /ws HTTP/1.1\r\nHost: "+allowedHost+"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Token: tok_alice\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(got.Body)
+	_ = got.Body.Close()
+	if got.StatusCode != http.StatusForbidden || string(body) != "denied for tok_alice" {
+		t.Fatalf("client got %d %q", got.StatusCode, body)
+	}
+}
