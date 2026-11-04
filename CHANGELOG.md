@@ -110,6 +110,17 @@ First release, planned as 0.1.0.
   ask to upgrade, and an HTTP/2 field name with an upper-case letter are
   refused with `502`; content in HTTP/2 DATA on a `HEAD`, `204` or `304`
   response resets the stream.
+- Responses no longer escape masking through a tunnel opened inside an
+  intercepted connection: a `CONNECT` (HTTP/1.1, or HTTP/2 with or without
+  `:protocol`, an extended `CONNECT` for `websocket` included) and an
+  HTTP/1.1 upgrade to another protocol than `websocket` (such as `h2c`)
+  are answered `502` and not sent. Before, any `2xx` to a `CONNECT`, or a
+  `101` to an `h2c` upgrade, passed the rest of the connection to the
+  client unmasked, with the real values swapped into the request that
+  opened it. The HTTP/2 relay no longer passes on the destination's
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so browsers open WebSockets over
+  HTTP/1.1, where only a `101` opens one; their frames still pass through
+  unmasked.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).
