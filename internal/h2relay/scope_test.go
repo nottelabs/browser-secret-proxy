@@ -2,6 +2,7 @@ package h2relay
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -66,8 +67,8 @@ func TestOutOfScopeRequestsAreAnswered502(t *testing.T) {
 	h.expect(h.toServer, "server", isType(FrameHeaders))
 }
 
-// An extended CONNECT is not buffered: its refusal also tells the client to
-// stop sending.
+// A request refused before its body arrives, here an extended CONNECT
+// refused as a tunnel, also tells the client to stop sending.
 func TestRefusedStreamingRequestIsReset(t *testing.T) {
 	h := newHarness(t, scoped(t))
 	fields := request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"}, hpack.HeaderField{Name: "authorization", Value: "tok_old"})
@@ -111,9 +112,10 @@ func TestInScopeValueIsSwapped(t *testing.T) {
 
 // A request whose fields a server could read as naming another host than
 // the CONNECT one, or whose framing it could read differently from the
-// relay, is malformed (RFC 9113 8.2.1, 8.3.1): it is answered 502, with or
+// relay, is malformed (RFC 9113 8.2.1, 8.3): it is answered 502, with or
 // without a stand-in, and nothing of it reaches the server. An uppercase
-// Content-Length would keep its length after a body swap.
+// Content-Length would keep its length after a body swap; a repeated,
+// unknown or misplaced pseudo-header could be read either way.
 func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 	withPath := func(path string, fields []hpack.HeaderField) []hpack.HeaderField {
 		fields[3].Value = path
@@ -134,7 +136,22 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 			{Name: ":method", Value: "GET"}, {Name: ":authority", Value: "evil.test"}, {Name: ":authority", Value: "allowed.test"},
 			{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/?k=tok_standin"},
 		}},
-		"a second host":        {fields: request("GET", hpack.HeaderField{Name: "host", Value: "allowed.test"}, hpack.HeaderField{Name: "host", Value: "allowed.test"})},
+		"a second host": {fields: request("GET", hpack.HeaderField{Name: "host", Value: "allowed.test"}, hpack.HeaderField{Name: "host", Value: "allowed.test"})},
+		// A server reading the first :method would answer a POST, which the
+		// relay, reading the last, would take for a tunnel and not mask.
+		"a second :method": {fields: []hpack.HeaderField{
+			{Name: ":method", Value: "POST"}, {Name: ":method", Value: "CONNECT"}, {Name: ":authority", Value: "allowed.test"},
+			{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/?k=tok_standin"},
+		}},
+		"a second :path":           {fields: request("GET", hpack.HeaderField{Name: ":path", Value: "/?k=tok_standin"})},
+		"a second :scheme":         {fields: request("GET", hpack.HeaderField{Name: ":scheme", Value: "http"})},
+		"a second :protocol":       {fields: request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"}, hpack.HeaderField{Name: ":protocol", Value: "websocket"})},
+		"an unknown pseudo-header": {fields: request("GET", hpack.HeaderField{Name: ":token", Value: "tok_standin"})},
+		"a response pseudo-header": {fields: request("GET", hpack.HeaderField{Name: ":status", Value: "200"})},
+		"a pseudo-header after a regular field": {fields: []hpack.HeaderField{
+			{Name: ":method", Value: "GET"}, {Name: ":authority", Value: "allowed.test"}, {Name: ":scheme", Value: "https"},
+			{Name: "x-token", Value: "tok_standin"}, {Name: ":path", Value: "/"},
+		}},
 		"uppercase field name": {fields: request("GET", hpack.HeaderField{Name: "X-Token", Value: "tok_standin"})},
 		"uppercase Content-Length": {
 			fields: request("POST",
@@ -142,6 +159,15 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 				hpack.HeaderField{Name: "Content-Length", Value: "13"}),
 			body: "k=tok_standin",
 		},
+		"NUL in a value":                {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: "tok_standin\x00"})},
+		"CR in a value":                 {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: "\rtok_standin"})},
+		"LF in a value, no stand-in":    {fields: request("GET", hpack.HeaderField{Name: "x-a", Value: "a\nhost: evil.test"})},
+		"leading space in a value":      {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: " tok_standin"})},
+		"trailing tab in a value":       {fields: request("GET", hpack.HeaderField{Name: "x-token", Value: "tok_standin\t"})},
+		"CRLF in a pseudo-header value": {fields: withPath("/?k=tok_standin\r\nx-a: 1", request("GET"))},
+		"malformed value after an empty name": {fields: request("GET",
+			hpack.HeaderField{Name: "", Value: "a\nb"},
+			hpack.HeaderField{Name: "x-token", Value: "tok_standin\r\nx-a: 1"})},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -156,6 +182,80 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 			}
 			h.expect(h.toClient, "client", isBadGateway(1))
 			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+		})
+	}
+}
+
+// Every CONNECT, an extended CONNECT for a WebSocket (RFC 8441) included, is
+// answered 502 before any swap and never sent: nothing in the server's 2xx
+// to it shows whether a tunnel or a catch-all handler answered, and either
+// would reach the client unmasked with the values swapped into the request.
+// So is a :protocol on another method, which a server could still take for
+// a tunnel, and a second :method, which a server could read instead of the
+// one the relay saw. The relay never tells the client that the server
+// supports extended CONNECT (TestServerSettingsNeverEnableExtendedConnect),
+// so a browser sends none: it opens its WebSockets over HTTP/1.1.
+func TestTunnelRequestsAreAnswered502(t *testing.T) {
+	protocol := func(value string) hpack.HeaderField { return hpack.HeaderField{Name: ":protocol", Value: value} }
+	token := hpack.HeaderField{Name: "x-token", Value: "tok_standin"}
+	for name, fields := range map[string][]hpack.HeaderField{
+		"plain CONNECT": {
+			{Name: ":method", Value: "CONNECT"}, {Name: ":authority", Value: "allowed.test"}, token,
+		},
+		"plain CONNECT with a path":        request("CONNECT", token),
+		"extended CONNECT for websocket":   request("CONNECT", protocol("websocket"), token),
+		"extended CONNECT for WebSocket":   request("CONNECT", protocol("WebSocket"), token),
+		"extended CONNECT for connect-udp": request("CONNECT", protocol("connect-udp"), token),
+		"two :protocol fields":             request("CONNECT", protocol("websocket"), protocol("connect-ip")),
+		"lower-case connect":               request("connect", protocol("websocket")),
+		":protocol on a GET":               request("GET", protocol("websocket"), token),
+		"a GET that names CONNECT too": append([]hpack.HeaderField{{Name: ":method", Value: "GET"}},
+			request("CONNECT", protocol("websocket"), token)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(fields...)})
+			h.expect(h.toClient, "client", isBadGateway(1))
+			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+		})
+	}
+}
+
+// Trailers with a malformed value (RFC 9113 8.2.1) stop the request: a
+// buffered one is answered 502 and never reaches the server, a streamed one
+// is reset on both sides. The streaming harness disables swapping explicitly:
+// CONNECT tunnels are refused.
+func TestMalformedTrailerValuesStopTheRequest(t *testing.T) {
+	cases := map[string][]hpack.HeaderField{
+		"NUL in a value": {{Name: "x-token", Value: "tok_standin\x00"}},
+		"malformed value after an empty name": {
+			{Name: "", Value: "a\nb"},
+			{Name: "x-token", Value: "tok_standin\r\nx-a: 1"},
+		},
+	}
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			h.clientSend(
+				Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
+				Frame{Type: FrameData, Stream: 1, Payload: []byte("plain")},
+				Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(bad...)},
+			)
+			h.expect(h.toClient, "client", isBadGateway(1))
+			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+
+			streamed := newHarness(t, streaming)
+			streamed.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 3, Payload: streamed.clientBlock(request("POST")...)})
+			opened := streamed.expect(streamed.toServer, "server", isType(FrameHeaders))
+			streamed.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 3, Payload: streamed.clientBlock(bad...)})
+			streamed.expect(streamed.toClient, "client", func(f Frame) bool {
+				return f.Type == FrameRSTStream && f.Stream == 3 && binary.BigEndian.Uint32(f.Payload) == errCodeProtocol
+			})
+			streamed.expect(streamed.toServer, "server", func(f Frame) bool {
+				return f.Type == FrameRSTStream && f.Stream == opened.Stream
+			})
+			h.settle("malformed trailers")
+			streamed.settle("malformed streamed trailers")
 		})
 	}
 }

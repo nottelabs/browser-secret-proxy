@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"errors"
+	"flag"
+	"io"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 )
 
 func TestDescribeParentLeavesCredentialsOut(t *testing.T) {
@@ -17,5 +23,143 @@ func TestDescribeParentLeavesCredentialsOut(t *testing.T) {
 	got := describeParent(u)
 	if got != "http://proxy.example:8080" || strings.Contains(got, "minted") || strings.Contains(got, "secret") {
 		t.Fatalf("describeParent = %q", got)
+	}
+}
+
+func TestMaskStreamWindowFlag(t *testing.T) {
+	parse := func(args ...string) (mask.Window, error) {
+		fs, opts := newFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		err := fs.Parse(args)
+		return *opts.maskWindow, err
+	}
+	for args, want := range map[string]mask.Window{
+		"":                            mask.Fixed,
+		"-mask-stream-window=fixed":   mask.Fixed,
+		"-mask-stream-window=minimal": mask.Minimal,
+	} {
+		got, err := parse(strings.Fields(args)...)
+		if err != nil || got != want {
+			t.Fatalf("%q: got %v, %v", args, got, err)
+		}
+	}
+	// An unknown value refuses to start, and says what is accepted.
+	for _, bad := range []string{"none", "Minimal", ""} {
+		_, err := parse("-mask-stream-window=" + bad)
+		if err == nil || !strings.Contains(err.Error(), "want fixed or minimal") {
+			t.Fatalf("%q: %v", bad, err)
+		}
+	}
+}
+
+// The usage text, printed on -h, on a bad flag and when a required flag is
+// missing, names the environment variables but never prints their values.
+func TestUsageLeavesTheEnvironmentOut(t *testing.T) {
+	t.Setenv("SECRET_PROXY_UPSTREAM", "http://minted-user:GATEWAY-SECRET@gw.example:8080")
+	t.Setenv("SECRET_PROXY_USERNAME", "proxy-user-name")
+	t.Setenv("SECRET_PROXY_PASSWORD", "PROXY-SECRET")
+	for _, args := range [][]string{{"-h"}, {"-bogus"}, {"-upstream-proxy"}, nil} {
+		fs, _ := newFlagSet("browser-secret-proxy", flag.ContinueOnError)
+		var out bytes.Buffer
+		fs.SetOutput(&out)
+		err := fs.Parse(args)
+		if args == nil {
+			if err != nil {
+				t.Fatal(err)
+			}
+			fs.Usage() // as run does when a required flag is missing
+		} else if err == nil {
+			t.Fatalf("%q parsed", args)
+		}
+		got := out.String()
+		for _, secret := range []string{"minted-user", "GATEWAY-SECRET", "gw.example", "proxy-user-name", "PROXY-SECRET"} {
+			if strings.Contains(got, secret) {
+				t.Fatalf("%q: usage prints %q:\n%s", args, secret, got)
+			}
+		}
+		for _, name := range []string{"SECRET_PROXY_USERNAME", "SECRET_PROXY_PASSWORD", "SECRET_PROXY_UPSTREAM", "-upstream-proxy"} {
+			if !strings.Contains(got, name) {
+				t.Fatalf("%q: usage does not mention %s:\n%s", args, name, got)
+			}
+		}
+	}
+}
+
+// A parent URL that does not parse, or that parses into something other
+// than a proxy address because of an unencoded character in its password,
+// is refused without quoting any part of its credentials.
+func TestParseParentErrorsLeaveCredentialsOut(t *testing.T) {
+	for _, raw := range []string{
+		"http://minted-user:pw%zzSECRET@gw.example:8080", // invalid escape
+		"socks5://minted-user:pa ss SECRET@gw.example:1080",
+		"http://minted-user:SECRET@gw.example:80x",
+		"http://minted-user:SECRET?x@gw.example:8080",
+		"http://minted-user:12/SECRET@gw.example:8080", // host minted-user:12
+		"http://minted-user:12#SECRET@gw.example:8080",
+		"http://minted-user:12?SECRET@gw.example:8080",
+		"minted-user:SECRET@gw.example:8080", // no scheme
+		"http:minted-user:SECRET@gw.example:8080",
+	} {
+		u, err := parseParent(raw)
+		if err == nil {
+			t.Fatalf("%q parsed as %s", raw, describeParent(u))
+		}
+		for _, part := range []string{"minted", "SECRET", "%zz", "12", "gw.example"} {
+			if strings.Contains(err.Error(), part) {
+				t.Fatalf("%q: error %q quotes %q", raw, err, part)
+			}
+		}
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			t.Fatalf("%q: error wraps a *url.Error, which quotes the URL", raw)
+		}
+	}
+	// Without credentials, the cause is given.
+	if _, err := parseParent("http://gw.example:80x"); err == nil || !strings.Contains(err.Error(), "invalid port") {
+		t.Fatalf("error %v", err)
+	}
+	for _, raw := range []string{"http://u:p@gw.example:8080", "http://u:p%25w@gw.example:8080/", "socks5://gw.example:1080"} {
+		if u, err := parseParent(raw); err != nil || u.Host != "gw.example:8080" && u.Host != "gw.example:1080" {
+			t.Fatalf("%q: %v", raw, err)
+		}
+	}
+	if u, err := parseParent(""); u != nil || err != nil {
+		t.Fatalf("empty: %v, %v", u, err)
+	}
+}
+
+// Resource-limit flags remain on the FlagSet used by run after integrating
+// the credential-safe usage handling.
+func TestConnectionLimitFlags(t *testing.T) {
+	fs, opts := newFlagSet("test", flag.ContinueOnError)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if opts.idleTimeout.String() != "5m0s" || opts.headerTimeout.String() != "10s" || opts.maxConns != 1024 {
+		t.Fatalf("defaults: idle %s, header %s, max %d", opts.idleTimeout, opts.headerTimeout, opts.maxConns)
+	}
+	if err := fs.Parse([]string{"-idle-timeout=0", "-header-timeout=2s", "-max-conns=7"}); err != nil {
+		t.Fatal(err)
+	}
+	if opts.idleTimeout != 0 || opts.headerTimeout.String() != "2s" || opts.maxConns != 7 {
+		t.Fatalf("overrides: idle %s, header %s, max %d", opts.idleTimeout, opts.headerTimeout, opts.maxConns)
+	}
+}
+
+// The private-destination override must remain registered on the FlagSet
+// used by run, alongside the credential-safe usage handling.
+func TestAllowPrivateDestinationsFlag(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		fs, opts := newFlagSet("test", flag.ContinueOnError)
+		var args []string
+		if enabled {
+			args = []string{"-allow-private-destinations"}
+		}
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		if opts.allowPrivate != enabled {
+			t.Fatalf("allowPrivate = %t, want %t", opts.allowPrivate, enabled)
+		}
 	}
 }

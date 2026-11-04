@@ -4,4 +4,7 @@ dist/
 .github/
 *.key
 *.pem
+payload*.json
 swaps*.json
+token*.txt
+values*.json

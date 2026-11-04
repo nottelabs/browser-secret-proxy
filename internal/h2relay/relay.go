@@ -4,7 +4,10 @@
 // and PING frames in the order the client sent them, the same pseudo-header
 // and header order, and the same priority on each request.
 //
-// The response direction is forwarded byte for byte, flow control included.
+// The response direction is forwarded byte for byte, flow control included,
+// except for the server's settings (see clientSettings) and connection
+// control (see control.go): the relay answers the server's PINGs, drops
+// GOAWAY debug data, and drops frames of extension or unknown types.
 // In the request direction the relay decodes each header block, swaps
 // stand-ins on allowlisted authorities and encodes it again for the upstream.
 // A request whose stand-ins cannot be swapped (see package scope) is answered
@@ -20,9 +23,21 @@
 // response headers, bodies and trailers.
 //
 // Memory is bounded per connection: header blocks (encoded and decoded),
-// each buffered body, all held request bytes together, and the number of open
-// streams. A stream over a limit is refused with REFUSED_STREAM, which tells
-// the client it never reached the server and may be retried.
+// each buffered body, all held request bytes together (header lists
+// included), and the number of open streams. A stream over the body, buffer
+// or stream limit is refused with REFUSED_STREAM, which tells the client it
+// never reached the server and may be retried; a header block over its
+// limit ends the connection.
+//
+// Abuse that costs the client little and the destination or the resolver
+// much is limited too: the client's HPACK table is no larger than the
+// relay's upstream one (decoderTableSize), and a client that resets streams
+// faster than it could use them (rapid reset) loses the connection.
+//
+// A peer that stalls a protocol step loses the connection too, rather than
+// holding it: a client that sends no preface in time or does not
+// acknowledge a SETTINGS frame in time (RFC 9113 6.5.3), and a server that
+// leaves a response header block unfinished.
 package h2relay
 
 import (
@@ -34,6 +49,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +61,7 @@ import (
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -58,11 +75,14 @@ type Options struct {
 	// MaxBody caps one buffered request body (default 32 MiB).
 	MaxBody int
 	// MaxBuffered caps the request bytes the relay holds for the whole
-	// connection: buffered bodies and data waiting for the server's flow
-	// control (default 64 MiB).
+	// connection: buffered bodies, data waiting for the server's flow
+	// control, and the decoded header and trailer lists of requests not sent
+	// upstream yet (default 64 MiB).
 	MaxBuffered int
 	// MaxStreams caps the client streams open at once (default 256).
-	// Streams waiting for a lookup count toward it.
+	// Streams waiting for a lookup count toward it. A client that resets
+	// more than twice as many streams within 10 seconds loses the
+	// connection.
 	MaxStreams int
 	// MaxLookups caps the resolver lookups running at once on the
 	// connection, each on a goroutine (default DefaultMaxLookups); more wait
@@ -74,6 +94,18 @@ type Options struct {
 	// PrefaceTimeout bounds the wait for the server's first SETTINGS frame
 	// (default 30 s); past it the client gets a connection error.
 	PrefaceTimeout time.Duration
+	// ClientPrefaceTimeout bounds the wait for the client's connection
+	// preface, its first frame included (default 10 s); past it the
+	// connection closes.
+	ClientPrefaceTimeout time.Duration
+	// SettingsTimeout bounds the wait for the client's ACK of each SETTINGS
+	// frame it is sent (default 10 s); past it the client gets GOAWAY with
+	// SETTINGS_TIMEOUT.
+	SettingsTimeout time.Duration
+	// HeaderBlockTimeout bounds how long the server may leave a response
+	// header block unfinished, waiting for CONTINUATION frames (default
+	// 10 s); past it the connection closes.
+	HeaderBlockTimeout time.Duration
 	// MaxDecoded caps the decoded size of one compressed response that is
 	// masked (default mask.DefaultMaxDecoded); past it the stream is reset.
 	MaxDecoded int64
@@ -90,17 +122,26 @@ var (
 )
 
 const (
-	errCodeNoError       = 0x0
-	errCodeProtocol      = 0x1
-	errCodeStreamClosed  = 0x5
-	errCodeInternal      = 0x2
-	errCodeFlowControl   = 0x3
-	errCodeFrameSize     = 0x6
-	errCodeRefusedStream = 0x7
-	errCodeCancel        = 0x8
-	errCodeCalm          = 0xb // ENHANCE_YOUR_CALM
-	decoderTableSize     = 1 << 16
-	maxWindow            = 1<<31 - 1
+	errCodeNoError         = 0x0
+	errCodeProtocol        = 0x1
+	errCodeStreamClosed    = 0x5
+	errCodeInternal        = 0x2
+	errCodeFlowControl     = 0x3
+	errCodeSettingsTimeout = 0x4
+	errCodeFrameSize       = 0x6
+	errCodeRefusedStream   = 0x7
+	errCodeCancel          = 0x8
+	errCodeCalm            = 0xb // ENHANCE_YOUR_CALM
+	// decoderTableSize is the largest HPACK table the relay's request
+	// decoder accepts, and so the largest the client is told it may use: the
+	// HPACK default, which is the table of the relay's upstream encoder too.
+	// With a larger client table, references to entries the encoder cannot
+	// index would go upstream as literals, a few bytes becoming kilobytes.
+	// Equal tables cut this but do not stop it: a literal the client does
+	// not index, which the encoder does, can evict an entry the client still
+	// refers to, so the ratio is not bounded.
+	decoderTableSize = 4096
+	maxWindow        = 1<<31 - 1
 	// maxResetStreams bounds how many client-reset streams are remembered
 	// so late server frames on them can still be passed on.
 	maxResetStreams = 1024
@@ -109,7 +150,16 @@ const (
 	// maxPriorityValue caps the Priority Field Value of a PRIORITY_UPDATE
 	// frame. RFC 9218 values are a few bytes ("u=3, i").
 	maxPriorityValue = 1024
+	// resetWindow is the period over which client resets are counted
+	// (clientDropped).
+	resetWindow = 10 * time.Second
 )
+
+// DefaultStepTimeout is the default of the timeouts on single protocol
+// steps: the client's preface, its ACK of a SETTINGS frame, and a server
+// header block. A peer that takes longer stalls the connection, so these
+// are short; browsers take milliseconds.
+const DefaultStepTimeout = 10 * time.Second
 
 type relay struct {
 	opts           Options
@@ -126,9 +176,36 @@ type relay struct {
 	lookupsRunning int
 	lookupQueue    []pendingLookup
 	asyncErrs      chan error
+	// panicked closes when one of the relay's goroutines panics (see
+	// contain); run then waits at most panicWait for the others, and
+	// returns panicErr, the first panic, whatever error reached it first.
+	panicked  chan struct{}
+	panicOnce sync.Once
+	panicErr  atomic.Pointer[panics.Error]
+	panicWait time.Duration
 	// streamErrors counts the client's stream errors (frames on a stream it
 	// ended); past maxStreamErrors they end the connection. clientLoop only.
 	streamErrors int
+	// resets counts the streams the client reset or had dropped since
+	// resetsSince (clientDropped). clientLoop only.
+	resets      int
+	resetsSince time.Time
+	now         func() time.Time // time.Now; tests replace it
+	// The SETTINGS frames sent to the client that it has not acknowledged
+	// yet (guarded by mu): their number, and the time by which each must be
+	// acknowledged, oldest first. ackDeadlines keeps at most
+	// maxUnackedSettings; when it runs out with frames still pending, the
+	// next deadline counts from the last ACK. ackTimer, armed while frames
+	// are pending (ackArmed), checks the oldest deadline.
+	ackPending   int
+	ackDeadlines []time.Time
+	ackTimer     *time.Timer
+	ackArmed     bool
+	// timeouts carries a protocol-step timeout found off the relay's loops
+	// (an unacknowledged SETTINGS frame), which ends the connection.
+	timeouts chan error
+	// decAllowed is the table size dec accepts (clientLoop only).
+	decAllowed uint32
 	// The largest frame each side may send: the client, what the server's
 	// SETTINGS told it; the server, what the client's told it. A longer one
 	// ends the connection with FRAME_SIZE_ERROR.
@@ -146,6 +223,17 @@ type relay struct {
 	enc         *hpack.Encoder
 	encBuf      bytes.Buffer
 	dec         *hpack.Decoder // used by the client reader only
+	// PING (control.go). clientStarted (guarded by serverMu) is set once the
+	// client's first SETTINGS went upstream. pingAcks (guarded by ackMu,
+	// taken after serverMu when both are held) holds the relay's answers to
+	// server PINGs until ackLoop, or the client's first SETTINGS, sends
+	// them; ackReady wakes ackLoop. pings is the data of the client's PINGs
+	// the server has not acknowledged, oldest first (guarded by mu).
+	clientStarted bool
+	ackMu         sync.Mutex
+	pingAcks      []Frame
+	ackReady      chan struct{}
+	pings         [][8]byte
 
 	mu           sync.Mutex
 	cond         *sync.Cond
@@ -166,13 +254,18 @@ type relay struct {
 	// client may have applied any prefix of them.
 	ackedInitial   int64
 	unackedInitial []int64
+	// The same for the HPACK table size the client's encoder may use, as
+	// forwarded (capped at decoderTableSize; -1: frame without one).
+	ackedTable   int64
+	unackedTable []int64
 	// settingsOverflow is set once unackedInitial overflowed: from then on
 	// the largest value ever sent is enforced.
 	settingsOverflow bool
 	maxInitialSent   int64
+	maxTableSent     int64
 	initialWindow    int64
 	maxFrame         int
-	held             int64 // request bytes held: buffered bodies plus unsent data
+	held             int64 // request bytes held: buffered bodies, unsent data and held header lists
 	// creditOwed is connection credit owed to the client for streamed bytes
 	// the relay discarded unsent; sendLoop returns it.
 	creditOwed int64
@@ -232,6 +325,11 @@ type stream struct {
 	priority  *Priority
 	body      bytes.Buffer
 	trailers  []hpack.HeaderField
+	// heldHeaders and heldTrailers are the decoded sizes of the request's
+	// header and trailer lists while the relay holds them (buffering,
+	// waiting for a lookup or a slot), counted in relay.held. Guarded by
+	// relay.mu.
+	heldHeaders, heldTrailers int64
 	// Control frames for a stream that has no server ID yet, combined so a
 	// client cannot grow them: the summed WINDOW_UPDATE increment and the
 	// latest PRIORITY_UPDATE.
@@ -285,6 +383,15 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	if opts.PrefaceTimeout <= 0 {
 		opts.PrefaceTimeout = 30 * time.Second
 	}
+	if opts.ClientPrefaceTimeout <= 0 {
+		opts.ClientPrefaceTimeout = DefaultStepTimeout
+	}
+	if opts.SettingsTimeout <= 0 {
+		opts.SettingsTimeout = DefaultStepTimeout
+	}
+	if opts.HeaderBlockTimeout <= 0 {
+		opts.HeaderBlockTimeout = DefaultStepTimeout
+	}
 	if opts.MaxDecoded <= 0 {
 		opts.MaxDecoded = mask.DefaultMaxDecoded
 	}
@@ -297,9 +404,14 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 
 		nextServerID: 1, connWindow: defaultWindow, initialWindow: defaultWindow, maxFrame: defaultMaxFrame,
 		recvConn: defaultWindow, clientInitial: defaultWindow, maxConcurrent: -1, ackedInitial: defaultWindow, maxInitialSent: defaultWindow,
+		decAllowed: decoderTableSize, ackedTable: decoderTableSize, maxTableSent: decoderTableSize,
+		now: time.Now,
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.asyncErrs = make(chan error, 1)
+	r.panicked, r.panicWait = make(chan struct{}), defaultPanicWait
+	r.timeouts = make(chan error, 1)
+	r.ackReady = make(chan struct{}, 1)
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
@@ -319,14 +431,24 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 // errNoServerPreface is a server that sent no SETTINGS in time.
 var errNoServerPreface = errors.New("server sent no SETTINGS frame in time")
 
+// errClientPreface is a client that sent no HTTP/2 preface in time.
+var errClientPreface = errors.New("client sent no HTTP/2 preface in time")
+
+// errSettingsTimeout is a client that did not acknowledge SETTINGS in time.
+var errSettingsTimeout = errors.New("client did not acknowledge SETTINGS in time")
+
+// errHeaderBlockTimeout is a server that left a header block unfinished.
+var errHeaderBlockTimeout = errors.New("server did not finish a header block in time")
+
 // errHeldFrames is more relay frames waiting for the server's SETTINGS
 // than the buffer budget allows.
 var errHeldFrames = errors.New("too many frames waiting for the server's SETTINGS")
 
 func (r *relay) run() error {
-	errs := make(chan error, 3)
+	errs := make(chan error, 4)
 	timeout := make(chan error, 1)
 	timer := time.AfterFunc(r.opts.PrefaceTimeout, func() {
+		defer panics.Recover(r.contain)
 		// No clientMu here: a writer stuck on a client that stopped reading
 		// may hold it.
 		if !r.prefaceSent.Load() {
@@ -334,34 +456,90 @@ func (r *relay) run() error {
 		}
 	})
 	defer timer.Stop()
-	pending := 3
+	pending := 4
 	if r.masking {
-		errs = make(chan error, 4)
-		pending = 4
-		go func() { errs <- r.serverLoopMasked() }()
-		go func() { errs <- r.clientSendLoop() }()
+		errs = make(chan error, 5)
+		pending = 5
+		r.start(errs, r.serverLoopMasked)
+		r.start(errs, r.clientSendLoop)
 	} else {
-		go func() { errs <- r.serverLoop() }()
+		r.start(errs, r.serverLoop)
 	}
-	go func() { errs <- r.clientLoop() }()
-	go func() { errs <- r.sendLoop() }()
+	r.start(errs, r.clientLoop)
+	r.start(errs, r.sendLoop)
+	r.start(errs, r.ackLoop)
 	var first error
 	select {
 	case first = <-errs:
 		pending--
 	case first = <-timeout:
+	case first = <-r.timeouts:
 	case first = <-r.asyncErrs:
 	}
-	r.shutdown()
-	for ; pending > 0; pending-- {
-		<-errs //nolint:errcheck // waits for the other loops; first is the cause
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		defer panics.Recover(r.contain)
+		r.shutdown()
+		for ; pending > 0; pending-- {
+			<-errs //nolint:errcheck // waits for the other loops; first is the cause
+		}
+		// shutdown canceled every lookup; none outlives the relay.
+		r.lookups.Wait()
+	}()
+	select {
+	case <-ended:
+	case <-r.panicked:
+		// The panic may have left a lock held, which the goroutines
+		// waiting on it never get: the relay stops waiting for them.
+		select {
+		case <-ended:
+		case <-time.After(r.panicWait):
+			r.opts.Logger.Warn("stopped waiting for the relay's goroutines after a panic", "after", r.panicWait)
+		}
 	}
-	// shutdown canceled every lookup; none outlives the relay.
-	r.lookups.Wait()
+	// The panic closed both connections, which may have ended another
+	// goroutine first, or came after another error: it is the cause.
+	if p := r.panicErr.Load(); p != nil {
+		return p
+	}
 	if errors.Is(first, io.EOF) || errors.Is(first, net.ErrClosed) {
 		return nil
 	}
 	return first
+}
+
+// defaultPanicWait bounds how long run waits for the relay's goroutines
+// after one of them panicked.
+const defaultPanicWait = 5 * time.Second
+
+// start runs loop on a goroutine that sends its result to errs, or the
+// panic that ended it.
+func (r *relay) start(errs chan<- error, loop func() error) {
+	go func() {
+		defer panics.Recover(func(p *panics.Error) {
+			r.contain(p)
+			errs <- p
+		})
+		errs <- loop()
+	}()
+}
+
+// contain is the panic handler of every goroutine the relay starts. It
+// logs where the panic happened, not its value, and ends the connection
+// without taking a lock, which the panic may have left held: both
+// connections close, which ends the other goroutines' I/O, and run stops
+// waiting.
+func (r *relay) contain(p *panics.Error) {
+	r.panicErr.CompareAndSwap(nil, p)
+	r.opts.Logger.Error("HTTP/2 relay panicked; closing the connection", "panic_type", p.Type, "at", p.Site)
+	r.panicOnce.Do(func() { close(r.panicked) })
+	r.cancel()
+	panics.Abort(r.server, r.client)
+	select {
+	case r.asyncErrs <- p:
+	default:
+	}
 }
 
 // shutdown ends the relay. It must not wait on a goroutine stuck in I/O
@@ -376,6 +554,9 @@ func (r *relay) shutdown() {
 	r.cancel()
 	r.mu.Lock()
 	r.closed = true
+	if r.ackTimer != nil {
+		r.ackTimer.Stop()
+	}
 	r.cond.Broadcast()
 	r.mu.Unlock()
 	_ = r.server.Close()
@@ -516,9 +697,19 @@ func (r *relay) connectionError(code uint32, cause error) error {
 }
 
 // clientLoop reads the client's frames and sends them on.
+//
+// The client's connection preface, the magic and the frame after it (RFC
+// 9113 3.4: its SETTINGS), must arrive within ClientPrefaceTimeout. A
+// client that opens the connection and stays silent would otherwise hold
+// it, and the destination's, for good.
 func (r *relay) clientLoop() error {
+	_ = r.client.SetReadDeadline(time.Now().Add(r.opts.ClientPrefaceTimeout))
+	inPreface := true
 	preface := make([]byte, len(Preface))
 	if _, err := io.ReadFull(r.client, preface); err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return errClientPreface
+		}
 		return fmt.Errorf("read client preface: %w", err)
 	}
 	if string(preface) != Preface {
@@ -548,8 +739,15 @@ func (r *relay) clientLoop() error {
 		if errors.Is(err, ErrFrameSize) {
 			return r.connectionError(errCodeFrameSize, fmt.Errorf("client: %w", err))
 		}
+		if inPreface && errors.Is(err, os.ErrDeadlineExceeded) {
+			return errClientPreface
+		}
 		if err != nil {
 			return err
+		}
+		if inPreface {
+			inPreface = false
+			_ = r.client.SetReadDeadline(time.Time{})
 		}
 		if inBlock && (f.Type != FrameContinuation || f.Stream != blockStream) {
 			return errors.New("client interrupted a header block")
@@ -588,9 +786,9 @@ func (r *relay) clientLoop() error {
 			err = r.onPriorityUpdate(f)
 		case FramePushPromise:
 			return errors.New("client sent PUSH_PROMISE")
-		default:
-			// SETTINGS (and their ACKs), PING, GOAWAY and unknown frame
-			// types go upstream exactly as the client sent them.
+		case FrameSettings, FrameGoAway:
+			// SETTINGS (and their ACKs) and GOAWAY go upstream exactly as
+			// the client sent them.
 			if f.Type == FrameSettings && f.Flags&FlagAck != 0 {
 				r.clientFrames.ack()
 				if err := r.applyClientAck(); err != nil {
@@ -605,7 +803,16 @@ func (r *relay) clientLoop() error {
 				}
 				r.serverFrames.sent(f.Payload)
 			}
-			err = r.writeServer(f)
+			if f.Type == FrameSettings {
+				err = r.forwardClientSettings(f)
+			} else {
+				err = r.writeServer(f)
+			}
+		case FramePing:
+			// PINGs go upstream as the client sent them; its ACKs do not.
+			err = r.onClientPing(f)
+		default:
+			err = r.onUnknown(f)
 		}
 		if err != nil {
 			return err
@@ -623,6 +830,18 @@ func (r *relay) clientLoop() error {
 // (RFC 9113 accounting: name, value and 32 bytes per field) passes the limit.
 // HPACK can expand a small block into a large list through table references.
 func (r *relay) decode(block []byte) ([]hpack.HeaderField, error) {
+	r.mu.Lock()
+	allowed := uint32(r.possibleTableLocked())
+	r.mu.Unlock()
+	if allowed != r.decAllowed {
+		if allowed < r.decAllowed {
+			// The client acknowledged a lower size, so its encoder no longer
+			// uses entries past it (RFC 7541 4.2): neither does the decoder.
+			r.dec.SetMaxDynamicTableSize(allowed)
+		}
+		r.dec.SetAllowedMaxDynamicTableSize(allowed)
+		r.decAllowed = allowed
+	}
 	var fields []hpack.HeaderField
 	size, overflow := 0, false
 	r.dec.SetEmitFunc(func(f hpack.HeaderField) {
@@ -678,15 +897,47 @@ func (r *relay) forStream(f Frame) error {
 				// RFC 9113 6.9.1: a window above 2^31-1 is an error for the stream.
 				r.dropLocked(s)
 				r.mu.Unlock()
+				if err := r.clientDropped(); err != nil {
+					return err
+				}
 				return r.writeClient(refusal(s.clientID))
 			}
+			r.mu.Unlock()
+			return nil
 		}
 		r.mu.Unlock()
-		return nil
+		return r.clientDropped()
 	}
 	f.Stream = s.serverID
 	r.mu.Unlock()
+	if f.Type == FrameRSTStream {
+		if err := r.clientDropped(); err != nil {
+			return err
+		}
+	}
 	return r.writeServer(f)
+}
+
+// errTooManyResets is a client that reset too many streams in a period.
+var errTooManyResets = errors.New("client reset too many streams")
+
+// clientDropped counts a stream the client reset, or made the relay drop,
+// while the relay still held it. Each such drop frees a stream slot and
+// cancels the stream's lookup at once, so without a bound a client could
+// have the destination open streams, and the resolver start lookups, as
+// fast as it sends frames (rapid reset, CVE-2023-44487). Past twice
+// MaxStreams within resetWindow, enough for a browser to cancel every open
+// request twice over, the connection ends with ENHANCE_YOUR_CALM.
+func (r *relay) clientDropped() error {
+	now := r.now()
+	if now.Sub(r.resetsSince) >= resetWindow {
+		r.resets, r.resetsSince = 0, now
+	}
+	r.resets++
+	if r.resets > 2*r.opts.MaxStreams {
+		return r.connectionError(errCodeCalm, errTooManyResets)
+	}
+	return nil
 }
 
 // openStreamsLocked counts the client streams the relay holds state for:
@@ -709,7 +960,8 @@ func (r *relay) openStreamsLocked() int {
 // decoding any header block; with masking, the response side ends here
 // (endRespLocked) and the server's remaining frames are absorbed.
 func (r *relay) dropLocked(s *stream) {
-	r.held -= int64(s.body.Len() + len(s.out))
+	r.held -= int64(s.body.Len()+len(s.out)) + s.heldHeaders + s.heldTrailers
+	s.heldHeaders, s.heldTrailers = 0, 0
 	if s.streaming && len(s.out) > 0 {
 		// Streamed bytes are credited once sent upstream; these never will
 		// be, so their connection credit is returned here. Buffered bodies
@@ -858,6 +1110,25 @@ func (r *relay) onPriorityUpdate(f Frame) error {
 	return r.writeServer(f)
 }
 
+// onUnknown forwards a client frame of an unknown or extension type. One on
+// stream 0 goes upstream as the client sent it. One on a stream goes under
+// that stream's server ID, as the client's ID may be another stream's
+// upstream; with no stream upstream for it (still buffering, closed or
+// idle), it is dropped, as RFC 9113 5.5 lets an endpoint do.
+func (r *relay) onUnknown(f Frame) error {
+	if f.Stream != 0 {
+		r.mu.Lock()
+		s := r.streams[f.Stream]
+		if s == nil || s.serverID == 0 {
+			r.mu.Unlock()
+			return nil
+		}
+		f.Stream = s.serverID
+		r.mu.Unlock()
+	}
+	return r.writeServer(f)
+}
+
 func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, block []byte) error {
 	// Every block is decoded, even for refused or closed streams, to keep the
 	// HPACK table in step with the client's encoder.
@@ -904,7 +1175,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		// (finish), with a single lookup for its headers, body and trailers.
 		// Any other request on an allowlisted authority is prepared here;
 		// one that needs a lookup waits for it off this loop (lookup.go).
-		buffered := !endStream && s.swap && method != "CONNECT"
+		buffered := !endStream && s.swap
 		var lookup *scope.Lookup
 		if s.swap && !buffered {
 			if lookup, err = r.opts.Session.Prepare(fieldText(fields)...); err != nil {
@@ -920,7 +1191,16 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		} else {
 			s.streaming = !endStream
 		}
+		// The header list counts toward MaxBuffered until it goes upstream.
+		size := fieldsSize(fields)
 		r.mu.Lock()
+		if r.held+size > int64(r.opts.MaxBuffered) {
+			r.mu.Unlock()
+			r.opts.Logger.Error("refusing a request whose headers pass the connection buffer limit", "stream", clientID, "connection_limit_bytes", r.opts.MaxBuffered)
+			return r.writeClient(refusal(clientID))
+		}
+		r.held += size
+		s.heldHeaders = size
 		s.recvWindow = r.clientInitial
 		r.streams[clientID] = s
 		if r.masking {
@@ -954,21 +1234,50 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		return nil
 	}
 
-	// Trailers. A buffered request's are swapped with its body in finish;
-	// a streamed request (extended CONNECT) on an allowlisted authority gets
-	// a lookup of its own. A header block after the client ended the stream
-	// is a stream error.
+	// Trailers. A buffered request's are swapped with its body in finish.
+	// Every request with a body on an allowlisted authority is buffered,
+	// but a streamed one there would get a lookup of its own. A header block
+	// after the client ended the stream is a stream error.
 	r.mu.Lock()
 	buffering, ended := s.buffering, s.clientEnded
 	r.mu.Unlock()
 	if ended {
 		return r.endedStream(s, 0)
 	}
+	// Malformed trailers end the request: a buffered one is answered 502, a
+	// streamed one, already upstream, is reset.
+	if name, bad := malformedValue(fields); bad {
+		cause := fmt.Errorf("%w: trailer %q has a malformed value", scope.ErrRefused, name)
+		if buffering {
+			r.mu.Lock()
+			s.clientEnded = s.clientEnded || endStream
+			r.mu.Unlock()
+			return r.refuseLookup(s, cause)
+		}
+		r.opts.Logger.Warn("resetting a request with malformed trailers", "stream", clientID, "reason", cause.Error())
+		return r.abort(s, errCodeProtocol)
+	}
+	// Trailers count toward MaxBuffered until they go upstream, in place of
+	// any the stream sent before.
+	size := fieldsSize(fields)
+	r.mu.Lock()
+	if r.streams[clientID] != s {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.held-s.heldTrailers+size > int64(r.opts.MaxBuffered) {
+		r.mu.Unlock()
+		r.opts.Logger.Error("resetting a request whose trailers pass the connection buffer limit", "stream", clientID, "connection_limit_bytes", r.opts.MaxBuffered)
+		return r.clientAbort(s, errCodeCalm)
+	}
+	r.held += size - s.heldTrailers
+	s.heldTrailers = size
+	r.mu.Unlock()
 	if s.swap && !buffering {
 		lookup, err := r.opts.Session.Prepare(fieldText(fields)...)
 		if err != nil {
 			r.opts.Logger.Error("resetting a request whose trailers cannot be sent", "stream", clientID, "error", err)
-			return r.abort(s, errCodeCalm)
+			return r.clientAbort(s, errCodeCalm)
 		}
 		if lookup != nil {
 			r.mu.Lock()
@@ -980,6 +1289,10 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 				}
 				if err != nil {
 					r.opts.Logger.Error("resetting a request whose trailers cannot be sent", "stream", s.clientID, "error", err)
+					return r.abort(s, errCodeCalm)
+				}
+				if !r.recountFields(s, nil, fields) {
+					r.opts.Logger.Error("resetting a request whose swapped trailers pass the connection buffer limit", "stream", s.clientID, "connection_limit_bytes", r.opts.MaxBuffered)
 					return r.abort(s, errCodeCalm)
 				}
 				r.mu.Lock()
@@ -1009,28 +1322,59 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 }
 
 // requestHead returns a request's :method and the authorities it names
-// (:authority, host), refusing a malformed request (RFC 9113 8.2.1, 8.3.1)
+// (:authority, host), refusing a malformed request (RFC 9113 8.2.1, 8.3)
 // that a server could read differently from the relay: a field name with an
 // uppercase character, which the relay would not take for the framing field
-// it is ("Content-Length" would keep its length after a body swap), or more
+// it is ("Content-Length" would keep its length after a body swap); more
 // than one :authority or host, of which a server may use another than the
-// one checked. Session.CheckAuthority refuses a host that disagrees with
-// :authority.
+// one checked; or a pseudo-header that is repeated, unknown, or after a
+// regular field, which a server may read otherwise or not at all (with two
+// :method fields, the relay would take a POST for a CONNECT, whose response
+// it does not mask), or a malformed field value. Session.CheckAuthority
+// refuses a host that disagrees with :authority.
+//
+// It also refuses every CONNECT, an extended CONNECT (RFC 8441) for a
+// WebSocket included, any request with a :protocol, and more than one
+// :method, of which a server may use another than the relay. A CONNECT asks
+// for a tunnel, which masking cannot follow, and nothing in a 2xx to it
+// shows whether a tunnel or a catch-all handler answered: either way the
+// values swapped into the request would come back unmasked. The client
+// never learns that the server supports extended CONNECT (clientSettings),
+// so a browser opens its WebSockets over HTTP/1.1, where only a 101 opens
+// one.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
-	authorityFields, hostFields, uppercase := 0, 0, ""
+	methodFields, authorityFields, hostFields, protocolFields, uppercase := 0, 0, 0, 0, ""
+	pseudo, badPseudo, regular := map[string]bool{}, "", false
+	malformed, hasMalformed := malformedValue(fields)
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
 		}
+		if !strings.HasPrefix(f.Name, ":") {
+			regular = true
+		} else if badPseudo == "" {
+			switch {
+			case !requestPseudo[f.Name]:
+				badPseudo = fmt.Sprintf("unknown pseudo-header %q", f.Name)
+			case pseudo[f.Name]:
+				badPseudo = "more than one " + f.Name + " field"
+			case regular:
+				badPseudo = f.Name + " after a regular field"
+			}
+			pseudo[f.Name] = true
+		}
 		switch f.Name {
 		case ":method":
 			method = f.Value
+			methodFields++
 		case ":authority":
 			authorities = append(authorities, f.Value)
 			authorityFields++
 		case "host":
 			authorities = append(authorities, f.Value)
 			hostFields++
+		case ":protocol":
+			protocolFields++
 		}
 	}
 	switch {
@@ -1038,8 +1382,36 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
 	case authorityFields > 1 || hostFields > 1:
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
+	case badPseudo != "":
+		err = fmt.Errorf("%w: %s", scope.ErrRefused, badPseudo)
+	case methodFields > 1:
+		err = fmt.Errorf("%w: more than one :method field", scope.ErrRefused)
+	case strings.EqualFold(method, "CONNECT") || protocolFields > 0:
+		err = fmt.Errorf("%w: a CONNECT or :protocol, which would open a tunnel", scope.ErrRefused)
+	case hasMalformed:
+		err = fmt.Errorf("%w: field %q has a malformed value", scope.ErrRefused, malformed)
 	}
 	return method, authorities, err
+}
+
+// requestPseudo are the pseudo-headers a request may have (RFC 9113 8.3.1,
+// and :protocol for extended CONNECT, RFC 8441).
+var requestPseudo = map[string]bool{":method": true, ":scheme": true, ":authority": true, ":path": true, ":protocol": true}
+
+// malformedValue returns the name of the first field whose value RFC 9113
+// 8.2.1 forbids: one holding a NUL, CR or LF, which a server or a later
+// HTTP/1.1 hop could split the field on, or starting or ending with a space
+// or tab. It reports false when every value is well formed; the name may be
+// empty, so callers go by the boolean.
+func malformedValue(fields []hpack.HeaderField) (name string, malformed bool) {
+	for _, f := range fields {
+		v := f.Value
+		if strings.ContainsAny(v, "\x00\r\n") ||
+			v != "" && (v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
+			return f.Name, true
+		}
+	}
+	return "", false
 }
 
 // fieldText is the text of a header list that stand-ins are swapped in: the
@@ -1114,6 +1486,43 @@ func (r *relay) swapFields(swapper *swap.Swapper, fields []hpack.HeaderField, au
 	return nil
 }
 
+// recountFields charges the swapped size of a stream's held header and
+// trailer lists (nil: unchanged) in place of what was counted before the
+// swap: real values may be longer than their stand-ins. It reports false,
+// changing nothing, when that would pass MaxBuffered; a stream dropped
+// meanwhile holds nothing and is left alone.
+func (r *relay) recountFields(s *stream, headers, trailers []hpack.HeaderField) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.streams[s.clientID] != s {
+		return true
+	}
+	h, t := s.heldHeaders, s.heldTrailers
+	if headers != nil {
+		h = fieldsSize(headers)
+	}
+	if trailers != nil {
+		t = fieldsSize(trailers)
+	}
+	grow := h - s.heldHeaders + t - s.heldTrailers
+	if r.held+grow > int64(r.opts.MaxBuffered) {
+		return false
+	}
+	r.held += grow
+	s.heldHeaders, s.heldTrailers = h, t
+	return true
+}
+
+// fieldsSize is the decoded size of a header list as RFC 9113 counts it:
+// name, value and 32 bytes per field.
+func fieldsSize(fields []hpack.HeaderField) int64 {
+	n := int64(0)
+	for _, f := range fields {
+		n += int64(len(f.Name) + len(f.Value) + 32)
+	}
+	return n
+}
+
 // framingHeaders describe the message, not its content: a stand-in that
 // happens to match their value ("123" in content-length: 123) is not one.
 // content-length is set from the body that is actually sent.
@@ -1141,6 +1550,17 @@ func (r *relay) abort(s *stream, clientCode uint32) error {
 		return err
 	}
 	return r.writeClient(Frame{Type: FrameRSTStream, Stream: s.clientID, Payload: binary.BigEndian.AppendUint32(nil, clientCode)})
+}
+
+// clientAbort is abort for a stream the client's own frames made the relay
+// drop, on clientLoop. The drop frees a slot and cancels the stream's
+// lookup as a reset does, so it counts toward the reset limit
+// (clientDropped).
+func (r *relay) clientAbort(s *stream, clientCode uint32) error {
+	if err := r.abort(s, clientCode); err != nil {
+		return err
+	}
+	return r.clientDropped()
 }
 
 // open sends a request's HEADERS upstream under a new server stream ID,
@@ -1178,6 +1598,8 @@ func (r *relay) openStream(s *stream, fields []hpack.HeaderField, priority *Prio
 	s.serverID = r.nextServerID
 	r.nextServerID += 2
 	r.byServer[s.serverID] = s
+	r.held -= s.heldHeaders // the header list is on its way upstream
+	s.heldHeaders = 0
 	if rs := r.resp[s.clientID]; rs != nil {
 		rs.serverID = s.serverID
 	}
@@ -1312,6 +1734,9 @@ func (r *relay) onData(f Frame) error {
 			r.mu.Unlock()
 			r.opts.Logger.Error("refusing a request body over the buffer limit",
 				"stream", f.Stream, "body_limit_bytes", r.opts.MaxBody, "connection_limit_bytes", r.opts.MaxBuffered, "connection_limit_reached", overConn)
+			if err := r.clientDropped(); err != nil {
+				return err
+			}
 			if err := r.writeClient(refusal(f.Stream)); err != nil {
 				return err
 			}
@@ -1331,7 +1756,7 @@ func (r *relay) onData(f Frame) error {
 	if r.held+int64(len(data)) > int64(r.opts.MaxBuffered) {
 		r.mu.Unlock()
 		r.opts.Logger.Error("resetting a streamed upload over the connection buffer limit", "stream", f.Stream, "connection_limit_bytes", r.opts.MaxBuffered)
-		if err := r.abort(s, errCodeCalm); err != nil {
+		if err := r.clientAbort(s, errCodeCalm); err != nil {
 			return err
 		}
 		return r.creditClient(0, len(f.Payload), false)
@@ -1397,9 +1822,6 @@ func (r *relay) finish(s *stream) error {
 // finishSwapped swaps a buffered request's headers, trailers and body with
 // swapper (nil: nothing to swap) and sends the request upstream.
 func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.HeaderField, priority *Priority, trailers []hpack.HeaderField, original []byte, contentType string) error {
-	r.mu.Lock()
-	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
-	r.mu.Unlock()
 	var err error
 	body, changed := original, false
 	if swapper != nil {
@@ -1409,6 +1831,15 @@ func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.
 				return r.abort(s, errCodeRefusedStream)
 			}
 		}
+		if !r.recountFields(s, headers, trailers) {
+			r.opts.Logger.Error("refusing a request whose swapped headers pass the connection buffer limit", "stream", s.clientID, "connection_limit_bytes", r.opts.MaxBuffered)
+			return r.abort(s, errCodeRefusedStream)
+		}
+	}
+	r.mu.Lock()
+	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
+	r.mu.Unlock()
+	if swapper != nil {
 		body, changed, err = swapper.Body(contentType, original, int(max(limit, 0)))
 	}
 	if err != nil {
@@ -1423,7 +1854,9 @@ func (r *relay) finishSwapped(s *stream, swapper *swap.Swapper, headers []hpack.
 		}
 	}
 	if changed {
-		r.opts.Logger.Info("swapped stand-ins in a request body", "bytes_before", len(original), "bytes_after", len(body))
+		// No sizes: with the stand-ins known, the change in length gives
+		// away the real values' lengths.
+		r.opts.Logger.Info("swapped stand-ins in a request body", "authority", s.authority)
 	}
 
 	r.mu.Lock()
@@ -1546,6 +1979,8 @@ func (r *relay) sendLoop() error {
 		end := len(s.out) == 0 && s.outEnd
 		if end {
 			trailers = s.trailers
+			r.held -= s.heldTrailers
+			s.heldTrailers = 0
 			r.dequeue(s)
 			r.forgetIfDoneLocked(s)
 		}
@@ -1655,8 +2090,14 @@ func (r *relay) serverLoop() error {
 			}
 			_, err = r.client.Write(encodeFrames([]Frame{f}))
 			if f.Flags&FlagEndHeaders == 0 {
+				if block == nil {
+					r.serverBlock(true)
+				}
 				block = s
 				break
+			}
+			if block != nil {
+				r.serverBlock(false)
 			}
 			block = nil
 			r.clientMu.Unlock()
@@ -1686,8 +2127,10 @@ func (r *relay) serverLoop() error {
 			return errors.New("server sent PUSH_PROMISE, which this proxy does not support")
 		case FrameGoAway:
 			err = r.onServerGoAway(f)
+		case FramePing:
+			err = r.onServerPing(f)
 		default:
-			err = r.writeClient(f)
+			// An extension or unknown frame type (control.go): dropped.
 		}
 		if err != nil {
 			return err
@@ -1704,7 +2147,25 @@ func (r *relay) readServerFrame() (Frame, error) {
 		r.goAwayServer(errCodeFrameSize)
 		return Frame{}, fmt.Errorf("server: %w", err)
 	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		// The only read deadline on the server is serverBlock's.
+		return Frame{}, errHeaderBlockTimeout
+	}
 	return f, err
+}
+
+// serverBlock bounds by HeaderBlockTimeout the time the server's header
+// block may stay open: open starts the clock when a block begins without
+// END_HEADERS, and !open stops it when the block ends. The server can send
+// no other frame meanwhile (RFC 9113 6.10), so every response waits, and
+// without masking the relay also holds the client write lock: a server
+// that stalls mid-block stalls the whole connection.
+func (r *relay) serverBlock(open bool) {
+	if open {
+		_ = r.server.SetReadDeadline(time.Now().Add(r.opts.HeaderBlockTimeout))
+	} else {
+		_ = r.server.SetReadDeadline(time.Time{})
+	}
 }
 
 // goAwayWait bounds how long the relay waits to tell the server with GOAWAY
@@ -1723,6 +2184,7 @@ func (r *relay) goAwayServer(code uint32) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		defer panics.Recover(r.contain)
 		r.serverMu.Lock()
 		defer r.serverMu.Unlock()
 		_ = r.server.SetWriteDeadline(time.Now().Add(goAwayWait))
@@ -1767,10 +2229,12 @@ func (r *relay) serverEnded(s *stream, reset bool) {
 	r.forgetIfDoneLocked(s)
 }
 
-// onServerGoAway passes the server's GOAWAY on. Requests the server will not
-// process (still buffering here, or above its last stream ID) are refused
-// with REFUSED_STREAM so the client can retry them elsewhere, and the
-// relay sends no new request upstream afterwards.
+// onServerGoAway passes the server's GOAWAY on, with its last stream ID
+// translated and without its debug data, which only describes the server's
+// side and can echo a real value. Requests the server will not process
+// (still buffering here, or above its last stream ID) are refused with
+// REFUSED_STREAM so the client can retry them elsewhere, and the relay
+// sends no new request upstream afterwards.
 func (r *relay) onServerGoAway(f Frame) error {
 	if len(f.Payload) < 8 {
 		return errors.New("server sent a bad GOAWAY")
@@ -1795,7 +2259,7 @@ func (r *relay) onServerGoAway(f Frame) error {
 	if len(refused) > 0 {
 		r.opts.Logger.Warn("server is going away, refusing requests it will not process", "streams", len(refused))
 	}
-	f.Payload = append(binary.BigEndian.AppendUint32(nil, translated), f.Payload[4:]...)
+	f.Payload = append(binary.BigEndian.AppendUint32(nil, translated), f.Payload[4:8]...)
 	return r.writeClient(append(refused, f)...)
 }
 
@@ -1840,8 +2304,25 @@ func (r *relay) possibleInitialLocked() int64 {
 	if r.settingsOverflow {
 		return r.maxInitialSent
 	}
-	state, largest := r.ackedInitial, r.ackedInitial
-	for _, v := range r.unackedInitial {
+	return largestState(r.ackedInitial, r.unackedInitial)
+}
+
+// possibleTableLocked is the largest HPACK table the client's encoder may be
+// using, the same way: it grows as soon as a larger size is sent, and
+// shrinks only once the client acknowledged a smaller one.
+func (r *relay) possibleTableLocked() int64 {
+	if r.settingsOverflow {
+		return r.maxTableSent
+	}
+	return largestState(r.ackedTable, r.unackedTable)
+}
+
+// largestState is the largest value a setting may have for the client:
+// acked, or its value after any prefix of the unacknowledged frames, each
+// with its value or -1 for a frame without the setting.
+func largestState(acked int64, unacked []int64) int64 {
+	state, largest := acked, acked
+	for _, v := range unacked {
 		if v >= 0 {
 			state = v
 		}
@@ -1855,6 +2336,7 @@ func (r *relay) possibleInitialLocked() int64 {
 // Buffering streams a decrease leaves short are topped up again.
 func (r *relay) applyClientAck() error {
 	r.mu.Lock()
+	r.settingsAckedLocked(time.Now())
 	if len(r.unackedInitial) == 0 {
 		r.mu.Unlock()
 		return nil
@@ -1862,7 +2344,11 @@ func (r *relay) applyClientAck() error {
 	if v := r.unackedInitial[0]; v >= 0 {
 		r.ackedInitial = v
 	}
+	if v := r.unackedTable[0]; v >= 0 {
+		r.ackedTable = v
+	}
 	r.unackedInitial = r.unackedInitial[1:]
+	r.unackedTable = r.unackedTable[1:]
 	r.setClientInitialLocked(r.possibleInitialLocked())
 	topUp := r.topUpBufferingLocked()
 	r.mu.Unlock()
@@ -1873,16 +2359,28 @@ func (r *relay) applyClientAck() error {
 }
 
 // clientSettings is the server's SETTINGS payload as the client receives it:
-// unchanged except that SETTINGS_HEADER_TABLE_SIZE is lowered to what the
-// relay's request decoder accepts. That value only bounds the client's own
-// HPACK encoder, whose output the relay decodes and encodes again, so the
-// server sees no difference.
+// unchanged except for two settings. SETTINGS_HEADER_TABLE_SIZE is lowered
+// to what the relay's request decoder accepts. That value only bounds the
+// client's own HPACK encoder, whose output the relay decodes and encodes
+// again, so the server sees no difference. SETTINGS_ENABLE_CONNECT_PROTOCOL
+// is dropped: the relay refuses every CONNECT (requestHead), and a client
+// may only send an extended CONNECT after it got that setting with value 1
+// (RFC 8441 section 3), so a browser opens its WebSockets over HTTP/1.1
+// instead of sending one to be refused.
 func clientSettings(payload []byte) []byte {
-	out := append([]byte{}, payload...)
-	for i := 0; i+6 <= len(out); i += 6 {
-		if binary.BigEndian.Uint16(out[i:]) == SettingHeaderTableSize && binary.BigEndian.Uint32(out[i+2:]) > decoderTableSize {
-			binary.BigEndian.PutUint32(out[i+2:], decoderTableSize)
+	out := make([]byte, 0, len(payload))
+	for i := 0; i+6 <= len(payload); i += 6 {
+		setting := payload[i : i+6]
+		switch binary.BigEndian.Uint16(setting) {
+		case SettingEnableConnectProtocol:
+			continue
+		case SettingHeaderTableSize:
+			if binary.BigEndian.Uint32(setting[2:]) > decoderTableSize {
+				out = binary.BigEndian.AppendUint32(append(out, setting[:2]...), decoderTableSize)
+				continue
+			}
 		}
+		out = append(out, setting...)
 	}
 	return out
 }
@@ -1895,32 +2393,38 @@ func (r *relay) onServerSettings(payload []byte) error {
 	// Before the client can read the frame, so its frames sized to the new
 	// value are let through.
 	r.clientFrames.sent(payload)
-	initial := int64(-1)
+	initial, table := int64(-1), int64(-1)
 	for _, s := range settings {
-		if s.ID == SettingInitialWindowSize {
+		switch s.ID {
+		case SettingInitialWindowSize:
 			initial = int64(s.Value)
+		case SettingHeaderTableSize:
+			table = int64(min(s.Value, decoderTableSize)) // as clientSettings forwards it
 		}
 	}
 	r.mu.Lock()
 	r.unackedInitial = append(r.unackedInitial, initial)
+	r.unackedTable = append(r.unackedTable, table)
 	r.maxInitialSent = max(r.maxInitialSent, initial)
+	r.maxTableSent = max(r.maxTableSent, table)
 	if len(r.unackedInitial) > maxUnackedSettings {
 		r.unackedInitial = r.unackedInitial[1:]
+		r.unackedTable = r.unackedTable[1:]
 		r.settingsOverflow = true
 	}
 	r.setClientInitialLocked(r.possibleInitialLocked())
 	topUp := r.topUpBufferingLocked()
 	r.mu.Unlock()
-	if len(topUp) > 0 {
-		if err := r.writeClient(topUp...); err != nil {
-			return err
-		}
-	}
 	for _, s := range settings {
 		switch s.ID {
 		case SettingHeaderTableSize:
+			// The upstream table is as large as the client's may be, within
+			// what the server allows: after a lower value it grows back.
 			r.serverMu.Lock()
 			r.enc.SetMaxDynamicTableSizeLimit(s.Value)
+			if size := min(s.Value, decoderTableSize); r.enc.MaxDynamicTableSize() < size {
+				r.enc.SetMaxDynamicTableSize(size)
+			}
 			r.serverMu.Unlock()
 		case SettingInitialWindowSize:
 			if s.Value > 1<<31-1 {
@@ -1949,5 +2453,104 @@ func (r *relay) onServerSettings(payload []byte) error {
 			r.mu.Unlock()
 		}
 	}
+	// The ACK clock starts only now, as forwarding begins: the serverMu wait
+	// above lasts as long as an upload's write to a destination that is slow
+	// to read, which is no fault of the client. The client cannot
+	// acknowledge the frame before the caller writes it, so no ACK comes
+	// ahead of this record. Writes to the client from here on are timed: a
+	// client that stops reading does not hold the connection.
+	r.mu.Lock()
+	r.settingsSentLocked(time.Now())
+	r.mu.Unlock()
+	if len(topUp) > 0 {
+		return r.writeClient(topUp...)
+	}
 	return nil
+}
+
+// settingsSentLocked records a SETTINGS frame sent to the client at now,
+// which it must acknowledge within SettingsTimeout.
+func (r *relay) settingsSentLocked(now time.Time) {
+	r.ackPending++
+	if len(r.ackDeadlines) < maxUnackedSettings {
+		r.ackDeadlines = append(r.ackDeadlines, now.Add(r.opts.SettingsTimeout))
+	}
+	if !r.ackArmed && !r.closed {
+		r.ackArmed = true
+		if r.ackTimer == nil {
+			r.ackTimer = time.AfterFunc(r.opts.SettingsTimeout, r.checkSettingsAck)
+		} else {
+			r.ackTimer.Reset(r.opts.SettingsTimeout)
+		}
+	}
+}
+
+// settingsAckedLocked records the client's ACK, at now, of the oldest
+// SETTINGS frame it has not acknowledged. An ACK with none pending is the
+// server's to judge.
+func (r *relay) settingsAckedLocked(now time.Time) {
+	if r.ackPending == 0 {
+		return
+	}
+	r.ackPending--
+	if len(r.ackDeadlines) > 0 {
+		r.ackDeadlines = r.ackDeadlines[1:]
+	}
+	if r.ackPending > 0 && len(r.ackDeadlines) == 0 {
+		r.ackDeadlines = append(r.ackDeadlines, now.Add(r.opts.SettingsTimeout))
+	}
+	// The timer stays as it is: deadlines only move later, so when it
+	// fires, checkSettingsAck re-arms it for the next one.
+}
+
+// checkSettingsAck runs when the oldest SETTINGS frame may be overdue
+// (RFC 9113 6.5.3). If it is, the client gets GOAWAY with SETTINGS_TIMEOUT
+// and the relay ends; if not, the timer waits for the oldest deadline.
+func (r *relay) checkSettingsAck() {
+	defer panics.Recover(r.contain)
+	r.mu.Lock()
+	if r.closed || r.ackPending == 0 {
+		r.ackArmed = false
+		r.mu.Unlock()
+		return
+	}
+	if wait := time.Until(r.ackDeadlines[0]); wait > 0 {
+		r.ackTimer.Reset(wait)
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	r.goAwayClient(errCodeSettingsTimeout)
+	select {
+	case r.timeouts <- errSettingsTimeout:
+	default:
+	}
+}
+
+// goAwayClient tells the client with GOAWAY that the connection ends for
+// code, waiting at most goAwayWait: a writer stuck on a client that stopped
+// reading may hold clientMu. The relay closes the connection either way,
+// which ends a write still waiting.
+func (r *relay) goAwayClient(code uint32) {
+	r.mu.Lock()
+	last := r.maxClientID
+	r.mu.Unlock()
+	goaway := Frame{Type: FrameGoAway, Payload: binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, last), code)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer panics.Recover(r.contain)
+		r.clientMu.Lock()
+		defer r.clientMu.Unlock()
+		if !r.prefaceSent.Load() {
+			_ = r.holdLocked([]Frame{goaway}) // failBeforePreface sends it
+			return
+		}
+		_ = r.client.SetWriteDeadline(time.Now().Add(goAwayWait))
+		_, _ = r.client.Write(encodeFrames([]Frame{goaway}))
+	}()
+	select {
+	case <-done:
+	case <-time.After(goAwayWait):
+	}
 }

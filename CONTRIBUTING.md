@@ -35,6 +35,7 @@ make build test
 | `make build` | Static binary in `bin/browser-secret-proxy` (`CGO_ENABLED=0`). |
 | `make test` | `go test ./...` |
 | `make race` | `go test -race ./...` (needs cgo, so a C compiler). |
+| `make fuzz` | Run each fuzz target for `FUZZTIME` (default `20s`), as CI does on pull requests. |
 | `make vet` | `go vet ./...` |
 | `make lint` | golangci-lint with `.golangci.yml`. |
 | `make vuln` | govulncheck against the Go vulnerability database. |
@@ -54,6 +55,18 @@ The tests start local TLS destinations and proxies in process; they need no
 network access beyond the Go module proxy. Always run the race detector on
 changes to the relays or the proxy (`make race`): most of the code is
 concurrent.
+
+The parsers of what clients and destinations send (HTTP/1.1 and HTTP/2
+framing, JSON strings, escapes, host names, content-codings) have fuzz
+targets next to their tests. `make fuzz` runs each briefly. To run one
+longer:
+
+```sh
+go test -run='^$' -fuzz='^FuzzRelay$' -fuzztime=10m ./internal/h2relay
+```
+
+A failing input is written to the package's `testdata/fuzz`. Commit it with
+the fix, so it stays a test.
 
 A change in behavior needs a test that fails without it. Tests that compare
 what the destination receives with what the client sent are the core of the

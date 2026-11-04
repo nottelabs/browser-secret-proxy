@@ -10,7 +10,10 @@ coverage.*
 # Local secrets and CAs: never commit them
 *.key
 *.pem
+payload*.json
 swaps*.json
+token*.txt
+values*.json
 
 # Editors and OS
 .idea/

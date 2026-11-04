@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -215,6 +216,59 @@ func TestAcceptedUpgradeBecomesRaw(t *testing.T) {
 	}
 }
 
+// A request that could open a tunnel other than a WebSocket is answered 502
+// before any swap and never sent: the server's answer to it, and the rest of
+// the connection, would reach the client neither swapped nor masked. A
+// CONNECT answered 200 by any catch-all handler would do it, and so would an
+// h2c upgrade, after which the server answers the swapped request itself as
+// HTTP/2.
+func TestTunnelRequestsAreAnswered502(t *testing.T) {
+	for name, request := range map[string]string{
+		"CONNECT":                    "CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\nX-Token: tok_standin\r\n\r\n",
+		"CONNECT in origin-form":     "CONNECT /echo?q=tok_standin HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"lower-case connect":         "connect /echo?q=tok_standin HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"upgrade to h2c":             "GET /echo?q=tok_standin HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n",
+		"websocket or h2c":           "GET /socket HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: websocket, h2c\r\n\r\n",
+		"websocket, then another":    "GET /socket HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nUpgrade: TLS/1.2\r\n\r\n",
+		"upgrade naming no protocol": "GET /socket HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: ,\r\n\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, clientReader, _, serverReader, result := pipesWith(t, options(t))
+			go func() { _, _ = io.WriteString(client, request) }()
+			refused, err := http.ReadResponse(clientReader, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(refused.Body)
+			_ = refused.Body.Close()
+			if refused.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "request refused") {
+				t.Fatalf("refusal %d %q", refused.StatusCode, body)
+			}
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatalf("relay error %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("relay kept the connection open")
+			}
+			if b, err := serverReader.ReadByte(); err == nil {
+				t.Fatalf("server received data starting with %q", b)
+			}
+		})
+	}
+}
+
+// A WebSocket upgrade is recognized whatever the case of its token, and its
+// handshake is swapped like any request.
+func TestWebSocketUpgradeIsSwapped(t *testing.T) {
+	client, _, _, serverReader := pipes(t)
+	send(t, client, "GET /socket?key=tok_standin HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n")
+	if head := readHead(t, serverReader); !strings.HasPrefix(head, "GET /socket?key=real ") {
+		t.Fatalf("server got %q", head)
+	}
+}
+
 // Responses are passed on byte for byte whatever their framing, and each
 // is matched to its request (a HEAD response has no body).
 func TestResponsesAreFramedAndCopiedExactly(t *testing.T) {
@@ -303,6 +357,24 @@ func TestSwapLimitsEndTheConnection(t *testing.T) {
 			}
 			if b, err := serverReader.ReadByte(); err == nil {
 				t.Fatalf("server received data starting with %q", b)
+			}
+		})
+	}
+}
+
+// A NUL or bare CR the client put in a header does not let a real value with
+// a line break into it: nothing of the request reaches the server.
+func TestHeaderControlCharactersDoNotLetLineBreaksIn(t *testing.T) {
+	for name, header := range map[string]string{"nul": "Bearer t1\x00", "bare cr": "\rBearer t1"} {
+		t.Run(name, func(t *testing.T) {
+			client, clientReader, _, serverReader, _ := pipesWith(t, expandingOptions(t, "a\r\nX-Injected: 1"))
+			go func() { _, _ = io.Copy(io.Discard, clientReader) }()
+			go func() {
+				_, _ = io.WriteString(client, "GET / HTTP/1.1\r\nHost: allowed.test\r\nAuthorization: "+header+"\r\n\r\n")
+			}()
+			// The relay closes the server connection when it refuses.
+			if got, _ := io.ReadAll(serverReader); len(got) > 0 {
+				t.Fatalf("server received %q", got)
 			}
 		})
 	}

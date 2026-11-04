@@ -451,7 +451,7 @@ func TestNonAllowlistedHostIsTunneled(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("destination received no ClientHello")
 	}
-	if !strings.Contains(p.logs.String(), "tunneling without decryption") {
+	if !strings.Contains(p.logs.String(), `level=INFO msg="tunneling without decryption"`) {
 		t.Fatalf("no tunnel log line:\n%s", p.logs.String())
 	}
 }

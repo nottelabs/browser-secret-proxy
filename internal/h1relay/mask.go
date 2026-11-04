@@ -41,9 +41,9 @@ var responseFraming = map[string]bool{
 // every header value except framing headers are masked; a decodable Content-Encoding is dropped, since
 // the body is decoded to be masked; a body whose length may change loses its
 // Content-Length and is sent chunked. Headers are rewritten line by line,
-// never by substitution in the raw head. It returns errUnmaskable for a
-// response that cannot be masked: a folded (obs-fold) header line, whose
-// value a client may unfold into another header than the one read here; an
+// never by substitution in the raw head. head must come from
+// readResponseHead, which checked it line by line: maskHead neither trims
+// header names nor looks for a missing colon. It returns errUnmaskable for a response that cannot be masked: an
 // unknown or stacked content-coding (in one list or several headers); a
 // transfer-coding other than chunked; a partial response (206); or a real
 // value in a framing header or in the status line outside its reason
@@ -53,21 +53,15 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 	var encodings, transferCodings []string
 	contentType := ""
 	for _, line := range lines[1 : len(lines)-1] {
-		if line[0] == ' ' || line[0] == '\t' {
-			return nil, maskPlan{}, fmt.Errorf("%w: a folded header line", errUnmaskable)
-		}
-		name, value, ok := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
-		if !ok {
-			return nil, maskPlan{}, fmt.Errorf("%w: a header line without a colon", errUnmaskable)
-		}
-		switch strings.ToLower(strings.TrimSpace(name)) {
+		name, value, _ := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
+		switch strings.ToLower(name) {
 		case "content-encoding":
 			encodings = append(encodings, value)
 		case "transfer-encoding":
 			// Every coding of every Transfer-Encoding header: repeated
 			// headers are one list (RFC 9110 5.3).
 			for _, c := range strings.Split(value, ",") {
-				if c = strings.ToLower(strings.TrimSpace(c)); c != "" {
+				if c = trimOWS(c); c != "" {
 					transferCodings = append(transferCodings, c)
 				}
 			}
@@ -89,8 +83,9 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 		return nil, p, fmt.Errorf("%w: %w", errUnmaskable, err)
 	}
 	if p.hasBody {
-		if len(transferCodings) > 0 && (len(transferCodings) != 1 || transferCodings[0] != "chunked") {
-			return nil, p, fmt.Errorf("%w: transfer-codings %q", errUnmaskable, strings.Join(transferCodings, ", "))
+		if len(transferCodings) > 0 && (len(transferCodings) != 1 || !isChunked(transferCodings[0])) {
+			// Not quoted: a destination can echo a real value into it.
+			return nil, p, fmt.Errorf("%w: a transfer-coding other than chunked", errUnmaskable)
 		}
 		p.decode = enc
 		p.inChunked = chunked
@@ -112,7 +107,7 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 	for _, line := range lines[1 : len(lines)-1] {
 		raw := strings.TrimRight(line, "\r\n")
 		name, value, _ := strings.Cut(raw, ":")
-		lower := strings.ToLower(strings.TrimSpace(name))
+		lower := strings.ToLower(name)
 		switch {
 		case lower == "content-encoding" && dropEncoding:
 			continue
@@ -226,15 +221,14 @@ func copyMaskedBody(br *bufio.Reader, client io.Writer, plan maskPlan, m *mask.M
 	end := []byte("0\r\n")
 	if chunks != nil {
 		for _, line := range chunks.trailers {
-			raw := strings.TrimRight(line, "\r\n")
-			if raw != "" && (raw[0] == ' ' || raw[0] == '\t') {
-				return fmt.Errorf("%w: a folded trailer line", errUnmaskable)
+			// A trailer line a client could split or unfold into other
+			// lines than the one masked here ends the response unfinished.
+			raw := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+			if err := checkFieldLine(raw); err != nil {
+				return fmt.Errorf("%w: trailer: %w", errUnmaskable, err)
 			}
-			name, value, ok := strings.Cut(raw, ":")
-			if !ok {
-				return fmt.Errorf("%w: a trailer line without a colon", errUnmaskable)
-			}
-			masked := m.String(mask.HeaderContext(strings.TrimSpace(name)), value)
+			name, value, _ := strings.Cut(raw, ":")
+			masked := m.String(mask.HeaderContext(name), value)
 			if unsafeHeader(masked, value) {
 				return fmt.Errorf("%w: a stand-in cannot go into a trailer", errUnmaskable)
 			}
@@ -301,7 +295,7 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 					return 0, err
 				}
 				total += len(trailer)
-				if strings.TrimRight(string(trailer), "\r\n") == "" {
+				if isEmptyLine(trailer) {
 					c.done = true
 					return 0, io.EOF
 				}

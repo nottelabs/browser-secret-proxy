@@ -3,11 +3,12 @@
 // header order, header name casing and spacing; only stand-ins change, plus
 // content-length when a swap changes the body size. A request whose
 // stand-ins cannot be swapped (see package scope) is answered 502 and not
-// sent. Responses are copied byte for byte, unless the connection's
-// principal has values on record for masking (see package scope): then every
-// real value in a response's header values, body and trailers is replaced by
-// its stand-in before it reaches the client, a compressed body being decoded
-// to do so.
+// sent. A response head that the client could read differently from the
+// relay is answered 502 instead. Responses are otherwise copied byte for
+// byte, unless the connection's principal has values on record for masking
+// (see package scope): then every real value in a response's header values,
+// body and trailers is replaced by its stand-in before it reaches the
+// client, a compressed body being decoded to do so.
 package h1relay
 
 import (
@@ -19,12 +20,16 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/mask"
+	"github.com/nottelabs/browser-secret-proxy/internal/panics"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -39,7 +44,16 @@ type Options struct {
 	// masked (default mask.DefaultMaxDecoded). A response past it is cut
 	// off.
 	MaxDecoded int64
-	Logger     *slog.Logger
+	// HeadTimeout bounds the time from the first byte of a request head to
+	// its end (zero: no limit), so a client cannot hold the connection by
+	// dripping a head. Waiting between requests is not counted.
+	HeadTimeout time.Duration
+	// Records is the connection beneath the client's TLS, wrapped by
+	// WatchRecords. When set, HeadTimeout counts from the first byte of the
+	// record that carries a head rather than from the head's decryption, so
+	// a client cannot put the deadline off by dripping an encrypted record.
+	Records *RecordConn
+	Logger  *slog.Logger
 }
 
 const (
@@ -72,19 +86,33 @@ func Serve(client, server net.Conn, opts Options) error {
 	responsesDone := make(chan struct{})
 	progress := newProgress()
 	done := make(chan error, 2)
+	// A panic on either goroutine ends the connection: both sides close,
+	// which ends the other goroutine, and Serve returns the panic.
+	contain := func(p *panics.Error) {
+		opts.Logger.Error("HTTP/1.1 relay panicked; closing the connection", "panic_type", p.Type, "at", p.Site)
+		panics.Abort(client, server)
+		done <- p
+	}
 	go func() {
 		defer close(responsesDone)
 		defer progress.stop()
+		defer panics.Recover(contain)
 		done <- responses(bufio.NewReader(server), toClient, queue, progress, opts)
 	}()
 	go func() {
-		done <- requests(ctx, bufio.NewReader(client), server, toClient, queue, responsesDone, progress, opts)
+		defer panics.Recover(contain)
+		done <- requests(ctx, bufio.NewReader(client), headTimer{conn: client, records: opts.Records, timeout: opts.HeadTimeout}, server, toClient, queue, responsesDone, progress, opts)
 	}()
 	err := <-done
 	cancel()
 	_ = client.Close()
 	_ = server.Close()
-	<-done //nolint:errcheck // waits for the other side; err above is the cause
+	// Waits for the other side. Its error is the cause only if it is a
+	// panic, whose closing of both sides may have ended this side first.
+	var p *panics.Error
+	if other := <-done; errors.As(other, &p) {
+		err = other
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, errRefused) {
 		return nil // a refusal was logged when it was answered
 	}
@@ -148,8 +176,8 @@ func (p *progress) wait(n int) bool {
 type exchange struct {
 	unsolicited bool // a response no request asked for, such as a 408
 	method      string
-	// switching requests (Upgrade, CONNECT) learn here whether the server
-	// switched the connection to another protocol.
+	// switching requests (a WebSocket upgrade, the only one sent) learn here
+	// whether the server switched the connection to another protocol.
 	switching bool
 	upgrade   bool // the request carried Upgrade, so a 101 may answer it
 	switched  chan bool
@@ -169,21 +197,25 @@ const maxPipelined = 64
 type header struct {
 	raw   string // the line without CRLF
 	name  string // lower case
-	value string // trimmed
+	value string // without the SP and HTAB around it
 }
 
 // errRefused ends a connection after a request was answered 502 instead of
 // being sent.
 var errRefused = errors.New("request refused")
 
-func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
+func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
 	sent := 0 // requests forwarded so far
 	for {
-		requestLine, err := readLine(br, maxHeadBytes)
-		if err != nil {
+		if err := head.start(br); err != nil {
 			return err
 		}
+		requestLine, err := readLine(br, maxHeadBytes)
+		if err != nil {
+			return head.wrap(err)
+		}
 		if requestLine == "" {
+			head.stop()
 			continue // tolerated empty line between requests
 		}
 		parts := strings.SplitN(requestLine, " ", 3)
@@ -198,23 +230,22 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 				if errors.Is(err, errLineTooLong) {
 					return errors.New("request head too large")
 				}
-				return err
+				return head.wrap(err)
 			}
 			if line == "" {
 				break
 			}
 			remaining -= len(line)
-			name, value, ok := strings.Cut(line, ":")
-			if !ok {
-				return fmt.Errorf("malformed header line")
-			}
-			headers = append(headers, header{raw: line, name: strings.ToLower(strings.TrimSpace(name)), value: strings.TrimSpace(value)})
+			// A line without a colon or otherwise malformed is refused by
+			// framing below.
+			name, value, _ := strings.Cut(line, ":")
+			headers = append(headers, header{raw: line, name: strings.ToLower(name), value: trimOWS(value)})
 		}
+		head.stop()
 
 		host, contentType := "", ""
 		hosts := 0
-		chunked, upgrade, expectContinue := false, false, false
-		contentLength := -1
+		upgrade, otherUpgrade, expectContinue := false, false, false
 		for _, h := range headers {
 			switch h.name {
 			case "host":
@@ -222,19 +253,31 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 				hosts++
 			case "content-type":
 				contentType = h.value
-			case "transfer-encoding":
-				chunked = strings.Contains(strings.ToLower(h.value), "chunked")
-			case "content-length":
-				n, err := strconv.Atoi(h.value)
-				if err != nil || n < 0 {
-					return fmt.Errorf("invalid content-length")
-				}
-				contentLength = n
 			case "upgrade":
 				upgrade = true
+				otherUpgrade = otherUpgrade || !websocketOnly(h.value)
 			case "expect":
 				expectContinue = strings.EqualFold(h.value, "100-continue")
 			}
+		}
+		// A tunnel passes the server's answer and the rest of the connection
+		// through raw, neither swapped nor masked. Only a WebSocket needs
+		// one; a CONNECT (which any catch-all handler answers 200) or
+		// another upgrade (h2c, after which the server answers this very
+		// request) is refused before anything is swapped.
+		switch {
+		case strings.EqualFold(parts[0], "CONNECT"):
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: CONNECT inside an intercepted connection", scope.ErrRefused))
+		case otherUpgrade:
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: an upgrade to another protocol than WebSocket", scope.ErrRefused))
+		}
+		// The body is framed as the server will frame it, and the head is
+		// split into the lines the server will see, or the request is
+		// refused: otherwise bytes swapped here as body could reach the
+		// server as another request, whose Host was never checked.
+		chunked, contentLength, err := framing(requestLine, parts[2], headers)
+		if err != nil {
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: %w", scope.ErrRefused, err))
 		}
 		// Every request goes to the CONNECT host: one naming another host is
 		// refused, so no value scoped to that host goes with it. A server
@@ -244,7 +287,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: more than one Host header", scope.ErrRefused))
 		}
 		authorities := []string{host}
-		if authority, ok := targetAuthority(parts[0], parts[1]); ok {
+		if authority, ok := targetAuthority(parts[1]); ok {
 			authorities = append(authorities, authority)
 		}
 		if err := opts.Session.CheckAuthority(authorities...); err != nil {
@@ -273,8 +316,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		case chunked:
 			body, trailer, err = readChunked(br, opts.MaxBody)
 		case contentLength > 0:
-			body = make([]byte, contentLength)
-			_, err = io.ReadFull(br, body)
+			body, err = readBody(br, contentLength)
 		}
 		if err != nil {
 			return err
@@ -334,7 +376,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 					swapped++
 				}
 			}
-			if h.name == "content-length" && !chunked && bodyChanged {
+			if h.name == "content-length" && bodyChanged {
 				colon := strings.IndexByte(line, ':')
 				spacing := line[colon+1 : colon+1+len(line[colon+1:])-len(strings.TrimLeft(line[colon+1:], " \t"))]
 				line = line[:colon+1] + spacing + strconv.Itoa(len(body))
@@ -358,7 +400,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			opts.Logger.Info("swapped stand-ins in a request", "host", host, "parts", swapped)
 		}
 		ex := &exchange{method: strings.ToUpper(parts[0]), upgrade: upgrade}
-		if upgrade || ex.method == "CONNECT" {
+		if upgrade {
 			ex.switching, ex.switched = true, make(chan bool, 1)
 		}
 		// Queued before the request is sent, so its response finds it.
@@ -373,7 +415,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		}
 		if ex.switching {
 			// Wait for the server's answer: only a switch makes the rest
-			// of the connection a raw stream (a WebSocket, a tunnel). After
+			// of the connection a raw stream (a WebSocket). After
 			// a refusal the client sends HTTP requests again, which are
 			// swapped as usual.
 			select {
@@ -387,6 +429,307 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			}
 		}
 	}
+}
+
+// headTimer puts a read deadline on the client while a request head
+// arrives, from its first byte.
+type headTimer struct {
+	conn    net.Conn
+	records *RecordConn // nil: the head's first byte is its first plaintext byte
+	timeout time.Duration
+}
+
+// start waits for the first byte of the next head, then sets the deadline.
+// With records, the deadline is set as soon as the first byte of the record
+// carrying the head arrives, while the record is still being decrypted.
+func (h headTimer) start(br *bufio.Reader) error {
+	if h.timeout <= 0 {
+		return nil
+	}
+	if h.records != nil && br.Buffered() == 0 {
+		h.records.arm(h.timeout)
+	}
+	if _, err := br.Peek(1); err != nil {
+		return err
+	}
+	// The head was already buffered, or the deadline was set when its
+	// record arrived.
+	if h.records == nil || !h.records.fired() {
+		_ = h.conn.SetReadDeadline(time.Now().Add(h.timeout))
+	}
+	return nil
+}
+
+func (h headTimer) stop() {
+	if h.timeout > 0 {
+		if h.records != nil {
+			h.records.disarm()
+		}
+		_ = h.conn.SetReadDeadline(time.Time{})
+	}
+}
+
+// RecordConn is the connection a client's TLS records arrive on. Armed, its
+// next read that receives bytes sets its read deadline, which is how a
+// request head is timed from the first byte of its record.
+//
+// It follows the stream's record framing, so that whole records that give
+// the head no bytes, such as a KeyUpdate or an empty record, do not count:
+// when the TLS stack asks for more after them, the deadline is cleared and
+// set again by the next record. A record that is still arriving keeps it.
+type RecordConn struct {
+	net.Conn
+	mu      sync.Mutex
+	timeout time.Duration // nonzero while armed
+	set     bool          // the armed deadline was set
+
+	header  [5]byte // the current record's header, as far as it has come
+	headerN int
+	body    int // bytes of the current record's body still to come
+}
+
+// WatchRecords wraps conn for Options.Records; pass the result to
+// tls.Server. It must see the client's TLS stream from its first byte.
+func WatchRecords(conn net.Conn) *RecordConn { return &RecordConn{Conn: conn} }
+
+func (c *RecordConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.set && c.headerN == 0 && c.body == 0 {
+		// The TLS stack reads again having taken every whole record that
+		// came since the deadline was set, and the head has no bytes yet:
+		// the client is waiting between requests, which is not counted.
+		_ = c.SetReadDeadline(time.Time{})
+		c.set = false
+	}
+	c.mu.Unlock()
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		if c.timeout > 0 && !c.set {
+			_ = c.SetReadDeadline(time.Now().Add(c.timeout))
+			c.set = true
+		}
+		c.follow(p[:n])
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+// follow moves the record framing past b.
+func (c *RecordConn) follow(b []byte) {
+	for len(b) > 0 {
+		if c.body > 0 {
+			k := min(c.body, len(b))
+			c.body -= k
+			b = b[k:]
+			continue
+		}
+		k := copy(c.header[c.headerN:], b)
+		c.headerN += k
+		b = b[k:]
+		if c.headerN == len(c.header) {
+			c.body = int(c.header[3])<<8 | int(c.header[4])
+			c.headerN = 0
+		}
+	}
+}
+
+// arm sets the read deadline to timeout from the next bytes received.
+func (c *RecordConn) arm(timeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timeout, c.set = timeout, false
+}
+
+// fired reports whether the armed deadline was set, and disarms it.
+func (c *RecordConn) fired() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set := c.set
+	c.timeout, c.set = 0, false
+	return set
+}
+
+func (c *RecordConn) disarm() { _ = c.fired() }
+
+// wrap names a deadline error as a head that came too slowly.
+func (h headTimer) wrap(err error) error {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("request head not received within %s: %w", h.timeout, err)
+	}
+	return err
+}
+
+// readBody reads an n-byte body. Memory follows the bytes received, so a
+// head that declares a large body reserves nothing until the body comes.
+func readBody(r io.Reader, n int) ([]byte, error) {
+	body := make([]byte, 0, min(n, 64<<10))
+	for len(body) < n {
+		if len(body) == cap(body) {
+			body = slices.Grow(body, min(len(body), n-len(body)))
+		}
+		m, err := r.Read(body[len(body):min(cap(body), n)])
+		body = body[:len(body)+m]
+		if err != nil && len(body) < n {
+			if errors.Is(err, io.EOF) && len(body) > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return body, nil
+}
+
+// websocketOnly reports whether an Upgrade value offers WebSocket and no
+// other protocol (RFC 6455 4.1: the token is case-insensitive).
+func websocketOnly(value string) bool {
+	offered := false
+	for token := range strings.SplitSeq(value, ",") {
+		switch token = strings.TrimSpace(token); {
+		case token == "": // an empty list element (RFC 9110 5.6.1)
+		case strings.EqualFold(token, "websocket"):
+			offered = true
+		default:
+			return false
+		}
+	}
+	return offered
+}
+
+// framing checks a request head that a server could read differently from
+// the relay, and returns how its body is framed: chunked, or its
+// Content-Length (-1 when absent). It refuses, as RFC 9112 allows or
+// requires (2.2, 5, 6.1, 6.3): a bare CR or a NUL in any line, a folded
+// (obs-fold) header line, a header name that is not a token (such as one
+// with a space before the colon), a control character other than HTAB in a
+// header value (RFC 9110 5.5), Transfer-Encoding with Content-Length,
+// Transfer-Encoding other than a single chunked or on a request that is not
+// HTTP/1.1, and more than one Content-Length or one that is not a decimal
+// number.
+func framing(requestLine, version string, headers []header) (chunked bool, contentLength int, err error) {
+	contentLength = -1
+	if strings.ContainsAny(requestLine, "\r\x00") {
+		return false, 0, errors.New("a bare CR or NUL in the request line")
+	}
+	encodings, lengths := 0, 0
+	for _, h := range headers {
+		if err := checkRequestFieldLine(h.raw); err != nil {
+			return false, 0, err
+		}
+		switch h.name {
+		case "transfer-encoding":
+			encodings++
+			chunked = isChunked(h.value)
+		case "content-length":
+			lengths++
+			if !isDigits(h.value) {
+				return false, 0, errors.New("an invalid Content-Length")
+			}
+			if contentLength, err = strconv.Atoi(h.value); err != nil {
+				return false, 0, errors.New("an invalid Content-Length")
+			}
+		}
+	}
+	switch {
+	case encodings > 0 && lengths > 0:
+		return false, 0, errors.New("both Transfer-Encoding and Content-Length")
+	case encodings > 1 || encodings == 1 && !chunked:
+		return false, 0, errors.New("a Transfer-Encoding other than a single chunked")
+	case chunked && version != "HTTP/1.1":
+		return false, 0, errors.New("Transfer-Encoding on a request that is not HTTP/1.1")
+	case lengths > 1:
+		return false, 0, errors.New("more than one Content-Length")
+	}
+	return chunked, contentLength, nil
+}
+
+// checkFieldLine refuses a header or trailer line that a server could split
+// or unfold into other lines than the relay reads, or whose name it could
+// read as another: a bare CR or a NUL, a folded (obs-fold) line, and a name
+// that is not a token.
+func checkFieldLine(line string) error {
+	if strings.ContainsAny(line, "\r\x00") {
+		return errors.New("a bare CR or NUL in a header line")
+	}
+	if line != "" && (line[0] == ' ' || line[0] == '\t') {
+		return errors.New("a folded header line")
+	}
+	name, _, ok := strings.Cut(line, ":")
+	if !ok || !isToken(name) {
+		return errors.New("a malformed header name")
+	}
+	return nil
+}
+
+// checkRequestFieldLine is checkFieldLine for a request, which also refuses
+// a control character other than HTAB in the value (RFC 9110 5.5): a server
+// may trim one from the ends of a value, as strings.TrimSpace does with VT
+// and FF, or keep it, so "Host: allowed.test\v" could name another host to
+// it than to the relay.
+func checkRequestFieldLine(line string) error {
+	if err := checkFieldLine(line); err != nil {
+		return err
+	}
+	_, value, _ := strings.Cut(line, ":")
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c < ' ' && c != '\t' || c == 0x7f {
+			return errors.New("a control character in a header value")
+		}
+	}
+	return nil
+}
+
+// trimOWS trims the whitespace around a header value: SP and HTAB only (RFC
+// 9110 5.6.3). strings.TrimSpace also trims VT, FF and spaces that are not
+// ASCII, such as NBSP, which a server or client may keep.
+func trimOWS(s string) string { return strings.Trim(s, " \t") }
+
+// isToken reports whether s is an RFC 9110 5.6.2 token, the syntax of a
+// header name.
+func isToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !isTchar(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isTchar(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
+}
+
+// isChunked reports whether s is the coding name chunked, in any ASCII case
+// (RFC 9112 7). strings.EqualFold is not used: it also folds non-ASCII
+// letters, such as the Kelvin sign to k.
+func isChunked(s string) bool {
+	const name = "chunked"
+	if len(s) != len(name) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i]|0x20 != name[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isDigits reports whether s is one or more ASCII digits, the syntax of a
+// Content-Length.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // swappableText is the text of a request that stand-ins are swapped in,
@@ -407,16 +750,13 @@ func swappableText(target string, headers []header, contentType string, body []b
 }
 
 // targetAuthority returns the authority a request target names, if any: the
-// target of a CONNECT (authority-form), or the authority of an absolute-form
-// target ("https://host/path"). An origin-form ("/path") or asterisk-form
-// ("*") target names none. Any other target names an empty authority, which
-// no connection is opened to.
-func targetAuthority(method, target string) (string, bool) {
-	switch {
-	case strings.HasPrefix(target, "/") || target == "*":
+// authority of an absolute-form target ("https://host/path"). An origin-form
+// ("/path") or asterisk-form ("*") target names none. Any other target
+// (authority-form is CONNECT's, which is refused) names an empty authority,
+// which no connection is opened to.
+func targetAuthority(target string) (string, bool) {
+	if strings.HasPrefix(target, "/") || target == "*" {
 		return "", false
-	case method == "CONNECT":
-		return target, true
 	}
 	_, rest, ok := strings.Cut(target, "://")
 	if !ok {
@@ -449,6 +789,13 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 	var current *exchange
 	for {
 		head, status, length, chunked, err := readResponseHead(br)
+		if errors.Is(err, errUnclearResponse) {
+			// Nothing of this response was passed on yet.
+			opts.Logger.Warn("refusing a response the client could read differently", "reason", err.Error())
+			body := "secret-proxy: malformed response from the server\n"
+			_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			return errRefused
+		}
 		if err != nil {
 			return err
 		}
@@ -461,14 +808,16 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 		}
 		// A 101 turns the rest of the connection into a raw stream that is
 		// neither swapped nor masked, so only a request that asked to
-		// upgrade may get one (RFC 9110 15.2.2). Any other 101 is refused.
+		// upgrade (to a WebSocket, the only upgrade sent) may get one (RFC
+		// 9110 15.2.2). Any other 101 is refused. Nothing else switches: a
+		// 2xx is an ordinary response, masked like any other.
 		if status == 101 && !current.upgrade {
 			opts.Logger.Warn("refusing a 101 to a request that did not ask to upgrade")
 			body := "secret-proxy: unrequested protocol switch\n"
 			_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 			return errRefused
 		}
-		switched := status == 101 || current.method == "CONNECT" && status >= 200 && status < 300
+		switched := status == 101
 		// Values resolved before this response's request was sent are on
 		// record by now.
 		masker := opts.Session.Masker()
@@ -530,41 +879,74 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 	}
 }
 
+// errUnclearResponse is a response head that a client could read
+// differently from the relay. It is answered 502: the relay follows each
+// response's framing to know where the next one, which it may have to mask,
+// begins.
+var errUnclearResponse = errors.New("unclear response head")
+
 // readResponseHead reads a status line and headers, returning their raw
 // bytes, the status code, the content length (-1 when absent) and whether
-// the body is chunked.
+// the body is chunked. It returns errUnclearResponse for a status line with
+// a bare CR or NUL, a header line that checkFieldLine refuses, a
+// Content-Length that is not a decimal number, or a Transfer-Encoding on a
+// response that is not HTTP/1.1: only SP and HTAB may surround a
+// Content-Length, and the coding name chunked is matched in ASCII only, as a
+// client matches them. A client ignores Transfer-Encoding before HTTP/1.1
+// and reads such a body to the close, so the relay would find the next
+// response where the client sees body (RFC 9112 6.1: the framing is
+// faulty).
 func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, chunked bool, err error) {
 	length = -1
+	var version string
+	encoded := false
 	for {
 		line, err := readRawLine(br, maxHeadBytes-len(head))
 		if err != nil {
 			return nil, 0, 0, false, err
 		}
 		head = append(head, line...)
-		text := strings.TrimRight(string(line), "\r\n")
+		// One line ending only: a line of "\r\r\n" does not end the head.
+		text := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
 		if status == 0 {
+			// A client ends the status line at a bare CR and reads what
+			// follows as header lines the relay would not see.
+			if strings.ContainsAny(text, "\r\x00") {
+				return nil, 0, 0, false, fmt.Errorf("%w: a bare CR or NUL in the status line", errUnclearResponse)
+			}
 			fields := strings.Fields(text)
 			if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") {
 				return nil, 0, 0, false, fmt.Errorf("malformed status line")
 			}
+			version = fields[0]
 			if status, err = strconv.Atoi(fields[1]); err != nil || status < 100 {
 				return nil, 0, 0, false, fmt.Errorf("malformed status line")
 			}
 			continue
 		}
 		if text == "" {
+			if encoded && version != "HTTP/1.1" {
+				return nil, 0, 0, false, fmt.Errorf("%w: Transfer-Encoding on a response that is not HTTP/1.1", errUnclearResponse)
+			}
 			return head, status, length, chunked, nil
 		}
+		if err := checkFieldLine(text); err != nil {
+			return nil, 0, 0, false, fmt.Errorf("%w: %w", errUnclearResponse, err)
+		}
 		name, value, _ := strings.Cut(text, ":")
-		value = strings.TrimSpace(value)
-		switch strings.ToLower(strings.TrimSpace(name)) {
+		value = trimOWS(value)
+		switch strings.ToLower(name) {
 		case "content-length":
-			if length, err = strconv.ParseInt(value, 10, 64); err != nil || length < 0 {
-				return nil, 0, 0, false, fmt.Errorf("invalid content-length in a response")
+			if !isDigits(value) {
+				return nil, 0, 0, false, fmt.Errorf("%w: an invalid Content-Length", errUnclearResponse)
+			}
+			if length, err = strconv.ParseInt(value, 10, 64); err != nil {
+				return nil, 0, 0, false, fmt.Errorf("%w: an invalid Content-Length", errUnclearResponse)
 			}
 		case "transfer-encoding":
-			codings := strings.Split(strings.ToLower(value), ",")
-			chunked = strings.TrimSpace(codings[len(codings)-1]) == "chunked"
+			encoded = true
+			codings := strings.Split(value, ",")
+			chunked = isChunked(trimOWS(codings[len(codings)-1]))
 		}
 	}
 }
@@ -588,7 +970,11 @@ func readRawLine(br *bufio.Reader, limit int) ([]byte, error) {
 	}
 }
 
-// copyChunked copies a chunked body unchanged, trailers included.
+// copyChunked copies a chunked body unchanged, trailers included. The
+// trailer section is read whole, up to maxHeadBytes, before it is copied: a
+// line in it that checkFieldLine refuses ends the connection with none of it
+// passed on, since the client could read the end of the body elsewhere than
+// the relay.
 func copyChunked(br *bufio.Reader, w io.Writer) error {
 	for {
 		line, err := readRawLine(br, maxChunkLine)
@@ -604,16 +990,19 @@ func copyChunked(br *bufio.Reader, w io.Writer) error {
 			return errors.New("invalid chunk size in a response")
 		}
 		if size == 0 {
+			var trailers []byte
 			for {
-				trailer, err := readRawLine(br, maxHeadBytes)
+				trailer, err := readRawLine(br, maxHeadBytes-len(trailers))
 				if err != nil {
 					return err
 				}
-				if _, err := w.Write(trailer); err != nil {
+				trailers = append(trailers, trailer...)
+				if isEmptyLine(trailer) {
+					_, err := w.Write(trailers)
 					return err
 				}
-				if strings.TrimRight(string(trailer), "\r\n") == "" {
-					return nil
+				if err := checkFieldLine(strings.TrimSuffix(strings.TrimSuffix(string(trailer), "\n"), "\r")); err != nil {
+					return fmt.Errorf("malformed trailer line in a response: %w", err)
 				}
 			}
 		}
@@ -621,6 +1010,12 @@ func copyChunked(br *bufio.Reader, w io.Writer) error {
 			return err
 		}
 	}
+}
+
+// isEmptyLine reports whether a raw line is the empty line that ends a head
+// or a trailer section: a line ending alone, so "\r\r\n" is not one.
+func isEmptyLine(line []byte) bool {
+	return string(line) == "\r\n" || string(line) == "\n"
 }
 
 // readLine reads one line without its CRLF, refusing it once it is longer
@@ -680,6 +1075,9 @@ func readChunked(br *bufio.Reader, limit int) ([]byte, []byte, error) {
 		}
 		if line == "" {
 			return body.Bytes(), trailer.Bytes(), nil
+		}
+		if err := checkRequestFieldLine(line); err != nil {
+			return nil, nil, fmt.Errorf("malformed trailer line: %w", err)
 		}
 		trailer.WriteString(line + "\r\n")
 	}

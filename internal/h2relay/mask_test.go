@@ -9,6 +9,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -431,6 +432,136 @@ func TestContentOnABodilessResponseIsReset(t *testing.T) {
 	h.serverSend(status(h, id, false, field(":status", "200"), field("content-length", "16")), data(id, "", true))
 	if resp := view.read(1, true); resp.resetSeen || resp.head[":status"] != "200" {
 		t.Fatalf("reset %v, head %v", resp.resetSeen, resp.head)
+	}
+}
+
+// DATA before the final response head, with no head yet or after only a
+// 1xx, is malformed (RFC 9113 8.1): there is no masking pipeline for it
+// yet, so the stream is reset on both sides and nothing of it is passed on.
+// An empty DATA counts too: it would end a response that has no head.
+func TestDataBeforeTheFinalHeadIsReset(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		interim bool
+		payload string
+		end     bool
+	}{
+		{"no head", false, "early " + realToken, false},
+		{"after a 103", true, "early " + realToken, false},
+		{"ending, after a 103", true, "early " + realToken, true},
+		{"empty, ending", false, "", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, masking(t, false))
+			view := newClientView(h)
+			id := get(h, 1)
+			if c.interim {
+				h.serverSend(status(h, id, false, field(":status", "103"), field("link", "</a>; rel=preload")))
+			}
+			h.serverSend(data(id, c.payload, c.end))
+			resp := view.read(1, true)
+			if !resp.resetSeen || resp.reset != errCodeInternal || len(resp.body) > 0 || resp.head != nil {
+				t.Fatalf("reset %v (%d), head %v, body %q", resp.resetSeen, resp.reset, resp.head, resp.body)
+			}
+			if !c.end {
+				// The server's stream is reset, and the final head and body
+				// that follow are absorbed.
+				f := h.expect(h.toServer, "server", isType(FrameRSTStream))
+				if f.Stream != id || binary.BigEndian.Uint32(f.Payload) != errCodeProtocol {
+					t.Fatalf("server got RST_STREAM %d on %d", binary.BigEndian.Uint32(f.Payload), f.Stream)
+				}
+				h.serverSend(status(h, id, false, field(":status", "200")), data(id, "late "+realToken, true))
+				h.quiet(h.toClient, 50*time.Millisecond, func(f Frame) bool { return f.Stream == 1 })
+			}
+			h.respReleased(1)
+		})
+	}
+}
+
+// fakeClock is a clock a test moves by hand.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) add(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+// Trailers are masked with the masker chosen at the response head, as the
+// body is, and as HTTP/1.1 does: a value that leaves the record while the
+// response is open (15 minutes of retention pass on a long stream) is still
+// masked in them.
+func TestTrailersUseTheHeadsMasker(t *testing.T) {
+	clock := &fakeClock{now: time.Now()}
+	h := newHarness(t, func(o *Options) {
+		r, err := resolve.NewStatic(map[string]string{tokenSIn: realToken})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := resolve.NewDetector(r, resolve.Patterns{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := scope.New(scope.Config{Resolver: r, Detector: d, Hosts: o.Hosts, Mask: true, Now: clock.Now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.Session = s.Session(resolve.Principal{ID: "alice"}, "allowed.test")
+		if _, err := o.Session.Swapper(context.Background(), swap.Part{Text: tokenSIn}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	c := newClientView(h)
+	id := get(h, 1)
+	h.serverSend(status(h, id, false, field(":status", "200"), field("content-type", "application/grpc")))
+	h.serverSend(data(id, "body "+realToken, false))
+	clock.add(16 * time.Minute)
+	if h.r.opts.Session.Masker() != nil {
+		t.Fatal("the value is still on record")
+	}
+	h.serverSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: id,
+		Payload: h.serverBlock(field("grpc-message", "invalid key "+realToken))})
+	resp := c.read(1, true)
+	if string(resp.body) != "body "+tokenSIn || resp.trailers["grpc-message"] != "invalid key "+tokenSIn {
+		t.Fatalf("body %q, trailers %v", resp.body, resp.trailers)
+	}
+}
+
+// A real value in content-length is refused with a 502, as HTTP/1.1 refuses
+// one in a framing header: the field is kept as it is, so it cannot be
+// masked. A content-length that is not a value is kept.
+func TestRealValueInContentLengthIsRefused(t *testing.T) {
+	for _, method := range []string{"HEAD", "GET"} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, masking(t, true))
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(request(method)...)})
+			id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+			h.serverSend(status(h, id, method == "HEAD", field(":status", "200"), field("content-length", realCard)))
+			h.expect(h.toClient, "client", isBadGateway(1))
+			if method == "GET" {
+				f := h.expect(h.toServer, "server", isType(FrameRSTStream))
+				if f.Stream != id || binary.BigEndian.Uint32(f.Payload) != errCodeCancel {
+					t.Fatalf("server got RST_STREAM %d on %d", binary.BigEndian.Uint32(f.Payload), f.Stream)
+				}
+			}
+		})
+	}
+	h := newHarness(t, masking(t, true))
+	c := newClientView(h)
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(request("HEAD")...)})
+	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+	h.serverSend(status(h, id, true, field(":status", "200"), field("content-length", "16")))
+	if head := c.readHead(1); head[":status"] != "200" || head["content-length"] != "16" {
+		t.Fatalf("head %v", head)
 	}
 }
 
