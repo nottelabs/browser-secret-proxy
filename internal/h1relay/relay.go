@@ -3,7 +3,11 @@
 // header order, header name casing and spacing; only stand-ins change, plus
 // content-length when a swap changes the body size. A request whose
 // stand-ins cannot be swapped (see package scope) is answered 502 and not
-// sent. Responses are copied byte for byte.
+// sent. Responses are copied byte for byte, unless the connection's
+// principal has values on record for masking (see package scope): then every
+// real value in a response's header values, body and trailers is replaced by
+// its stand-in before it reaches the client, a compressed body being decoded
+// to do so.
 package h1relay
 
 import (
@@ -20,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -30,7 +35,11 @@ type Options struct {
 	// Session resolves the stand-ins of each request on an allowlisted host.
 	Session *scope.Session
 	MaxBody int
-	Logger  *slog.Logger
+	// MaxDecoded caps the decoded size of one compressed response that is
+	// masked (default mask.DefaultMaxDecoded). A response past it is cut
+	// off.
+	MaxDecoded int64
+	Logger     *slog.Logger
 }
 
 const (
@@ -53,6 +62,9 @@ func Serve(client, server net.Conn, opts Options) error {
 	if opts.MaxBody <= 0 {
 		opts.MaxBody = 32 << 20
 	}
+	if opts.MaxDecoded <= 0 {
+		opts.MaxDecoded = mask.DefaultMaxDecoded
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	toClient := &lockedWriter{w: client}
@@ -63,7 +75,7 @@ func Serve(client, server net.Conn, opts Options) error {
 	go func() {
 		defer close(responsesDone)
 		defer progress.stop()
-		done <- responses(bufio.NewReader(server), toClient, queue, progress)
+		done <- responses(bufio.NewReader(server), toClient, queue, progress, opts)
 	}()
 	go func() {
 		done <- requests(ctx, bufio.NewReader(client), server, toClient, queue, responsesDone, progress, opts)
@@ -399,7 +411,7 @@ func refuse(client io.Writer, progress *progress, sent int, host string, opts Op
 // responses copies the server's responses to the client byte for byte,
 // following message boundaries to tell each switching request whether the
 // server switched protocols.
-func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progress *progress) error {
+func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progress *progress, opts Options) error {
 	var current *exchange
 	for {
 		head, status, length, chunked, err := readResponseHead(br)
@@ -413,10 +425,23 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 				current = &exchange{unsolicited: true}
 			}
 		}
+		switched := status == 101 || current.method == "CONNECT" && status >= 200 && status < 300
+		// Values resolved before this response's request was sent are on
+		// record by now.
+		masker := opts.Session.Masker()
+		var plan maskPlan
+		if masker != nil {
+			head, plan, err = maskHead(head, status, current.method, switched, length, chunked, masker)
+			if err != nil {
+				opts.Logger.Warn("refusing a response that cannot be masked", "status", status, "reason", err.Error())
+				body := "secret-proxy: the response cannot be masked\n"
+				_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+				return errRefused
+			}
+		}
 		if _, err := client.Write(head); err != nil {
 			return err
 		}
-		switched := status == 101 || current.method == "CONNECT" && status >= 200 && status < 300
 		if switched {
 			if current.switching {
 				current.switched <- true
@@ -429,6 +454,14 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 		}
 		switch {
 		case current.method == "HEAD" || status == 204 || status == 304:
+		case masker != nil && plan.hasBody:
+			if plan.closeDelimited && current.switching {
+				current.switched <- false
+			}
+			err = copyMaskedBody(br, client, plan, masker, opts.MaxDecoded)
+			if err == nil && plan.closeDelimited {
+				return io.EOF
+			}
 		case chunked:
 			err = copyChunked(br, client)
 		case length >= 0:

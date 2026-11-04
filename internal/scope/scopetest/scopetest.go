@@ -8,6 +8,7 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 // Static returns a session, for the empty principal, over a fixed map of
@@ -78,4 +79,30 @@ func PerPrincipal(values map[string]map[string]resolve.Value) Resolver {
 		}
 		return out, nil
 	}}
+}
+
+// Masked returns a session for principal over resolver with masking on,
+// whose record already holds every value the resolver gives for known: as
+// if a request had carried those stand-ins to host.
+func Masked(t testing.TB, hosts *hostmatch.List, resolver resolve.Resolver, principal resolve.Principal, host string, known ...string) *scope.Session {
+	t.Helper()
+	detector, err := resolve.NewDetector(resolver, resolve.Patterns{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := scope.New(scope.Config{Resolver: resolver, Detector: detector, Hosts: hosts, Mask: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := s.Session(principal, host)
+	if len(known) > 0 {
+		parts := make([]swap.Part, len(known))
+		for i, k := range known {
+			parts[i] = swap.Part{Place: swap.Literal, Text: k}
+		}
+		if _, err := session.Swapper(context.Background(), parts...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return session
 }

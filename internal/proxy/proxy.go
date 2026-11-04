@@ -60,7 +60,10 @@ type Config struct {
 	MaxBody int
 	// ResolveTimeout bounds one resolver lookup (default
 	// scope.DefaultTimeout).
-	ResolveTimeout   time.Duration
+	ResolveTimeout time.Duration
+	// MaskResponses replaces real values resolved for a connection's
+	// principal with their stand-ins in responses on allowlisted hosts.
+	MaskResponses    bool
 	HandshakeTimeout time.Duration
 	Logger           *slog.Logger
 }
@@ -91,7 +94,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 30 * time.Second
 	}
-	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Logger: cfg.Logger})
+	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Mask: cfg.MaskResponses, Logger: cfg.Logger})
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +141,7 @@ func (s *Server) untrack(c net.Conn) {
 }
 
 func (s *Server) shutdown() {
+	defer s.scope.Close()
 	s.mu.Lock()
 	s.closing = true
 	for c := range s.conns {

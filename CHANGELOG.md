@@ -49,6 +49,13 @@ First release, planned as 0.1.0.
     the earlier encrypt-only format, from before this release, are refused.
 - Stand-in detection by pattern (`-standin-pattern`, `-standin-prefixes`),
   with an optional Luhn check for card-like stand-ins (`-standin-luhn`).
+- Response masking, on by default (`-mask-responses`): real values looked up
+  for a principal are replaced by their stand-ins in response headers,
+  bodies and trailers on allowlisted hosts, over HTTP/1.1 and HTTP/2, in
+  their common encoded forms and card number groupings. Compressed bodies
+  (`gzip`, `deflate`, `br`, `zstd`) are decoded to be masked and sent
+  without a content-coding; a response that cannot be masked is answered
+  `502`.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).

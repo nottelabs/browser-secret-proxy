@@ -175,8 +175,8 @@ func startProxy(t *testing.T, dialer mapDialer, destinationCAs *x509.CertPool, m
 	logs := &syncBuffer{}
 	cfg := Config{
 		Authority: authority, Hosts: hosts, Resolver: resolver, Detector: detector, Dialer: dialer, RootCAs: destinationCAs,
-		HandshakeTimeout: 10 * time.Second,
-		Logger:           slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		HandshakeTimeout: 10 * time.Second, MaskResponses: true,
+		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	if mutate != nil {
 		mutate(&cfg)

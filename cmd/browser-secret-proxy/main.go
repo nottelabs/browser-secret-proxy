@@ -38,6 +38,7 @@ func run() error {
 	hosts := flag.String("hosts", "", "comma-separated hosts to intercept: exact names or a leading \"*.\" (required)")
 	resolverOpts := registerResolverFlags(flag.CommandLine)
 	parent := flag.String("upstream-proxy", os.Getenv("SECRET_PROXY_UPSTREAM"), "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
+	maskResponses := flag.Bool("mask-responses", true, "replace real values with their stand-ins in responses from allowlisted hosts")
 	verbose := flag.Bool("v", false, "debug logging")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -92,6 +93,8 @@ func run() error {
 		Username:       os.Getenv("SECRET_PROXY_USERNAME"),
 		Password:       os.Getenv("SECRET_PROXY_PASSWORD"),
 		Logger:         logger,
+		// Real values in responses are replaced by their stand-ins.
+		MaskResponses: *maskResponses,
 	})
 	if err != nil {
 		return err
@@ -102,7 +105,8 @@ func run() error {
 	}
 	parentDescription := describeParent(parentURL)
 	attrs := append([]any{"address", ln.Addr().String(), "hosts", *hosts}, values.logAttrs...)
-	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed")
+	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed",
+		"mask_responses", *maskResponses)
 	logger.Info("listening", attrs...)
 
 	ctx, cancel := context.WithCancel(context.Background())

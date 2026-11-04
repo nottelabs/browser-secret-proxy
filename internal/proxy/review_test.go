@@ -389,9 +389,13 @@ func TestHeaderMatchesFollowHeaderRules(t *testing.T) {
 				"tok_a b": {Real: "real_ab_value"},
 			}}, nil
 		}}
+		// The destination records the header it received: echoing it back
+		// would be masked into the stand-in again.
 		received := &echoed{}
+		headers := make(chan string, 4)
 		dest := startDestination(t, allowedHost, []string{proto}, serveWith(received, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = io.WriteString(w, r.Header.Get("X-Token"))
+			headers <- r.Header.Get("X-Token")
+			_, _ = io.WriteString(w, "ok")
 		})))
 		p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, func(c *Config) {
 			d, err := resolve.NewDetector(r, resolve.Patterns{})
@@ -412,11 +416,11 @@ func TestHeaderMatchesFollowHeaderRules(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			body, _ := io.ReadAll(resp.Body)
+			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			want := strings.Replace(header, "tok_a", "real_a_value", 1)
-			if resp.StatusCode != http.StatusOK || string(body) != want {
-				t.Fatalf("header %q: destination got %q (%d), want %q", header, body, resp.StatusCode, want)
+			if got := <-headers; resp.StatusCode != http.StatusOK || got != want {
+				t.Fatalf("header %q: destination got %q (%d), want %q", header, got, resp.StatusCode, want)
 			}
 		}
 	})
