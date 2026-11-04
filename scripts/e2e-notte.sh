@@ -42,7 +42,11 @@ cleanup() {
       -H "Authorization: Bearer $NOTTE_API_KEY" \
       "$NOTTE_API_URL/sessions/$session_id/stop"
   fi
-  [ -n "$bore_pid" ] && kill "$bore_pid" 2>/dev/null
+  if [ -n "$bore_pid" ]; then
+    kill "$bore_pid" 2>/dev/null
+    log "bore log:"
+    cat "$work/bore.log" >&2
+  fi
   if docker inspect "$container" >/dev/null 2>&1; then
     log "proxy logs:"
     docker logs "$container" 2>&1 | tail -n 40 >&2
@@ -105,11 +109,18 @@ public=""
 for _ in $(seq 1 30); do
   public="$(grep -o "listening at [^ ]*" "$work/bore.log" | awk '{print $3}' | head -n1 || true)"
   [ -n "$public" ] && break
-  kill -0 "$bore_pid" 2>/dev/null || { cat "$work/bore.log" >&2; fail "bore exited"; }
+  kill -0 "$bore_pid" 2>/dev/null || fail "bore exited"
   sleep 1
 done
-[ -n "$public" ] || { cat "$work/bore.log" >&2; fail "no tunnel address"; }
+[ -n "$public" ] || fail "no tunnel address"
 log "proxy is public at $public"
+
+# The relay can hand out a port that does not accept connections. Check the
+# public address reaches the proxy (any HTTP answer, such as its 407) before
+# starting a session, so that failure is reported as the tunnel's.
+public_status="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 "http://$public/" || true)"
+[ "$public_status" != 000 ] || fail "the tunnel at $public does not reach the proxy"
+log "tunnel reaches the proxy (HTTP $public_status)"
 
 start_body="$(jq -n --arg server "http://$public" --arg user "$proxy_user" --arg pass "$proxy_pass" \
   --rawfile ca "$work/ca.pem" --arg host "$SWAP_HOST" \
