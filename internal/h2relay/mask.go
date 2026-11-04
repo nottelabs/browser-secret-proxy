@@ -69,6 +69,7 @@ type respState struct {
 	listed          bool // in relay.respList
 	sending         bool // a frame of this stream is being written
 	final           bool // the final (non-1xx) response head arrived
+	bodiless        bool // masked, and its head says it has no content
 	done            bool // the stream ended toward the client
 	pipe            *maskPipe
 }
@@ -93,9 +94,10 @@ type maskPipe struct {
 
 // respPlan says how a masked response's body is handled.
 type respPlan struct {
-	body    bool
-	decode  mask.Encoding
-	context mask.Context // of the body, from its content-type
+	body     bool
+	bodiless bool // HEAD, 204 or 304: content in DATA makes it malformed
+	decode   mask.Encoding
+	context  mask.Context // of the body, from its content-type
 }
 
 // newRespLocked creates the response state of a new client stream.
@@ -424,12 +426,13 @@ func (r *relay) onServerHeadersMasked(serverID uint32, ends bool, block []byte) 
 			if err != nil {
 				return r.refuseResponse(s, rs, ends, err)
 			}
+			r.mu.Lock()
+			rs.bodiless = plan.bodiless
 			if plan.body {
-				r.mu.Lock()
 				rs.pipe = &maskPipe{}
-				r.mu.Unlock()
 				startMask = &plan
 			}
+			r.mu.Unlock()
 		}
 	case masker != nil:
 		masked, ok := maskFields(fields, masker)
@@ -552,11 +555,23 @@ func (r *relay) refuseResponse(s *stream, rs *respState, serverDone bool, cause 
 // masked body no longer matches: a decodable content-encoding (the body is
 // sent decoded) and a content-length the body may no longer have. It returns
 // errUnmaskable for a body that cannot be masked: an unknown or stacked
-// content-coding, or a partial response (206) whose ranges masking would
-// shift.
+// content-coding, a partial response (206), or a field name with an
+// upper-case letter.
 func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bool, m *mask.Masker) ([]hpack.HeaderField, respPlan, error) {
+	// Ranges are masked one by one, so a client that asks for ranges that
+	// split a value (bytes=0-7, then bytes=8-15) would get each piece as is
+	// and could put the value back together.
+	if status == "206" {
+		return nil, respPlan{}, fmt.Errorf("%w: a partial response", errUnmaskable)
+	}
 	var encodings []string
 	for _, f := range fields {
+		// Field names are lower case in HTTP/2, so one with an upper-case
+		// letter is malformed (RFC 9113 8.2.1), and would escape the
+		// lookups below: a Content-Encoding body would pass undecoded.
+		if strings.ToLower(f.Name) != f.Name {
+			return nil, respPlan{}, fmt.Errorf("%w: an upper-case field name", errUnmaskable)
+		}
 		switch f.Name {
 		case "content-encoding":
 			encodings = append(encodings, f.Value)
@@ -577,9 +592,12 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 	// HTTP/1.1 upgrade. A refused one has an ordinary body, masked like any
 	// other.
 	tunnel := method == "CONNECT" && len(status) == 3 && status[0] == '2'
+	// A 2xx to CONNECT, 204 included, is a tunnel: its DATA is the tunnel's.
+	bodiless := !tunnel && (method == "HEAD" || status == "204" || status == "304")
 	plan := respPlan{
-		body:    !ends && !tunnel && method != "HEAD" && status != "204" && status != "304",
-		context: mask.ContextOf(contentType),
+		body:     !ends && !tunnel && !bodiless,
+		bodiless: bodiless,
+		context:  mask.ContextOf(contentType),
 	}
 	enc, err := mask.ParseEncoding(encodings)
 	if err != nil {
@@ -587,9 +605,6 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 			return nil, plan, fmt.Errorf("%w: %w", errUnmaskable, err)
 		}
 		enc = "" // no body to decode: the header stays as it is
-	}
-	if plan.body && status == "206" && (enc != "" || !m.SameLength(plan.context)) {
-		return nil, plan, fmt.Errorf("%w: a partial response whose content masking would change", errUnmaskable)
 	}
 	if plan.body {
 		plan.decode = enc
@@ -653,6 +668,18 @@ func (r *relay) onServerDataMasked(f Frame) error {
 		}
 		return nil
 	}
+	if rs.bodiless {
+		data, err := unpad(f.Flags, f.Payload)
+		if err != nil {
+			r.mu.Unlock()
+			return err
+		}
+		if len(data) > 0 {
+			r.mu.Unlock()
+			return r.resetMalformed(s, rs, len(f.Payload), end)
+		}
+		// An empty DATA (often the END_STREAM of a HEAD) is passed on.
+	}
 	if rs.pipe != nil {
 		data, err := unpad(f.Flags, f.Payload)
 		if err != nil {
@@ -714,6 +741,40 @@ func (r *relay) onServerDataMasked(f Frame) error {
 		r.serverEnded(s, false)
 	}
 	return nil
+}
+
+// resetMalformed ends a masked stream whose response has content in DATA
+// though its head says it has none (a HEAD, 204 or 304): malformed (RFC 9113
+// 8.1.1), and never masked, so its content is not passed on. Both sides get
+// RST_STREAM; the server is credited the n bytes the relay dropped. The
+// client stops sending once reset, so the request ends here too, even when
+// the server already ended the stream: one still uploading (a CONNECT) would
+// otherwise keep its stream slot, and the server's stream is reset as well.
+func (r *relay) resetMalformed(s *stream, rs *respState, n int, serverDone bool) error {
+	r.opts.Logger.Warn("resetting a response with content it cannot have", "stream", s.clientID)
+	r.mu.Lock()
+	r.endRespLocked(rs)
+	uploading := !s.sentEnd
+	if !serverDone {
+		if r.streams[s.clientID] == s {
+			r.dropLocked(s)
+		}
+		r.forgetResetLocked(s)
+	}
+	r.mu.Unlock()
+	if err := r.writeServer(windowUpdate(0, n)); err != nil {
+		return err
+	}
+	if err := r.writeClient(Frame{Type: FrameRSTStream, Stream: s.clientID, Payload: binary.BigEndian.AppendUint32(nil, errCodeInternal)}); err != nil {
+		return err
+	}
+	if serverDone {
+		r.serverEnded(s, true)
+		if !uploading {
+			return nil // both sides ended: the stream is closed
+		}
+	}
+	return r.writeServer(Frame{Type: FrameRSTStream, Stream: s.serverID, Payload: binary.BigEndian.AppendUint32(nil, errCodeProtocol)})
 }
 
 // takeDebtReturnLocked returns how much credit to give the server at once

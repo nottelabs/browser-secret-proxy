@@ -75,22 +75,49 @@ func TestCancelledWaitingResponseReturnsCredit(t *testing.T) {
 }
 
 // An accepted extended CONNECT (a WebSocket) carries frames, not a body: they
-// pass through untouched even with a value on record in them.
+// pass through untouched even with a value on record in them. Any 2xx
+// accepts it, 204 included, which elsewhere has no content.
 func TestExtendedConnectTunnelIsNotMasked(t *testing.T) {
-	h := newHarness(t, masking(t, false))
+	for _, code := range []string{"200", "204"} {
+		t.Run(code, func(t *testing.T) {
+			h := newHarness(t, masking(t, false))
+			c := newClientView(h)
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
+				Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
+			id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+			h.serverSend(status(h, id, false, field(":status", code)))
+			if head := c.readHead(1); head[":status"] != code {
+				t.Fatalf("head %v", head)
+			}
+			frame := "\x81\x19" + realToken // a WebSocket text frame holding the value
+			h.serverSend(data(id, frame, false))
+			f := h.expect(h.toClient, "client", isType(FrameData))
+			if string(f.Payload) != frame {
+				t.Fatalf("client got %q, want the frame untouched", f.Payload)
+			}
+		})
+	}
+}
+
+// Content on a bodiless response is reset even when it ends the server's
+// stream while the request is still open (an extended CONNECT answered
+// 304): the client stops sending once reset, so the request ends too, the
+// server's stream is reset, and the stream gives back its slot.
+func TestBodilessResetEndsARequestStillOpen(t *testing.T) {
+	h := newHarness(t, masking(t, true))
 	c := newClientView(h)
 	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
 		Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
 	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
-	h.serverSend(status(h, id, false, field(":status", "200")))
-	if head := c.readHead(1); head[":status"] != "200" {
-		t.Fatalf("head %v", head)
+	h.serverSend(status(h, id, false, field(":status", "304")), data(id, "card "+realCard, true))
+	if resp := c.read(1, true); !resp.resetSeen || bytes.Contains(resp.body, []byte(realCard)) {
+		t.Fatalf("reset %v, body %q", resp.resetSeen, resp.body)
 	}
-	frame := "\x81\x19" + realToken // a WebSocket text frame holding the value
-	h.serverSend(data(id, frame, false))
-	f := h.expect(h.toClient, "client", isType(FrameData))
-	if string(f.Payload) != frame {
-		t.Fatalf("client got %q, want the frame untouched", f.Payload)
+	if f := h.expect(h.toServer, "server", isType(FrameRSTStream)); f.Stream != id {
+		t.Fatalf("server got RST_STREAM on %d, want %d", f.Stream, id)
+	}
+	if streams, byServer, _ := h.state(); streams != 0 || byServer != 0 {
+		t.Fatalf("%d streams, %d server mappings left", streams, byServer)
 	}
 }
 

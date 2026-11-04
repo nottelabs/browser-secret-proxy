@@ -370,6 +370,9 @@ func TestUnmaskableResponsesAreRefused(t *testing.T) {
 		"unknown coding":  {field(":status", "200"), field("content-encoding", "compress")},
 		"stacked codings": {field(":status", "200"), field("content-encoding", "gzip, br")},
 		"partial":         {field(":status", "206"), field("content-range", "bytes 0-3/9")},
+		// Malformed in HTTP/2 (RFC 9113 8.2.1), and not recognized as the
+		// content-encoding, so the body would pass undecoded.
+		"upper-case name": {field(":status", "200"), field("Content-Encoding", "gzip")},
 	}
 	for name, fields := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -385,6 +388,49 @@ func TestUnmaskableResponsesAreRefused(t *testing.T) {
 			h.serverSend(data(id, "abcd", true))
 			h.quiet(h.toClient, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameData })
 		})
+	}
+}
+
+// Partial responses are refused even when masking keeps every length:
+// ranges masked one by one would let a client ask for the pieces of a value
+// (bytes=0-7, then bytes=8-15) and put it back together.
+func TestSameLengthPartialResponseIsRefused(t *testing.T) {
+	h := newHarness(t, masking(t, true))
+	id := get(h, 1)
+	h.serverSend(status(h, id, false, field(":status", "206"), field("content-range", "bytes 0-7/16"), field("content-length", "8")))
+	h.expect(h.toClient, "client", isBadGateway(1))
+	h.serverSend(data(id, realCard[:8], true))
+	h.quiet(h.toClient, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameData })
+}
+
+// Content on a response that cannot have any (HEAD, 204, 304) is malformed
+// (RFC 9113 8.1.1): the stream is reset and the content not passed on. An
+// empty DATA that ends such a stream is passed on.
+func TestContentOnABodilessResponseIsReset(t *testing.T) {
+	for _, c := range []struct{ method, status string }{{"HEAD", "200"}, {"GET", "204"}, {"GET", "304"}} {
+		t.Run(c.method+" "+c.status, func(t *testing.T) {
+			h := newHarness(t, masking(t, true))
+			view := newClientView(h)
+			h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(request(c.method)...)})
+			id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+			h.serverSend(status(h, id, false, field(":status", c.status)), data(id, "card "+realCard, false))
+			resp := view.read(1, true)
+			if !resp.resetSeen || bytes.Contains(resp.body, []byte(realCard)) {
+				t.Fatalf("reset %v, body %q", resp.resetSeen, resp.body)
+			}
+			f := h.expect(h.toServer, "server", isType(FrameRSTStream))
+			if f.Stream != id || binary.BigEndian.Uint32(f.Payload) != errCodeProtocol {
+				t.Fatalf("server got RST_STREAM %d on %d", binary.BigEndian.Uint32(f.Payload), f.Stream)
+			}
+		})
+	}
+	h := newHarness(t, masking(t, true))
+	view := newClientView(h)
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(request("HEAD")...)})
+	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+	h.serverSend(status(h, id, false, field(":status", "200"), field("content-length", "16")), data(id, "", true))
+	if resp := view.read(1, true); resp.resetSeen || resp.head[":status"] != "200" {
+		t.Fatalf("reset %v, head %v", resp.resetSeen, resp.head)
 	}
 }
 

@@ -604,18 +604,22 @@ come.
 
 What is masked:
 
-- header values (`Location`, `Set-Cookie`, ...), the body and trailers, over
-  HTTP/1.1 and HTTP/2;
-- each value as is, JSON-escaped (with and without HTML escaping), query- and
-  path-escaped, HTML-escaped, as decimal or hexadecimal character references,
-  and, for 13 to 19 digit card numbers, grouped in fours (or 4-6-5 and 4-6-4)
-  with spaces or dashes. Each form is replaced by the same form of the
-  stand-in, so the response stays valid. Where the value has nothing to
-  escape, so several forms look alike, the stand-in is escaped for where it
-  lands, as the request side does: JSON-escaped in JSON and JavaScript
-  bodies, query-escaped in form bodies and in `Location`, `Content-Location`,
-  `Link`, `Refresh` and `Set-Cookie`, HTML-escaped in HTML and XML bodies,
-  as is elsewhere;
+- header values (`Location`, `Set-Cookie`, ...), the HTTP/1.1 reason phrase
+  (`statusText` in `fetch`), the body and trailers, over HTTP/1.1 and HTTP/2;
+- each value as is, and in the escaped forms Go's standard encoders write:
+  JSON-escaped as `encoding/json` writes it (with and without HTML escaping),
+  query- and path-escaped as `net/url` writes it (`QueryEscape`,
+  `PathEscape`), HTML-escaped as `html.EscapeString` writes it, as decimal
+  references (`&#65;`) and as hexadecimal references in lower case (`&#x4a;`)
+  or upper case (`&#X4A;`); and, for 13 to 19 digit card numbers, grouped in
+  fours (or 4-6-5 and 4-6-4) with spaces or dashes. Other encoders often
+  escape differently: see [What masking misses](#what-masking-misses). Each
+  form is replaced by the same form of the stand-in, so the response stays
+  valid. Where the value has nothing to escape, so several forms look alike,
+  the stand-in is escaped for where it lands, as the request side does:
+  JSON-escaped in JSON and JavaScript bodies, query-escaped in form bodies
+  and in `Location`, `Content-Location`, `Link`, `Refresh` and `Set-Cookie`,
+  HTML-escaped in HTML and XML bodies, as is elsewhere;
 - values split across HTTP/1.1 chunks or HTTP/2 DATA frames. The proxy holds
   back at most the length of the longest form, and only bytes that could
   begin a value, so streamed responses keep flowing.
@@ -634,13 +638,30 @@ How a masked response changes:
   body is sent chunked.
 - A response ends with its own framing (the HTTP/1.1 zero chunk and
   trailers, the HTTP/2 end of stream), never earlier because the compressed
-  data ended; bytes after the end of the compressed data are dropped.
+  data ended. Bytes after the end of `deflate` data are dropped. Bytes
+  after the end of `gzip`, `br` or `zstd` data make the decoder fail, so
+  the response is cut off as when it passes the cap: the browser sees an
+  error, never an unmasked byte.
 - A response that cannot be masked gets a `502` from the proxy instead: an
   unknown or stacked content-coding (`compress`, `gzip, br`, or several
   `Content-Encoding` headers), a folded (obs-fold) HTTP/1.1 header line,
   transfer-codings other than a single `chunked` across every
   `Transfer-Encoding` header (any `transfer-encoding` field over HTTP/2), or
-  a `206` partial response whose ranges masking would shift.
+  any `206` partial response. Ranges would be masked one by one, so a client
+  could ask for the pieces of a value (`bytes=0-7`, then `bytes=8-15`) and
+  put it back together, even with a stand-in of the same length.
+- Also refused with a `502`: a real value in a header that frames the
+  HTTP/1.1 message or connection (`Content-Length`, `Transfer-Encoding`,
+  `Content-Encoding`, `Connection`, `Keep-Alive`, `Trailer`, `Upgrade`),
+  which are kept as they are; a real value in the HTTP/1.1 status line
+  outside its reason phrase; and, over HTTP/2, a field name with an
+  upper-case letter (malformed, RFC 9113 8.2.1). An HTTP/1.1 `101` to a
+  request that did not ask to upgrade is refused the same way, with masking
+  on or off: it would turn the rest of the connection into a raw stream,
+  neither swapped nor masked.
+- Over HTTP/2, content in DATA on a response that cannot have any (to a
+  `HEAD`, or a `204` or `304`) is malformed (RFC 9113 8.1.1): the stream is
+  reset and the content is not passed on.
 - Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
   the proxy is the flow-control endpoint for a masked stream, and keeps every
   other stream within the browser's windows. The request direction, and so
@@ -656,6 +677,25 @@ How a masked response changes:
   the upper-case form Go and browsers produce), base64, hashes, or a value
   split by markup
   (`4111<span>1111...`).
+- Escaped forms other than the ones Go's encoders write, though they decode
+  to the same value. For example: `\/` for `/` (PHP's `json_encode`);
+  `\u002B` for `+` and upper-case `\u003C` for `<` (.NET's
+  `System.Text.Json`); `\u00e4` for `ä` (Python's `json.dumps`, which
+  escapes non-ASCII by default); `&quot;` and `&#x27;` (Python's
+  `html.escape`, Django, React); `&#x2B;` (.NET's
+  `HtmlEncoder`); hexadecimal references that mix a lower-case `x` with
+  upper-case digits (`&#x4A;`); `%20` for a space with `!*'()` left as is
+  (`encodeURIComponent`); `%7E` for `~` (`URLSearchParams`); `/` left as is
+  with `%20` for a space (Python's `urllib.parse.quote`).
+- A value first recorded while a response is already open, such as a
+  server-sent events stream or another long response: which values are
+  masked is decided when the response head arrives, so a value the
+  principal sends afterwards, on any connection, is masked only in later
+  responses.
+- Values that overlap: when the end of one real value is the start of
+  another in the response (`abcdefgh12` then `gh12345678` in
+  `abcdefgh12345678`), the first one found is replaced, and the rest of the
+  other reaches the client.
 - Values shorter than 8 bytes (a CVC, a PIN): masking them would corrupt
   unrelated text.
 - Values the proxy has not looked up for this principal in the last 15
