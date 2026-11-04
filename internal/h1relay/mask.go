@@ -45,8 +45,8 @@ var responseFraming = map[string]bool{
 // ranges masking would shift.
 func maskHead(head []byte, status int, method string, switched bool, length int64, chunked bool, m *mask.Masker) ([]byte, maskPlan, error) {
 	lines := splitLines(head)
-	var encodings []string
-	transferEncoding, contentType := "", ""
+	var encodings, transferCodings []string
+	contentType := ""
 	for _, line := range lines[1 : len(lines)-1] {
 		if line[0] == ' ' || line[0] == '\t' {
 			return nil, maskPlan{}, fmt.Errorf("%w: a folded header line", errUnmaskable)
@@ -59,7 +59,13 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 		case "content-encoding":
 			encodings = append(encodings, value)
 		case "transfer-encoding":
-			transferEncoding = strings.ToLower(strings.TrimSpace(value))
+			// Every coding of every Transfer-Encoding header: repeated
+			// headers are one list (RFC 9110 5.3).
+			for _, c := range strings.Split(value, ",") {
+				if c = strings.ToLower(strings.TrimSpace(c)); c != "" {
+					transferCodings = append(transferCodings, c)
+				}
+			}
 		case "content-type":
 			contentType = value
 		}
@@ -72,8 +78,8 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 		return nil, p, fmt.Errorf("%w: %w", errUnmaskable, err)
 	}
 	if p.hasBody {
-		if transferEncoding != "" && transferEncoding != "chunked" {
-			return nil, p, fmt.Errorf("%w: transfer-coding %q", errUnmaskable, transferEncoding)
+		if len(transferCodings) > 0 && (len(transferCodings) != 1 || transferCodings[0] != "chunked") {
+			return nil, p, fmt.Errorf("%w: transfer-codings %q", errUnmaskable, strings.Join(transferCodings, ", "))
 		}
 		if status == 206 && (enc != "" || !m.SameLength(p.context)) {
 			return nil, p, fmt.Errorf("%w: a partial response whose content masking would change", errUnmaskable)

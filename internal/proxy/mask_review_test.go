@@ -275,3 +275,37 @@ func TestRefusedUpgradeBodyIsMasked(t *testing.T) {
 		t.Fatalf("client got %d %q", got.StatusCode, body)
 	}
 }
+
+// Transfer-codings are read from every Transfer-Encoding header: gzip in one
+// header and chunked in another is not plain chunked, and is refused, never
+// passed on with a gzip-coded real value.
+func TestRepeatedTransferEncodingsAreRefused(t *testing.T) {
+	var gz bytes.Buffer
+	z := gzip.NewWriter(&gz)
+	_, _ = io.WriteString(z, "secret real_alice")
+	_ = z.Close()
+	for name, headers := range map[string]string{
+		"repeated":      "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+		"list":          "Transfer-Encoding: gzip, chunked\r\n",
+		"chunked twice": "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := maskingSetup(t, "http/1.1", rawDestination(func(string) string {
+				return "HTTP/1.1 200 OK\r\n" + headers + "\r\n" + strconv.FormatInt(int64(gz.Len()), 16) + "\r\n" + gz.String() + "\r\n0\r\n\r\n"
+			}, nil), map[string]string{"tok_alice": "real_alice"})
+			conn, resp := connect(t, p.addr, allowedHost+":443", "")
+			_ = resp.Body.Close()
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: allowedHost, RootCAs: p.ca, NextProtos: []string{"http/1.1"}})
+			if err := tlsConn.Handshake(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(tlsConn, "POST /t HTTP/1.1\r\nHost: "+allowedHost+"\r\nContent-Length: 11\r\n\r\nc=tok_alice"); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := io.ReadAll(tlsConn)
+			if !bytes.HasPrefix(got, []byte("HTTP/1.1 502 ")) || bytes.Contains(got, gz.Bytes()[:10]) {
+				t.Fatalf("client got %q", got)
+			}
+		})
+	}
+}

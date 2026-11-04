@@ -198,3 +198,28 @@ func TestRefusedConnectBodyIsMasked(t *testing.T) {
 		t.Fatalf("client got %q", resp.body)
 	}
 }
+
+// A refused extended CONNECT's compressed body is decoded and masked like any
+// other body, and its content-encoding dropped only because it was decoded.
+func TestRefusedConnectCompressedBodyIsDecodedAndMasked(t *testing.T) {
+	h := newHarness(t, masking(t, false))
+	c := newClientView(h)
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1,
+		Payload: h.clientBlock(request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})...)})
+	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+	body := compressed(t, "gzip", []byte("denied for "+realToken))
+	h.serverSend(status(h, id, false, field(":status", "403"), field("content-encoding", "gzip")), data(id, string(body), true))
+	resp := c.read(1, true)
+	if string(resp.body) != "denied for "+tokenSIn || resp.head["content-encoding"] != "" {
+		t.Fatalf("client got %v %q", resp.head, resp.body)
+	}
+}
+
+// transfer-encoding is malformed in HTTP/2 and a coding the masker would not
+// see: a response carrying it is refused.
+func TestTransferEncodingFieldIsRefused(t *testing.T) {
+	h := newHarness(t, masking(t, false))
+	id := get(h, 1)
+	h.serverSend(status(h, id, false, field(":status", "200"), field("transfer-encoding", "gzip")))
+	h.expect(h.toClient, "client", isBadGateway(1))
+}

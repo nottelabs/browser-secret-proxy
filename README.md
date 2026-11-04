@@ -463,9 +463,10 @@ How a masked response changes:
   data ended; bytes after the end of the compressed data are dropped.
 - A response that cannot be masked gets a `502` from the proxy instead: an
   unknown or stacked content-coding (`compress`, `gzip, br`, or several
-  `Content-Encoding` headers), a folded (obs-fold) HTTP/1.1 header line, a
-  transfer-coding other than `chunked`, or a `206` partial response whose
-  ranges masking would shift.
+  `Content-Encoding` headers), a folded (obs-fold) HTTP/1.1 header line,
+  transfer-codings other than a single `chunked` across every
+  `Transfer-Encoding` header (any `transfer-encoding` field over HTTP/2), or
+  a `206` partial response whose ranges masking would shift.
 - Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
   the proxy is the flow-control endpoint for a masked stream, and keeps every
   other stream within the browser's windows. The request direction, and so

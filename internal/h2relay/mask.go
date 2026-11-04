@@ -557,8 +557,13 @@ func (r *relay) refuseResponse(s *stream, rs *respState, serverDone bool, cause 
 func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bool, m *mask.Masker) ([]hpack.HeaderField, respPlan, error) {
 	var encodings []string
 	for _, f := range fields {
-		if f.Name == "content-encoding" {
+		switch f.Name {
+		case "content-encoding":
 			encodings = append(encodings, f.Value)
+		case "transfer-encoding":
+			// Connection-specific, so malformed in HTTP/2 (RFC 9113 8.2.2),
+			// and a coding the masker would not see: refused.
+			return nil, respPlan{}, fmt.Errorf("%w: a transfer-encoding field", errUnmaskable)
 		}
 	}
 	contentType := ""
