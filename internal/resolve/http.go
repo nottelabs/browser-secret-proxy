@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/strictjson"
 )
 
 // HTTPConfig configures an HTTP resolver.
@@ -59,6 +60,10 @@ type HTTPConfig struct {
 // case, without a port or a trailing dot. "hosts" restricts the value to
 // those hosts; without it, or with null, the value may go to any host in
 // the proxy's allowlist, and an empty list refuses the request.
+//
+// The answer is read strictly: one that names a member twice, at any depth,
+// or spells a member above in another case is malformed. Other members are
+// ignored.
 //
 // One call covers every stand-in of a request that is not cached. Any other
 // status, a malformed answer or a timeout is an error, and a stand-in left
@@ -162,6 +167,12 @@ type detokenizeResponse struct {
 		Hosts     []string  `json:"hosts"`
 		ExpiresAt time.Time `json:"expires_at"`
 	} `json:"values"`
+}
+
+// detokenizeAnswer names the members of detokenizeResponse, as their json
+// tags spell them, at every level.
+var detokenizeAnswer = strictjson.Object{
+	"values": strictjson.Map{Elem: strictjson.Object{"real": nil, "hosts": nil, "expires_at": nil}},
 }
 
 // Resolve answers cached stand-ins from memory and asks the service for the
@@ -274,6 +285,12 @@ func (h *HTTP) call(ctx context.Context, body detokenizeRequest) (*detokenizeRes
 	}
 	if len(data) > maxResponse {
 		return nil, fmt.Errorf("the resolver answer is larger than %d bytes", maxResponse)
+	}
+	// encoding/json alone would read "HOSTS" as hosts and keep the last of
+	// two members, so the answer could carry another scope than the service
+	// meant.
+	if err := strictjson.Check(data, detokenizeAnswer); err != nil {
+		return nil, fmt.Errorf("the resolver answer is ambiguous: %w", err)
 	}
 	var answer detokenizeResponse
 	if err := json.Unmarshal(data, &answer); err != nil {

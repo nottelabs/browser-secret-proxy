@@ -59,6 +59,11 @@ First release, planned as 0.1.0.
   a member or spell a claim in another case (`"HOSTS"`) gets `407`. With
   masking on, a request carrying more than 1,024 values is refused instead
   of evicting some of its own values from the masking record.
+- The `http` resolver's answer is read as the service wrote it, like sealed
+  claims: an answer that names a member twice, at any depth, or spells
+  `values`, `real`, `hosts` or `expires_at` in another case (`"HOSTS"`) is
+  malformed, and the request is refused. `examples/seal` refuses such a
+  payload file, and `examples/http-resolver` such a values file or request.
 - Releases are published only after fmt, vet, lint, the race tests and
   govulncheck pass on the tagged commit, in a job without write or signing
   permissions. The README verifies signatures against the exact identity of

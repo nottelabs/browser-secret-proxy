@@ -51,3 +51,41 @@ func TestHandlerAnswersTheResolverAPI(t *testing.T) {
 		t.Fatal("an entry without real loaded")
 	}
 }
+
+// The values file is read as written: encoding/json alone would take
+// "HOSTS" for "hosts" and let the last of two members win, so an entry could
+// go to other hosts than the file seems to say.
+func TestLoadValuesIsStrict(t *testing.T) {
+	values, err := loadValues([]byte(`{"tok_a": "real_a", "TOK_A": {"real": "real_b", "hosts": ["api.test"], "note": {"a": 1, "A": 2}}}`))
+	if err != nil || values["tok_a"].Real != "real_a" || values["TOK_A"].Real != "real_b" || len(values["TOK_A"].Hosts) != 1 {
+		t.Fatalf("values %v, err %v", values, err)
+	}
+	for name, file := range map[string]string{
+		"hosts in another case": `{"tok_a": {"real": "real_a", "hosts": ["api.test"], "HOSTS": ["other.test"]}}`,
+		"hosts twice":           `{"tok_a": {"real": "real_a", "hosts": ["api.test"], "hosts": ["other.test"]}}`,
+		"real in another case":  `{"tok_a": {"REAL": "real_a"}}`,
+		"a stand-in twice":      `{"tok_a": "real_a", "tok_a": "real_b"}`,
+		"not an object":         `["tok_a"]`,
+	} {
+		if _, err := loadValues([]byte(file)); err == nil {
+			t.Errorf("%s: loaded", name)
+		}
+	}
+}
+
+// A request is read as the proxy writes it: one that spells a member in
+// another case or names it twice is refused.
+func TestHandlerRefusesAmbiguousRequests(t *testing.T) {
+	values := map[string]value{"tok_a": {Real: "real_a"}}
+	for name, body := range map[string]string{
+		"host in another case": `{"stand_ins": ["tok_a"], "host": "api.test", "HOST": "other.test", "principal_id": "u"}`,
+		"host twice":           `{"stand_ins": ["tok_a"], "host": "api.test", "host": "other.test", "principal_id": "u"}`,
+		"principal twice":      `{"stand_ins": ["tok_a"], "host": "api.test", "principal_id": "u", "principal_id": "v"}`,
+	} {
+		rec := httptest.NewRecorder()
+		handler(values).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d", name, rec.Code)
+		}
+	}
+}
