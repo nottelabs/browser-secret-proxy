@@ -237,3 +237,88 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 		t.Fatalf("a token Seal accepted was refused: %v", err)
 	}
 }
+
+func TestSealedCacheIsBoundedByExpiryTTLAndSize(t *testing.T) {
+	key := ecKey(t)
+	s, _ := NewSealed(key)
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	cached := func() int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.cache)
+	}
+
+	// Dropped at exp: an expired token leaves nothing in memory.
+	short := seal(t, key, payload(now.Add(time.Minute)))
+	if _, err := s.Authenticate("u", short); err != nil || cached() != 1 {
+		t.Fatalf("not cached: %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := s.Authenticate("u", short); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("an expired token was accepted: %v", err)
+	}
+	if cached() != 0 {
+		t.Fatal("an expired token's values stayed in memory")
+	}
+
+	// Kept at most sealedCacheTTL, even when exp is later.
+	long := seal(t, key, payload(now.Add(24*time.Hour)))
+	if _, err := s.Authenticate("u", long); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	for _, e := range s.cache {
+		if e.until.After(now.Add(sealedCacheTTL)) {
+			t.Errorf("cached until %v, more than %v from now", e.until.Sub(now), sealedCacheTTL)
+		}
+	}
+	s.mu.Unlock()
+	now = now.Add(sealedCacheTTL + time.Second)
+	other := seal(t, key, payload(now.Add(time.Hour)))
+	if _, err := s.Authenticate("u", other); err != nil {
+		t.Fatal(err)
+	}
+	if cached() != 1 {
+		t.Fatalf("%d cached tokens, want only the new one after the TTL", cached())
+	}
+	if _, err := s.Authenticate("u", long); err != nil {
+		t.Fatalf("a token past the cache TTL but before exp was refused: %v", err)
+	}
+
+	// Capped in size.
+	for range maxSealedCache + 20 {
+		if _, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Hour)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := cached(); n > maxSealedCache {
+		t.Fatalf("%d cached tokens, limit %d", n, maxSealedCache)
+	}
+}
+
+func TestSealedViewFailsClosedOnExpiry(t *testing.T) {
+	key := ecKey(t)
+	s, _ := NewSealed(key)
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.view(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v.StandIns(p); !reflect.DeepEqual(got, []string{"4242424242424242", "tok_a"}) {
+		t.Fatalf("StandIns = %q", got)
+	}
+	res, err := v.Resolve(context.Background(), Request{StandIns: v.StandIns(p)})
+	if err != nil || len(res.Values) != 2 {
+		t.Fatalf("the view resolved %d values: %v", len(res.Values), err)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := s.view(p); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("an expired token gave a view: %v", err)
+	}
+}

@@ -42,9 +42,13 @@ type SealedPayload struct {
 // Sealed resolves stand-ins from the proxy credential itself: the Basic
 // password is a compact JWE (ECDH-ES+A256KW, A256GCM) encrypted to the
 // proxy's key, whose payload is a SealedPayload. Decrypting it at CONNECT
-// both authenticates the client and yields the values, with no lookup
-// service and nothing stored. An expired, tampered or foreign token is
-// refused with 407.
+// both admits the client and yields the values, with no lookup service and
+// no external storage. An expired, tampered or foreign token is refused with
+// 407.
+//
+// Decrypted tokens, real values included, are kept in memory so a request
+// does not pay an ECDH per lookup: at most maxSealedCache of them, each
+// until the earlier of its exp and sealedCacheTTL after it was decrypted.
 type Sealed struct {
 	keys []crypto.PrivateKey
 	now  func() time.Time
@@ -56,11 +60,17 @@ type Sealed struct {
 type sealedEntry struct {
 	payload  *SealedPayload
 	standIns []string
-	expires  time.Time
+	expires  time.Time // the token's exp
+	until    time.Time // when the cache drops it: the earlier of exp and sealedCacheTTL
 }
 
-// maxSealedCache bounds the decrypted tokens kept in memory.
-const maxSealedCache = 1024
+const (
+	// maxSealedCache bounds the decrypted tokens kept in memory.
+	maxSealedCache = 256
+	// sealedCacheTTL bounds how long a decrypted token stays in memory; it is
+	// decrypted again after that.
+	sealedCacheTTL = 5 * time.Minute
+)
 
 // LoadSealed reads the proxy's private key: a PEM file with one or more EC
 // keys (P-256, P-384 or P-521; PKCS #8 or SEC 1). With several, a token
@@ -133,33 +143,61 @@ func (s *Sealed) Authenticate(username, password string) (Principal, error) {
 	return Principal{ID: id, Password: password}, nil
 }
 
-// StandIns returns the stand-ins of the principal's token.
+// StandIns returns the stand-ins of the principal's token, nil when the
+// token is no longer valid. Callers that must tell those apart use view.
 func (s *Sealed) StandIns(p Principal) []string {
-	e, err := s.open(p.Password)
+	v, err := s.view(p)
 	if err != nil {
 		return nil
 	}
-	return e.standIns
+	return v.StandIns(p)
 }
 
 // Resolve answers from the principal's token. Each value expires with the
 // token and may go to the token's hosts only.
-func (s *Sealed) Resolve(_ context.Context, req Request) (Result, error) {
-	e, err := s.open(req.Principal.Password)
+func (s *Sealed) Resolve(ctx context.Context, req Request) (Result, error) {
+	v, err := s.view(req.Principal)
 	if err != nil {
 		return Result{}, err
 	}
+	return v.Resolve(ctx, req)
+}
+
+// sealedView is one opened token: its stand-ins and its values, read
+// together. A request is detected and resolved from the same view, so a
+// token that expires in between cannot leave its stand-ins undetected.
+type sealedView struct{ entry *sealedEntry }
+
+// StandIns returns the token's stand-ins. The view belongs to one
+// principal, so the argument is not needed.
+func (v *sealedView) StandIns(Principal) []string { return v.entry.standIns }
+
+// Resolve answers the requested stand-ins the token holds.
+func (v *sealedView) Resolve(_ context.Context, req Request) (Result, error) {
+	payload := v.entry.payload
 	out := Result{Values: make(map[string]Value, len(req.StandIns))}
 	for _, standIn := range req.StandIns {
-		if real, ok := e.payload.Values[standIn]; ok {
-			out.Values[standIn] = Value{Real: real, Hosts: e.payload.Hosts, ExpiresAt: e.expires}
+		if real, ok := payload.Values[standIn]; ok {
+			out.Values[standIn] = Value{Real: real, Hosts: payload.Hosts, ExpiresAt: v.entry.expires}
 		}
 	}
 	return out, nil
 }
 
-// open decrypts and checks a token, from memory when it was seen before.
-// Errors wrap ErrUnauthenticated and never quote the token.
+// view opens the principal's token once. The error wraps ErrUnauthenticated
+// when the token is no longer valid (expired, or never was): the request
+// must then be refused, even when it holds no stand-in, since its stand-ins
+// can no longer be found.
+func (s *Sealed) view(p Principal) (*sealedView, error) {
+	e, err := s.open(p.Password)
+	if err != nil {
+		return nil, err
+	}
+	return &sealedView{entry: e}, nil
+}
+
+// open decrypts and checks a token, from memory when it was decrypted
+// recently. Errors wrap ErrUnauthenticated and never quote the token.
 func (s *Sealed) open(token string) (*sealedEntry, error) {
 	now := s.now()
 	if token == "" || len(token) > maxSealedToken {
@@ -168,29 +206,47 @@ func (s *Sealed) open(token string) (*sealedEntry, error) {
 	sum := sha256.Sum256([]byte(token))
 	s.mu.Lock()
 	e, ok := s.cache[sum]
+	if ok && !now.Before(e.until) {
+		delete(s.cache, sum)
+		ok = false
+	}
 	s.mu.Unlock()
 	if !ok {
 		var err error
 		if e, err = s.decrypt(token); err != nil {
 			return nil, err
 		}
+		e.until = e.expires
+		if limit := now.Add(sealedCacheTTL); limit.Before(e.until) {
+			e.until = limit
+		}
 	}
 	if !now.Before(e.expires) {
 		return nil, fmt.Errorf("%w: the sealed token expired", ErrUnauthenticated)
 	}
 	if !ok {
-		s.mu.Lock()
-		if len(s.cache) >= maxSealedCache {
-			for k, old := range s.cache {
-				if !now.Before(old.expires) || len(s.cache) >= maxSealedCache {
-					delete(s.cache, k)
-				}
-			}
-		}
-		s.cache[sum] = e
-		s.mu.Unlock()
+		s.store(sum, e, now)
 	}
 	return e, nil
+}
+
+// store caches a decrypted token, first dropping every entry past its time,
+// then arbitrary ones while the cache is full.
+func (s *Sealed) store(sum [sha256.Size]byte, e *sealedEntry, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, old := range s.cache {
+		if !now.Before(old.until) {
+			delete(s.cache, k)
+		}
+	}
+	for k := range s.cache {
+		if len(s.cache) < maxSealedCache {
+			break
+		}
+		delete(s.cache, k)
+	}
+	s.cache[sum] = e
 }
 
 func (s *Sealed) decrypt(token string) (*sealedEntry, error) {
