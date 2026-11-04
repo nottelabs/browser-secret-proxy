@@ -248,7 +248,7 @@ func (e *e2e) setup(ctx context.Context) error {
 	}
 	for _, p := range []*proxyRun{e.swapProxy, e.maskProxy} {
 		logf("starting the %s proxy (%s)", p.role, e.cfg.image)
-		// Set before docker run: a run that fails or is cancelled can still
+		// Set before docker run: a run that fails or is canceled can still
 		// have created the container, so cleanup must try to remove it.
 		p.started = true
 		if err := startProxy(ctx, e.cfg.image, p); err != nil {
