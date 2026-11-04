@@ -151,6 +151,7 @@ type exchange struct {
 	// switching requests (Upgrade, CONNECT) learn here whether the server
 	// switched the connection to another protocol.
 	switching bool
+	upgrade   bool // the request carried Upgrade, so a 101 may answer it
 	switched  chan bool
 }
 
@@ -356,7 +357,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		if swapped > 0 {
 			opts.Logger.Info("swapped stand-ins in a request", "host", host, "parts", swapped)
 		}
-		ex := &exchange{method: strings.ToUpper(parts[0])}
+		ex := &exchange{method: strings.ToUpper(parts[0]), upgrade: upgrade}
 		if upgrade || ex.method == "CONNECT" {
 			ex.switching, ex.switched = true, make(chan bool, 1)
 		}
@@ -457,6 +458,15 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 			default:
 				current = &exchange{unsolicited: true}
 			}
+		}
+		// A 101 turns the rest of the connection into a raw stream that is
+		// neither swapped nor masked, so only a request that asked to
+		// upgrade may get one (RFC 9110 15.2.2). Any other 101 is refused.
+		if status == 101 && !current.upgrade {
+			opts.Logger.Warn("refusing a 101 to a request that did not ask to upgrade")
+			body := "secret-proxy: unrequested protocol switch\n"
+			_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			return errRefused
 		}
 		switched := status == 101 || current.method == "CONNECT" && status >= 200 && status < 300
 		// Values resolved before this response's request was sent are on

@@ -26,23 +26,28 @@ type maskPlan struct {
 	context        mask.Context // of the body, from its Content-Type
 }
 
-// responseHeaders the masker does not touch: they frame the message or the
-// connection and carry no content.
+// responseFraming are headers the masker does not rewrite: they frame the
+// message or the connection, and a client parses them as names and tokens,
+// so a stand-in put in their place could change the framing (a Trailer or
+// Connection that names another field, an Upgrade the client did not ask
+// for). They carry no content, so a server has no reason to echo a value in
+// them: one that does is refused rather than masked.
 var responseFraming = map[string]bool{
 	"content-length": true, "transfer-encoding": true, "content-encoding": true, "connection": true,
 	"keep-alive": true, "trailer": true, "upgrade": true,
 }
 
-// maskHead rewrites a response head for masking: every header value except
-// framing headers is masked; a decodable Content-Encoding is dropped, since
+// maskHead rewrites a response head for masking: the reason phrase and
+// every header value except framing headers are masked; a decodable Content-Encoding is dropped, since
 // the body is decoded to be masked; a body whose length may change loses its
 // Content-Length and is sent chunked. Headers are rewritten line by line,
 // never by substitution in the raw head. It returns errUnmaskable for a
 // response that cannot be masked: a folded (obs-fold) header line, whose
 // value a client may unfold into another header than the one read here; an
 // unknown or stacked content-coding (in one list or several headers); a
-// transfer-coding other than chunked; or a partial response (206) whose
-// ranges masking would shift.
+// transfer-coding other than chunked; a partial response (206); or a real
+// value in a framing header or in the status line outside its reason
+// phrase.
 func maskHead(head []byte, status int, method string, switched bool, length int64, chunked bool, m *mask.Masker) ([]byte, maskPlan, error) {
 	lines := splitLines(head)
 	var encodings, transferCodings []string
@@ -70,6 +75,12 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 			contentType = value
 		}
 	}
+	// Ranges are masked one by one, so a client that asks for ranges that
+	// split a value (bytes=0-7, then bytes=8-15) would get each piece as is
+	// and could put the value back together.
+	if status == 206 {
+		return nil, maskPlan{}, fmt.Errorf("%w: a partial response", errUnmaskable)
+	}
 	p := maskPlan{context: mask.ContextOf(contentType)}
 	bodiless := switched || method == "HEAD" || status == 204 || status == 304 || status < 200 || (!chunked && length == 0)
 	p.hasBody = !bodiless
@@ -80,9 +91,6 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 	if p.hasBody {
 		if len(transferCodings) > 0 && (len(transferCodings) != 1 || transferCodings[0] != "chunked") {
 			return nil, p, fmt.Errorf("%w: transfer-codings %q", errUnmaskable, strings.Join(transferCodings, ", "))
-		}
-		if status == 206 && (enc != "" || !m.SameLength(p.context)) {
-			return nil, p, fmt.Errorf("%w: a partial response whose content masking would change", errUnmaskable)
 		}
 		p.decode = enc
 		p.inChunked = chunked
@@ -96,7 +104,11 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 	dropEncoding := enc != "" && !switched && status >= 200
 
 	out := make([]byte, 0, len(head)+32)
-	out = append(out, lines[0]...)
+	statusLine, err := maskStatusLine(lines[0], m)
+	if err != nil {
+		return nil, p, err
+	}
+	out = append(out, statusLine...)
 	for _, line := range lines[1 : len(lines)-1] {
 		raw := strings.TrimRight(line, "\r\n")
 		name, value, _ := strings.Cut(raw, ":")
@@ -107,6 +119,9 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 		case lower == "content-length" && (p.hasBody && !p.keepFraming || method == "HEAD" && dropEncoding):
 			continue
 		case responseFraming[lower]:
+			if m.String(mask.HeaderContext(lower), value) != value {
+				return nil, p, fmt.Errorf("%w: a real value in a framing header", errUnmaskable)
+			}
 			out = append(out, line...)
 			continue
 		}
@@ -120,6 +135,24 @@ func maskHead(head []byte, status int, method string, switched bool, length int6
 		out = append(out, "Transfer-Encoding: chunked\r\n"...)
 	}
 	return append(out, "\r\n"...), p, nil
+}
+
+// maskStatusLine masks the reason phrase of a status line, which a client
+// may show (fetch's statusText). The whole line is masked, so a reason
+// phrase is covered however its separators are written; a value that
+// reaches into the version or code, or a stand-in that cannot go into the
+// line, is refused.
+func maskStatusLine(line string, m *mask.Masker) (string, error) {
+	text := strings.TrimRight(line, "\r\n")
+	masked := m.String(mask.Text, text)
+	if masked == text {
+		return line, nil
+	}
+	before, after := strings.Fields(text), strings.Fields(masked)
+	if unsafeHeader(masked, text) || len(after) < 2 || after[0] != before[0] || after[1] != before[1] {
+		return "", fmt.Errorf("%w: a real value in the status line", errUnmaskable)
+	}
+	return masked + line[len(text):], nil
 }
 
 func unsafeHeader(masked, original string) bool {

@@ -49,6 +49,7 @@ func maskedOptions(t *testing.T, sameLength bool) Options {
 // received is a response as the client parsed it.
 type received struct {
 	StatusCode       int
+	Status           string
 	Header, Trailer  http.Header
 	ContentLength    int64
 	TransferEncoding []string
@@ -71,7 +72,7 @@ func roundTrip(t *testing.T, o Options, method, response string) (received, stri
 	if err != nil {
 		t.Fatalf("read body: %v (got %q)", err, body)
 	}
-	return received{resp.StatusCode, resp.Header, resp.Trailer, resp.ContentLength, resp.TransferEncoding}, string(body)
+	return received{resp.StatusCode, resp.Status, resp.Header, resp.Trailer, resp.ContentLength, resp.TransferEncoding}, string(body)
 }
 
 func TestSameLengthMaskingKeepsContentLength(t *testing.T) {
@@ -206,10 +207,10 @@ func TestCloseDelimitedBodyIsMasked(t *testing.T) {
 // Responses that cannot be masked are answered 502 and the connection ends.
 func TestUnmaskableResponsesAreRefused(t *testing.T) {
 	for name, raw := range map[string]string{
-		"unknown coding":          "HTTP/1.1 200 OK\r\nContent-Encoding: compress\r\nContent-Length: 4\r\n\r\nabcd",
-		"stacked codings":         "HTTP/1.1 200 OK\r\nContent-Encoding: gzip, br\r\nContent-Length: 4\r\n\r\nabcd",
-		"partial, length changes": "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/10\r\nContent-Length: 4\r\n\r\nabcd",
-		"transfer coding":         "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+		"unknown coding":  "HTTP/1.1 200 OK\r\nContent-Encoding: compress\r\nContent-Length: 4\r\n\r\nabcd",
+		"stacked codings": "HTTP/1.1 200 OK\r\nContent-Encoding: gzip, br\r\nContent-Length: 4\r\n\r\nabcd",
+		"partial":         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/10\r\nContent-Length: 4\r\n\r\nabcd",
+		"transfer coding": "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			resp, body := roundTrip(t, maskedOptions(t, false), "GET", raw)
@@ -218,11 +219,77 @@ func TestUnmaskableResponsesAreRefused(t *testing.T) {
 			}
 		})
 	}
-	// A partial response whose masking keeps every length goes through.
-	resp, body := roundTrip(t, maskedOptions(t, true), "GET",
-		"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-15/99\r\nContent-Length: 16\r\n\r\n"+realCard)
-	if resp.StatusCode != http.StatusPartialContent || body != cardSIn {
-		t.Fatalf("got %d %q", resp.StatusCode, body)
+}
+
+// rawRoundTrip sends one request and the server's raw response, and returns
+// every byte the client got until the relay stopped writing.
+func rawRoundTrip(t *testing.T, o Options, request, response string) string {
+	t.Helper()
+	client, clientReader, server, serverReader, _ := pipesWith(t, o)
+	send(t, client, request)
+	readHead(t, serverReader)
+	go func() {
+		_, _ = io.WriteString(server, response)
+		_ = server.Close()
+	}()
+	got, _ := io.ReadAll(clientReader)
+	return string(got)
+}
+
+// Partial responses are refused even when masking keeps every length:
+// ranges masked one by one would let a client ask for the pieces of a
+// value (bytes=0-7, then bytes=8-15) and put it back together.
+func TestPartialResponsesAreRefused(t *testing.T) {
+	multipart := "--B\r\nContent-Range: bytes 0-7/16\r\n\r\n" + realCard[:8] + "\r\n--B\r\nContent-Range: bytes 8-15/16\r\n\r\n" + realCard[8:] + "\r\n--B--\r\n"
+	for name, raw := range map[string]string{
+		"one range":   "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/16\r\nContent-Length: 8\r\n\r\n" + realCard[:8],
+		"byteranges":  "HTTP/1.1 206 Partial Content\r\nContent-Type: multipart/byteranges; boundary=B\r\nContent-Length: " + itoa(len(multipart)) + "\r\n\r\n" + multipart,
+		"whole value": "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-15/99\r\nContent-Length: 16\r\n\r\n" + realCard,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := rawRoundTrip(t, maskedOptions(t, true), "GET / HTTP/1.1\r\nHost: allowed.test\r\nRange: bytes=0-7\r\n\r\n", raw)
+			if !strings.HasPrefix(got, "HTTP/1.1 502 ") || strings.Contains(got, realCard[:8]) || strings.Contains(got, realCard[8:]) {
+				t.Fatalf("client got %q", got)
+			}
+		})
+	}
+}
+
+// The reason phrase is masked like a header value: fetch exposes it as
+// statusText.
+func TestReasonPhraseIsMasked(t *testing.T) {
+	resp, body := roundTrip(t, maskedOptions(t, false), "GET",
+		"HTTP/1.1 402 Card "+realCard+" declined\r\nContent-Length: 2\r\n\r\nno")
+	if resp.Status != "402 Card "+cardSIn+" declined" || body != "no" {
+		t.Fatalf("got %q %q", resp.Status, body)
+	}
+	// A value in place of the code cannot be masked without changing it.
+	got := rawRoundTrip(t, maskedOptions(t, true), "GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"HTTP/1.1 "+realCard+" OK\r\nContent-Length: 2\r\n\r\nno")
+	if !strings.HasPrefix(got, "HTTP/1.1 502 ") || strings.Contains(got, realCard) {
+		t.Fatalf("client got %q", got)
+	}
+}
+
+// Headers that frame the connection are kept as they are, so a response
+// with a real value in one is refused.
+func TestRealValueInAFramingHeaderIsRefused(t *testing.T) {
+	for _, h := range []string{"Keep-Alive: timeout=5, id=" + realCard, "Trailer: x-" + realCard, "Upgrade: x/" + realCard, "Connection: x-" + realCard} {
+		got := rawRoundTrip(t, maskedOptions(t, true), "GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+			"HTTP/1.1 200 OK\r\n"+h+"\r\nContent-Length: 2\r\n\r\nok")
+		if !strings.HasPrefix(got, "HTTP/1.1 502 ") || strings.Contains(got, realCard) {
+			t.Errorf("%s: client got %q", h, got)
+		}
+	}
+}
+
+// A 101 to a request that did not ask to upgrade is refused: it would turn
+// the rest of the connection into a stream that is not masked.
+func TestUnrequested101IsRefused(t *testing.T) {
+	got := rawRoundTrip(t, maskedOptions(t, true), "GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"HTTP/1.1 101 Switching Protocols\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n"+realCard)
+	if !strings.HasPrefix(got, "HTTP/1.1 502 ") || strings.Contains(got, realCard) {
+		t.Fatalf("client got %q", got)
 	}
 }
 
