@@ -106,5 +106,6 @@ test endpoint you run.
   connections of the principal that looked them up, through the same
   proxy process. With several replicas, see
   [Sizing](../deployment.md#sizing).
-- **WebSockets, other tunnels, and hosts not on `-hosts`** are never
-  masked.
+- **WebSocket frames and hosts not on `-hosts`** are never masked. Other
+  tunnels inside a decrypted connection are refused with `502`, so they
+  cannot carry a response past masking.

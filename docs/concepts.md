@@ -152,8 +152,10 @@ request usually fails on the site's side.
   it.
 - **Hosts that are not allowlisted.** Their traffic is tunneled, never
   decrypted.
-- **WebSockets and other upgraded connections**, once the destination
-  accepts the upgrade (HTTP/1.1 `Upgrade`, HTTP/2 extended `CONNECT`).
+- **WebSocket frames**, once the destination accepts an HTTP/1.1
+  `Upgrade: websocket` with a `101`. Other tunnels inside a decrypted
+  connection (a `CONNECT`, an HTTP/2 extended `CONNECT`, an upgrade to
+  another protocol) are refused with `502`.
 - **Plain `http://` requests.** The proxy accepts `CONNECT` only and
   answers anything else with `405`.
 

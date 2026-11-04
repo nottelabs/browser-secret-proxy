@@ -433,6 +433,13 @@ only encrypted traffic: the proxy opens its TLS connection to the
 destination through the parent's tunnel. Credentials in the URL are never
 logged. Calls to an `http` resolver do not use the parent.
 
+A `CONNECT` to an internal address (loopback, private, link-local such as
+`169.254.169.254`, `100.64.0.0/10`) is refused with `403`, so a browser
+cannot use the proxy to reach your network. Through `-upstream-proxy`,
+only destinations given as IP addresses are checked.
+`-allow-private-destinations` turns the check off, for tests against a
+local destination.
+
 ## Logs
 
 The proxy logs to stderr in `key=value` text, one line per event. `-v`
@@ -503,6 +510,11 @@ The proxy keeps little state. Measured locally, an idle proxy uses about
   body).
 - **Caches** are capped: 10,000 `http` values, 256 sealed tokens, 1,024
   masked values per principal and 4,096 principals.
+- **Connections** are capped at `-max-conns` (default `1024`); past it a
+  new one is answered `503`. A connection idle for `-idle-timeout`
+  (default `5m`) is closed, and each request head must arrive within
+  `-header-timeout` (default `10s`). Raise `-max-conns` for many browsers
+  per replica.
 - **CPU** goes to TLS: every intercepted connection does a full handshake
   with the destination and one with the client (no session resumption).
   Tunneled hosts cost a TCP copy only.
