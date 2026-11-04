@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -52,29 +53,34 @@ type echoed struct {
 	requests []string
 }
 
-func (e *echoed) add(r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
-	e.mu.Lock()
-	e.requests = append(e.requests, r.URL.RequestURI()+" "+string(body))
-	e.mu.Unlock()
-}
-
 func (e *echoed) all() string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return strings.Join(e.requests, "\n")
 }
 
-// echoDestination records each request and answers 200 "ok", over HTTP/2
-// or HTTP/1.1, whichever was negotiated, with net/http's own server.
+// echoDestination records each request and answers 200 "ok".
 func echoDestination(e *echoed) func(*tls.Conn) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		e.add(r)
+	return serveWith(e, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok")
+	}))
+}
+
+// serveWith serves handler on a destination connection, over HTTP/2 or
+// HTTP/1.1, whichever was negotiated, with net/http's own server, recording
+// each request it receives.
+func serveWith(e *echoed, handler http.Handler) func(*tls.Conn) {
+	recording := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		e.mu.Lock()
+		e.requests = append(e.requests, r.URL.RequestURI()+" "+string(body))
+		e.mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		handler.ServeHTTP(w, r)
 	})
 	return func(c *tls.Conn) {
 		ln := &oneConnListener{conn: c, done: make(chan struct{})}
-		server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, ConnState: func(_ net.Conn, state http.ConnState) {
+		server := &http.Server{Handler: recording, ReadHeaderTimeout: 10 * time.Second, ConnState: func(_ net.Conn, state http.ConnState) {
 			if state == http.StateClosed || state == http.StateHijacked {
 				ln.close()
 			}

@@ -1,0 +1,269 @@
+package h1relay
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
+)
+
+// errUnmaskable is a response that cannot be masked and so is not passed on.
+var errUnmaskable = errors.New("response cannot be masked")
+
+// maskPlan is how a masked response is rewritten.
+type maskPlan struct {
+	hasBody        bool
+	decode         mask.Encoding // decoded and sent without a content-coding
+	keepFraming    bool          // the body keeps its length: framing unchanged
+	inChunked      bool
+	outChunked     bool // sent chunked (re-chunked, or chunked instead of a Content-Length)
+	closeDelimited bool // the body runs until the server closes
+	length         int64
+}
+
+// responseHeaders the masker does not touch: they frame the message or the
+// connection and carry no content.
+var responseFraming = map[string]bool{
+	"content-length": true, "transfer-encoding": true, "content-encoding": true, "connection": true,
+	"keep-alive": true, "trailer": true, "upgrade": true,
+}
+
+// maskHead rewrites a response head for masking: every header value except
+// framing headers is masked; a decodable Content-Encoding is dropped, since
+// the body is decoded to be masked; a body whose length may change loses its
+// Content-Length and is sent chunked. Headers are rewritten line by line,
+// never by substitution in the raw head. It returns errUnmaskable for a
+// response that cannot be masked: an unknown or stacked content-coding, a
+// transfer-coding other than chunked, or a partial response (206) whose
+// ranges masking would shift.
+func maskHead(head []byte, status int, method string, switched bool, length int64, chunked bool, m *mask.Masker) ([]byte, maskPlan, error) {
+	lines := splitLines(head)
+	var encodings []string
+	transferEncoding := ""
+	for _, line := range lines[1:] {
+		name, value, ok := strings.Cut(strings.TrimRight(line, "\r\n"), ":")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "content-encoding":
+			encodings = append(encodings, value)
+		case "transfer-encoding":
+			transferEncoding = strings.ToLower(strings.TrimSpace(value))
+		}
+	}
+	var p maskPlan
+	bodiless := switched || method == "HEAD" || status == 204 || status == 304 || status < 200 || (!chunked && length == 0)
+	p.hasBody = !bodiless
+	enc, err := mask.ParseEncoding(encodings)
+	if err != nil && !switched && status >= 200 {
+		return nil, p, fmt.Errorf("%w: %w", errUnmaskable, err)
+	}
+	if p.hasBody {
+		if transferEncoding != "" && transferEncoding != "chunked" {
+			return nil, p, fmt.Errorf("%w: transfer-coding %q", errUnmaskable, transferEncoding)
+		}
+		if status == 206 && (enc != "" || !m.SameLength()) {
+			return nil, p, fmt.Errorf("%w: a partial response whose content masking would change", errUnmaskable)
+		}
+		p.decode = enc
+		p.inChunked = chunked
+		p.closeDelimited = !chunked && length < 0
+		p.length = length
+		p.keepFraming = enc == "" && m.SameLength()
+		p.outChunked = chunked || (!p.closeDelimited && !p.keepFraming)
+	}
+	// The coding is dropped on bodiless responses too, so a 304 or HEAD
+	// cannot restore it on a cached copy that was decoded.
+	dropEncoding := enc != "" && !switched && status >= 200
+
+	out := make([]byte, 0, len(head)+32)
+	out = append(out, lines[0]...)
+	for _, line := range lines[1 : len(lines)-1] {
+		raw := strings.TrimRight(line, "\r\n")
+		name, value, ok := strings.Cut(raw, ":")
+		lower := strings.ToLower(strings.TrimSpace(name))
+		switch {
+		case !ok:
+			// An obsolete folded continuation line is part of a value.
+			masked := m.String(raw)
+			if unsafeHeader(masked, raw) {
+				return nil, p, fmt.Errorf("%w: a stand-in cannot go into a header", errUnmaskable)
+			}
+			out = append(out, masked+"\r\n"...)
+			continue
+		case lower == "content-encoding" && dropEncoding:
+			continue
+		case lower == "content-length" && (p.hasBody && !p.keepFraming || method == "HEAD" && dropEncoding):
+			continue
+		case responseFraming[lower]:
+			out = append(out, line...)
+			continue
+		}
+		masked := m.String(value)
+		if unsafeHeader(masked, value) {
+			return nil, p, fmt.Errorf("%w: a stand-in cannot go into a header", errUnmaskable)
+		}
+		out = append(out, name+":"+masked+"\r\n"...)
+	}
+	if p.outChunked && !p.inChunked {
+		out = append(out, "Transfer-Encoding: chunked\r\n"...)
+	}
+	return append(out, "\r\n"...), p, nil
+}
+
+func unsafeHeader(masked, original string) bool {
+	return masked != original && strings.ContainsAny(masked, "\r\n\x00")
+}
+
+// splitLines splits a head into its lines, each with its line ending; the
+// last one is the empty line that ends the head.
+func splitLines(head []byte) []string {
+	var lines []string
+	for rest := string(head); rest != ""; {
+		i := strings.IndexByte(rest, '\n')
+		lines = append(lines, rest[:i+1])
+		rest = rest[i+1:]
+	}
+	return lines
+}
+
+// copyMaskedBody passes a response body on masked, decoded when it had a
+// content-coding, and framed as plan says. It stops with an error, which
+// ends the connection, when the body cannot be decoded or decodes past
+// maxDecoded: the client then gets a truncated response, never unmasked
+// bytes.
+func copyMaskedBody(br *bufio.Reader, client io.Writer, plan maskPlan, m *mask.Masker, maxDecoded int64) error {
+	var src io.Reader
+	var chunks *chunkReader
+	var limited *io.LimitedReader
+	switch {
+	case plan.inChunked:
+		chunks = &chunkReader{br: br}
+		src = chunks
+	case plan.closeDelimited:
+		src = br
+	default:
+		limited = &io.LimitedReader{R: br, N: plan.length}
+		src = limited
+	}
+	decoded, err := mask.Decoder(plan.decode, src, maxDecoded)
+	if err != nil {
+		return fmt.Errorf("decoding a response to mask it: %w", err)
+	}
+	defer decoded.Close()
+	if plan.decode == "" {
+		decoded = io.NopCloser(src) // identity bodies are not capped
+	}
+	sink := client
+	if plan.outChunked {
+		sink = chunkWriter{w: client}
+	}
+	w := m.NewWriter(sink)
+	buf := make([]byte, 32<<10)
+	if _, err := io.CopyBuffer(w, decoded, buf); err != nil {
+		return fmt.Errorf("masking a response: %w", err)
+	}
+	if limited != nil && limited.N > 0 {
+		return io.ErrUnexpectedEOF
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if !plan.outChunked {
+		return nil
+	}
+	end := []byte("0\r\n")
+	if chunks != nil {
+		for _, line := range chunks.trailers {
+			raw := strings.TrimRight(line, "\r\n")
+			masked := m.String(raw)
+			if unsafeHeader(masked, raw) {
+				return fmt.Errorf("%w: a stand-in cannot go into a trailer", errUnmaskable)
+			}
+			end = append(end, masked+"\r\n"...)
+		}
+	}
+	_, err = client.Write(append(end, "\r\n"...))
+	return err
+}
+
+// chunkWriter writes each Write as one chunk.
+type chunkWriter struct{ w io.Writer }
+
+func (c chunkWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	b := make([]byte, 0, len(p)+16)
+	b = strconv.AppendInt(b, int64(len(p)), 16)
+	b = append(b, "\r\n"...)
+	b = append(b, p...)
+	b = append(b, "\r\n"...)
+	if _, err := c.w.Write(b); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// chunkReader reads the data of a chunked body and keeps its trailers.
+type chunkReader struct {
+	br       *bufio.Reader
+	left     int64
+	started  bool
+	done     bool
+	trailers []string // raw lines, each with its line ending
+}
+
+func (c *chunkReader) Read(p []byte) (int, error) {
+	if c.done {
+		return 0, io.EOF
+	}
+	for c.left == 0 {
+		if c.started {
+			crlf, err := readRawLine(c.br, 2)
+			if err != nil || strings.TrimRight(string(crlf), "\r\n") != "" {
+				return 0, errors.New("missing CRLF after a chunk in a response")
+			}
+		}
+		c.started = true
+		line, err := readRawLine(c.br, maxChunkLine)
+		if err != nil {
+			return 0, err
+		}
+		sizeText, _, _ := strings.Cut(strings.TrimRight(string(line), "\r\n"), ";")
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeText), 16, 64)
+		if err != nil || size < 0 {
+			return 0, errors.New("invalid chunk size in a response")
+		}
+		if size == 0 {
+			total := 0
+			for {
+				trailer, err := readRawLine(c.br, maxHeadBytes-total)
+				if err != nil {
+					return 0, err
+				}
+				total += len(trailer)
+				if strings.TrimRight(string(trailer), "\r\n") == "" {
+					c.done = true
+					return 0, io.EOF
+				}
+				c.trailers = append(c.trailers, string(trailer))
+			}
+		}
+		c.left = size
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.br.Read(p)
+	c.left -= int64(n)
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
+}

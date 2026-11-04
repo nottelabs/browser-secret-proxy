@@ -8,6 +8,11 @@
 // sent upstream. Nothing is cached here: every request is resolved again, so
 // a value resolved for one principal is never used for another, and a
 // resolver's own expiry and revocation apply to the next request.
+//
+// When masking is on, every value resolved for a principal is also kept on
+// record (bounded, see Retention), and Session.Masker returns a mask.Masker
+// that turns those values back into their stand-ins in responses, on every
+// connection of that principal.
 package scope
 
 import (
@@ -18,6 +23,7 @@ import (
 	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -35,12 +41,17 @@ type Config struct {
 	// Timeout bounds one Resolve call (default DefaultTimeout).
 	Timeout time.Duration
 	// Now is the clock that expiry is checked against (default time.Now).
-	Now    func() time.Time
+	Now func() time.Time
+	// Mask keeps resolved values on record for masking responses.
+	Mask   bool
 	Logger *slog.Logger
 }
 
 // Scope builds a Session for each intercepted connection.
-type Scope struct{ cfg Config }
+type Scope struct {
+	cfg    Config
+	record *record
+}
 
 // New validates the configuration.
 func New(cfg Config) (*Scope, error) {
@@ -56,7 +67,7 @@ func New(cfg Config) (*Scope, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Scope{cfg: cfg}, nil
+	return &Scope{cfg: cfg, record: newRecord(cfg.Now)}, nil
 }
 
 // Session is the scope of one connection: the principal its CONNECT
@@ -70,6 +81,20 @@ type Session struct {
 	scope     *Scope
 	principal resolve.Principal
 }
+
+// Masker returns the Masker for every value resolved for this session's
+// principal, on any connection. It is nil when masking is off or nothing was
+// resolved yet.
+func (s *Session) Masker() *mask.Masker {
+	if !s.scope.cfg.Mask {
+		return nil
+	}
+	return s.scope.record.masker(s.principal)
+}
+
+// Masking reports whether responses are masked on this session's
+// connection: Masker may return a Masker at any time.
+func (s *Session) Masking() bool { return s.scope.cfg.Mask }
 
 // Principal is the connection's principal.
 func (s *Session) Principal() resolve.Principal { return s.principal }
@@ -128,6 +153,11 @@ func (s *Session) Values(ctx context.Context, host string, texts ...string) (map
 		// return it to the client.
 		cfg.Logger.Warn("resolver failed", "principal", s.principal.ID, "host", host, "stand_ins", len(standIns), "error", err)
 		return nil, refused("the resolver failed")
+	}
+	if cfg.Mask {
+		// Recorded before the checks: a value refused here is still the
+		// principal's, and a destination may hold it already.
+		s.scope.record.add(s.principal, result.Values)
 	}
 	now := cfg.Now()
 	values := make(map[string]resolve.Value, len(standIns))

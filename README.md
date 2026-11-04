@@ -27,8 +27,9 @@ reproduce instead of substituting its own.
    chose). The proxy finds the stand-ins in header values, the query string
    and the request body, looks up their real values once for that request,
    and replaces them. A request whose values cannot all be used is answered
-   `502` and not sent (see [Security model](#security-model)). Responses are
-   passed back unchanged.
+   `502` and not sent (see [Security model](#security-model)). In responses,
+   real values are replaced by their stand-ins before they reach the client
+   (see [Response masking](#response-masking)).
 
 Real values are never logged. Log lines name the host and how many fields
 were swapped.
@@ -124,6 +125,7 @@ curl --proxy http://127.0.0.1:8080 --cacert ca.pem \
 | `-swaps` | JSON file of stand-in to real value. Required. See [Where values are replaced](#where-values-are-replaced). |
 | `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty. |
+| `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
 | `-version` | Print the version and exit. |
 
@@ -217,7 +219,8 @@ host.
 - **Single use.** The proxy looks values up once per request and does not
   count uses. A value that must work only once has to be retired by the
   resolver that issues it.
-- **Responses** are not masked: see [Responses are not masked](#responses-are-not-masked).
+- **Responses** are masked for known forms of the values only: see
+  [what masking misses](#what-masking-misses).
 - **WebSockets** and other upgraded connections get no swaps once upgraded.
 
 ## Exposing the proxy
@@ -233,14 +236,71 @@ host.
   `https://` address.
 - **Network.** Restrict inbound access to the clients that need it.
 
-## Responses are not masked
+## Response masking
 
-The proxy replaces values in requests only. If a destination echoes a real
-value back (a card number in a confirmation page, a token in an error message
-or a redirect URL), the browser, the agent and anything that records the
-session will see it. Masking responses is your responsibility as the
-operator: allowlist only endpoints that do not return the secrets, or review
-what they return before relying on them.
+A destination may echo a real value back: a card number on a confirmation
+page, a token in an error message or a redirect URL. With masking on (the
+default), the proxy replaces every real value it looked up for a principal
+with its stand-in in responses on allowlisted hosts, before they reach the
+browser, its logs and recordings. That covers all of the principal's
+connections, and values looked up up to 24 hours ago (at most 1,024 per
+principal).
+
+What is masked:
+
+- header values (`Location`, `Set-Cookie`, ...), the body and trailers, over
+  HTTP/1.1 and HTTP/2;
+- each value as is, JSON-escaped (with and without HTML escaping), query- and
+  path-escaped, HTML-escaped, as decimal or hexadecimal character references,
+  and, for 13 to 19 digit card numbers, grouped in fours (or 4-6-5 and 4-6-4)
+  with spaces or dashes. Each form is replaced by the same form of the
+  stand-in, so the response stays valid;
+- values split across HTTP/1.1 chunks or HTTP/2 DATA frames. The proxy holds
+  back at most the length of the longest form, and only bytes that could
+  begin a value, so streamed responses keep flowing.
+
+How a masked response changes:
+
+- `gzip`, `deflate`, `br` and `zstd` bodies are decoded, masked and sent
+  without a content-coding: the `Content-Encoding` header is dropped. The
+  proxy never passes a compressed body through unmasked. A decoded body is
+  capped at 64 MiB; past it the response is cut off (HTTP/1.1: the
+  connection closes mid-body; HTTP/2: the stream is reset), so the browser
+  sees an error, never an unmasked byte.
+- When a stand-in has the same length as its value (a format-preserving
+  card stand-in, say) and the body is not compressed, the length and framing
+  stay as they are. Otherwise `Content-Length` is dropped, and an HTTP/1.1
+  body is sent chunked.
+- A response that cannot be masked gets a `502` from the proxy instead: an
+  unknown or stacked content-coding (`compress`, `gzip, br`), a
+  transfer-coding other than `chunked`, or a `206` partial response whose
+  ranges masking would shift.
+- Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
+  the proxy is the flow-control endpoint for a masked stream, and keeps every
+  other stream within the browser's windows. The request direction, and so
+  what the destination sees, is unchanged.
+- A response whose head arrives while its principal has nothing on record
+  is passed through unchanged (over HTTP/2 its header blocks are re-encoded
+  by the proxy).
+
+### What masking misses
+
+- Values the destination transforms: only the last four digits, other
+  groupings or separators, lower-case percent-encoding (the proxy matches
+  the upper-case form Go and browsers produce), base64, hashes, or a value
+  split by markup
+  (`4111<span>1111...`).
+- Values shorter than 8 bytes (a CVC, a PIN): masking them would corrupt
+  unrelated text.
+- Values the proxy has not looked up for this principal in the last 24
+  hours: a card the destination already had on file is masked only after
+  the principal sent its stand-in. Values looked up for another principal
+  are not masked on this one's connections.
+- WebSocket and other upgraded connections, and responses on hosts that are
+  not allowlisted (they are never decrypted).
+
+Allowlist only the endpoints that need the values, and check what they
+return.
 
 ## Limits and known gaps
 
@@ -267,7 +327,8 @@ what they return before relying on them.
 - When the destination sends GOAWAY, requests it will not process are refused
   with `REFUSED_STREAM`.
 - Server push is not supported.
-- Responses are not masked (see above).
+- Response masking has limits of its own: see
+  [What masking misses](#what-masking-misses).
 - The swaps file and the CA are read once at start. Restart the proxy to
   change them.
 

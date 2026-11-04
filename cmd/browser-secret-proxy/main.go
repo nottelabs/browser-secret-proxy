@@ -38,6 +38,7 @@ func run() error {
 	hosts := flag.String("hosts", "", "comma-separated hosts to intercept: exact names or a leading \"*.\" (required)")
 	swaps := flag.String("swaps", "", "JSON file mapping each stand-in to its real value (required)")
 	parent := flag.String("upstream-proxy", os.Getenv("SECRET_PROXY_UPSTREAM"), "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
+	maskResponses := flag.Bool("mask-responses", true, "replace real values with their stand-ins in responses from allowlisted hosts")
 	verbose := flag.Bool("v", false, "debug logging")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -92,6 +93,8 @@ func run() error {
 		Username:  os.Getenv("SECRET_PROXY_USERNAME"),
 		Password:  os.Getenv("SECRET_PROXY_PASSWORD"),
 		Logger:    logger,
+
+		MaskResponses: *maskResponses,
 	})
 	if err != nil {
 		return err
@@ -102,7 +105,7 @@ func run() error {
 	}
 	parentDescription := describeParent(parentURL)
 	logger.Info("listening", "address", ln.Addr().String(), "hosts", *hosts, "stand_ins", resolver.Count(), "upstream_proxy", parentDescription,
-		"proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "")
+		"proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "", "mask_responses", *maskResponses)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

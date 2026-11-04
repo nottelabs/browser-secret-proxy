@@ -26,3 +26,10 @@ First release, planned as 0.1.0.
   allows and before it expires, and only for the principal (proxy
   credential) it was looked up for. A request that breaks a scope, or whose
   lookup fails, is answered `502` and not sent.
+- Response masking, on by default (`-mask-responses`): real values looked up
+  for a principal are replaced by their stand-ins in response headers,
+  bodies and trailers on allowlisted hosts, over HTTP/1.1 and HTTP/2, in
+  their common encoded forms and card number groupings. Compressed bodies
+  (`gzip`, `deflate`, `br`, `zstd`) are decoded to be masked and sent
+  without a content-coding; a response that cannot be masked is answered
+  `502`.

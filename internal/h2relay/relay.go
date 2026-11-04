@@ -15,6 +15,10 @@
 // are assigned when a request is sent upstream, so a buffered request does
 // not block the ones after it.
 //
+// With masking on (see mask.go), responses are masked too: real values
+// resolved for the connection's principal are replaced by their stand-ins in
+// response headers, bodies and trailers.
+//
 // Memory is bounded per connection: header blocks (encoded and decoded),
 // each buffered body, all held request bytes together, and the number of open
 // streams. A stream over a limit is refused with REFUSED_STREAM, which tells
@@ -39,6 +43,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
@@ -63,7 +68,10 @@ type Options struct {
 	// PrefaceTimeout bounds the wait for the server's first SETTINGS frame
 	// (default 30 s); past it the client gets a connection error.
 	PrefaceTimeout time.Duration
-	Logger         *slog.Logger
+	// MaxDecoded caps the decoded size of one compressed response that is
+	// masked (default mask.DefaultMaxDecoded); past it the stream is reset.
+	MaxDecoded int64
+	Logger     *slog.Logger
 }
 
 // continueBlock is ":status: 100" as a literal without indexing on the static
@@ -153,12 +161,34 @@ type relay struct {
 	// afterOpen, when set (tests only), runs in finish after a buffered
 	// request's headers went upstream and before its body is queued.
 	afterOpen func(*stream)
+
+	// Response masking (mask.go), when masking is on.
+	masking bool
+	sdec    *hpack.Decoder // server header blocks; serverLoop only
+	// sdecAllowed is the table size sdec accepts (serverLoop only), and
+	// serverTableSize the largest the client allowed the server.
+	sdecAllowed     uint32
+	serverTableSize atomic.Uint32
+	cenc            *hpack.Encoder // client header blocks; guarded by clientMu
+	cencBuf         bytes.Buffer
+	// Guarded by mu: the client's connection window and initial stream
+	// window as the relay counts them for what it sends, the response side
+	// of each client stream, the streams with queued items, the bytes held
+	// for responses, and the connection credit owed to the server (negative)
+	// or to withhold from it (positive).
+	cliConn           int64
+	clientRespInitial int64
+	resp              map[uint32]*respState
+	respList          []*respState
+	respHeld          int64
+	debt              int64
 }
 
 type stream struct {
 	clientID, serverID uint32
 	swap               bool
 	authority          string
+	method             string
 	buffering          bool
 	headers            []hpack.HeaderField
 	priority           *Priority
@@ -214,6 +244,9 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	if opts.PrefaceTimeout <= 0 {
 		opts.PrefaceTimeout = 30 * time.Second
 	}
+	if opts.MaxDecoded <= 0 {
+		opts.MaxDecoded = mask.DefaultMaxDecoded
+	}
 	r := &relay{
 		opts: opts, client: client, server: server,
 		dec:      hpack.NewDecoder(decoderTableSize, nil),
@@ -228,6 +261,16 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
+	if opts.Session != nil && opts.Session.Masking() {
+		r.masking = true
+		r.sdecAllowed = 4096
+		r.serverTableSize.Store(4096)
+		r.sdec = hpack.NewDecoder(4096, nil)
+		r.sdec.SetMaxStringLength(opts.MaxHeaderBytes)
+		r.cenc = hpack.NewEncoder(&r.cencBuf)
+		r.cliConn, r.clientRespInitial = defaultWindow, defaultWindow
+		r.resp = map[uint32]*respState{}
+	}
 	return r
 }
 
@@ -249,11 +292,18 @@ func (r *relay) run() error {
 		}
 	})
 	defer timer.Stop()
+	pending := 3
+	if r.masking {
+		errs = make(chan error, 4)
+		pending = 4
+		go func() { errs <- r.serverLoopMasked() }()
+		go func() { errs <- r.clientSendLoop() }()
+	} else {
+		go func() { errs <- r.serverLoop() }()
+	}
 	go func() { errs <- r.clientLoop() }()
-	go func() { errs <- r.serverLoop() }()
 	go func() { errs <- r.sendLoop() }()
 	var first error
-	pending := 3
 	select {
 	case first = <-errs:
 		pending--
@@ -470,9 +520,12 @@ func (r *relay) clientLoop() error {
 		case FrameData:
 			err = r.onData(f)
 		case FrameWindowUpdate, FrameRSTStream:
-			if f.Stream == 0 {
+			switch {
+			case f.Stream == 0 && r.masking && f.Type == FrameWindowUpdate:
+				err = r.onClientConnWindow(f)
+			case f.Stream == 0:
 				err = r.writeServer(f)
-			} else {
+			default:
 				err = r.forStream(f)
 			}
 		case FramePriority:
@@ -486,6 +539,11 @@ func (r *relay) clientLoop() error {
 			// types go upstream exactly as the client sent them.
 			if f.Type == FrameSettings && f.Flags&FlagAck != 0 {
 				if err := r.applyClientAck(); err != nil {
+					return err
+				}
+			}
+			if f.Type == FrameSettings && f.Flags&FlagAck == 0 && r.masking {
+				if err := r.onClientSettings(f.Payload); err != nil {
 					return err
 				}
 			}
@@ -533,6 +591,12 @@ func (r *relay) decode(block []byte) ([]hpack.HeaderField, error) {
 // forStream forwards a WINDOW_UPDATE or RST_STREAM the client sent for a
 // request stream.
 func (r *relay) forStream(f Frame) error {
+	if r.masking {
+		keep, err := r.onClientStreamFrame(f)
+		if err != nil || keep {
+			return err
+		}
+	}
 	r.mu.Lock()
 	s := r.streams[f.Stream]
 	if s == nil {
@@ -593,6 +657,12 @@ func (r *relay) dropLocked(s *stream) {
 	}
 	r.dequeue(s)
 	delete(r.streams, s.clientID)
+	if r.masking && s.serverID == 0 {
+		// Never sent upstream: no response will come.
+		if rs := r.resp[s.clientID]; rs != nil {
+			r.endRespLocked(rs)
+		}
+	}
 }
 
 // forgetResetLocked drops the server mapping of a stream the client reset.
@@ -743,7 +813,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 				}
 			}
 		}
-		s = &stream{clientID: clientID, swap: r.opts.Hosts.Match(authority), authority: authority, clientEnded: endStream}
+		s = &stream{clientID: clientID, swap: r.opts.Hosts.Match(authority), authority: authority, method: method, clientEnded: endStream}
 		// A request with a body is swapped once the body is complete
 		// (finish), with a single lookup for its headers, body and trailers.
 		buffered := !endStream && s.swap && method != "CONNECT"
@@ -772,6 +842,9 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		r.mu.Lock()
 		s.recvWindow = r.clientInitial
 		r.streams[clientID] = s
+		if r.masking {
+			r.newRespLocked(clientID, method)
+		}
 		var topUp []Frame
 		if buffered {
 			topUp = r.topUpBufferingLocked()
@@ -964,6 +1037,9 @@ func (r *relay) openStream(s *stream, fields []hpack.HeaderField, priority *Prio
 	s.serverID = r.nextServerID
 	r.nextServerID += 2
 	r.byServer[s.serverID] = s
+	if rs := r.resp[s.clientID]; rs != nil {
+		rs.serverID = s.serverID
+	}
 	s.window = r.initialWindow
 	if endStream {
 		s.sentEnd = true
