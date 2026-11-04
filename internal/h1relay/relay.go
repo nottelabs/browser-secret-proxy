@@ -888,12 +888,18 @@ var errUnclearResponse = errors.New("unclear response head")
 // readResponseHead reads a status line and headers, returning their raw
 // bytes, the status code, the content length (-1 when absent) and whether
 // the body is chunked. It returns errUnclearResponse for a status line with
-// a bare CR or NUL, a header line that checkFieldLine refuses, or a
-// Content-Length that is not a decimal number: only SP and HTAB may surround
-// it, and the coding name chunked is matched in ASCII only, as a client
-// matches them.
+// a bare CR or NUL, a header line that checkFieldLine refuses, a
+// Content-Length that is not a decimal number, or a Transfer-Encoding on a
+// response that is not HTTP/1.1: only SP and HTAB may surround a
+// Content-Length, and the coding name chunked is matched in ASCII only, as a
+// client matches them. A client ignores Transfer-Encoding before HTTP/1.1
+// and reads such a body to the close, so the relay would find the next
+// response where the client sees body (RFC 9112 6.1: the framing is
+// faulty).
 func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, chunked bool, err error) {
 	length = -1
+	var version string
+	encoded := false
 	for {
 		line, err := readRawLine(br, maxHeadBytes-len(head))
 		if err != nil {
@@ -912,12 +918,16 @@ func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, 
 			if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") {
 				return nil, 0, 0, false, fmt.Errorf("malformed status line")
 			}
+			version = fields[0]
 			if status, err = strconv.Atoi(fields[1]); err != nil || status < 100 {
 				return nil, 0, 0, false, fmt.Errorf("malformed status line")
 			}
 			continue
 		}
 		if text == "" {
+			if encoded && version != "HTTP/1.1" {
+				return nil, 0, 0, false, fmt.Errorf("%w: Transfer-Encoding on a response that is not HTTP/1.1", errUnclearResponse)
+			}
 			return head, status, length, chunked, nil
 		}
 		if err := checkFieldLine(text); err != nil {
@@ -934,6 +944,7 @@ func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, 
 				return nil, 0, 0, false, fmt.Errorf("%w: an invalid Content-Length", errUnclearResponse)
 			}
 		case "transfer-encoding":
+			encoded = true
 			codings := strings.Split(value, ",")
 			chunked = isChunked(trimOWS(codings[len(codings)-1]))
 		}
