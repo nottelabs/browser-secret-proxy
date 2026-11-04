@@ -1,0 +1,45 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck and unused, plus:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - nilerr
+    - unconvert
+  settings:
+    gosec:
+      excludes:
+        # Files are read from paths the operator passes on the command line.
+        - G304
+        # Integer conversions write fixed-width protocol fields (frame
+        # lengths, window increments, record versions) from values already
+        # bounded by protocol limits.
+        - G115
+    misspell:
+      locale: US
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      # Tests build throwaway TLS configs and servers on purpose.
+      - path: _test\.go
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/nottelabs/secret-proxy

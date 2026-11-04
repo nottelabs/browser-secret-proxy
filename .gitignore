@@ -1,0 +1,19 @@
+# Build output
+/bin/
+/dist/
+
+# Test and coverage output
+*.test
+*.out
+coverage.*
+
+# Local secrets and CAs: never commit them
+*.key
+*.pem
+swaps*.json
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

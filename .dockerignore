@@ -1,0 +1,7 @@
+bin/
+dist/
+.git/
+.github/
+*.key
+*.pem
+swaps*.json

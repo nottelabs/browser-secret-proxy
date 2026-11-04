@@ -1,0 +1,66 @@
+name: CodeQL
+
+# Code scanning is free on public repositories and needs GitHub Advanced
+# Security on private ones. While the repository is private, the analysis is
+# skipped, not failed; it starts on its own once the repository is public.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  visibility:
+    runs-on: ubuntu-24.04
+    outputs:
+      public: ${{ steps.check.outputs.public }}
+    steps:
+      # Read from the API: scheduled runs carry no repository in their event.
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          visibility="$(gh api "repos/$REPOSITORY" --jq .visibility)"
+          echo "Repository visibility: $visibility"
+          if [ "$visibility" = public ]; then
+            echo "public=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "public=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CodeQL skipped: code scanning on a $visibility repository needs GitHub Advanced Security."
+          fi
+
+  analyze:
+    needs: visibility
+    if: needs.visibility.outputs.public == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write # upload results to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.x
+          check-latest: true
+          cache-dependency-path: go.sum
+      - uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          languages: go
+          build-mode: manual
+          queries: security-extended
+      - run: make build
+      - uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          category: /language:go
