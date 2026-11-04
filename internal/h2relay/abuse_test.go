@@ -1,7 +1,9 @@
 package h2relay
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -325,13 +327,67 @@ func TestWindowOverflowDropsCountAsResets(t *testing.T) {
 	}
 }
 
-// fieldsBytes is a header list's size as RFC 9113 counts it.
-func fieldsBytes(fields []hpack.HeaderField) int64 {
-	n := int64(0)
-	for _, f := range fields {
-		n += int64(len(f.Name) + len(f.Value) + 32)
+// A stream the relay drops for the client's own frames cancels its lookup
+// as a reset does, so it counts as one: trailers or streamed data past the
+// buffer budget, or a frame after the client ended the stream. Before, a
+// client that kept the budget nearly full could open an extended CONNECT
+// with a stand-in, then send trailers past what was left, and start a
+// lookup per stream at its frame rate.
+func TestRelayDropsCountAsResets(t *testing.T) {
+	fill := bigHeaders(100 << 10)
+	connect := otherRequest("")
+	connect[3].Value = "/?k=tok_a"
+	for name, after := range map[string]func(h *harness, id uint32) []Frame{
+		"trailers": func(h *harness, id uint32) []Frame {
+			trailers := []hpack.HeaderField{{Name: "x-t", Value: strings.Repeat("b", 2000)}}
+			return []Frame{{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: id, Payload: h.clientBlock(trailers...)}}
+		},
+		"data": func(_ *harness, id uint32) []Frame {
+			return []Frame{{Type: FrameData, Stream: id, Payload: bytes.Repeat([]byte("b"), 2000)}}
+		},
+		"frame after the end": func(_ *harness, id uint32) []Frame {
+			return []Frame{{Type: FrameData, Flags: FlagEndStream, Stream: id}, {Type: FrameData, Stream: id}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &countingResolver{}
+			h := newHarness(t, func(o *Options) {
+				o.MaxStreams = 4
+				o.MaxBuffered = int(fieldsSize(fill)+fieldsSize(connect)) + 1000
+				o.Session = scopetest.Session(t, o.Hosts, c, resolve.Principal{ID: "alice"})
+			})
+			limit := 2 * h.r.opts.MaxStreams
+			h.write(h.client, encodeFrames(splitBlock(1, h.clientBlock(fill...), 0)))
+			go func() {
+				for range h.toServer {
+				}
+			}()
+			goaway := make(chan struct{})
+			go func() {
+				for f := range h.toClient {
+					if isGoAway(errCodeCalm)(f) {
+						close(goaway)
+						return
+					}
+				}
+			}()
+			_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
+			for i := range 4 * limit {
+				id := uint32(3 + 2*i)
+				frames := append([]Frame{{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: id, Payload: h.clientBlock(connect...)}}, after(h, id)...)
+				if _, err := h.client.Write(encodeFrames(frames)); err != nil {
+					break
+				}
+			}
+			if err := h.result(); !errors.Is(err, errTooManyResets) {
+				t.Fatalf("relay error %v, want %v", err, errTooManyResets)
+			}
+			<-goaway
+			if n := c.calls.Load(); n > int64(limit)+1 {
+				t.Fatalf("resolver got %d lookups, want at most %d", n, limit+1)
+			}
+		})
 	}
-	return n
 }
 
 // bigHeaders is a POST with about size bytes of headers, sent as literals
@@ -352,7 +408,7 @@ func bigHeaders(size int) []hpack.HeaderField {
 func TestHeldHeaderListsShareTheBudget(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.MaxBuffered = 1 << 20 })
 	fields := bigHeaders(300 << 10)
-	size := fieldsBytes(fields)
+	size := fieldsSize(fields)
 	fit := (1 << 20) / size
 	for i := range fit + 3 {
 		id := uint32(1 + 2*i)
@@ -396,7 +452,7 @@ func TestQueuedRequestsShareTheBudget(t *testing.T) {
 	h.expect(h.toClient, "client", isType(FrameSettings))
 	fields := bigHeaders(300 << 10)
 	fields[0].Value = "GET"
-	size := fieldsBytes(fields)
+	size := fieldsSize(fields)
 	fit := (1 << 20) / size
 	for i := range fit + 1 {
 		id := uint32(1 + 2*i)
@@ -437,4 +493,62 @@ func TestHeldTrailersShareTheBudget(t *testing.T) {
 		t.Fatalf("trailers without END_STREAM")
 	}
 	h.released("sending the trailers")
+}
+
+// A swap grows a held header list in place, by as much as the real values
+// are longer than their stand-ins: the swapped list counts toward
+// MaxBuffered instead. Before, queued requests whose swapped headers were
+// 100 times longer than what the client sent were still counted at the
+// size it sent.
+func TestSwappedHeaderListsShareTheBudget(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.MaxBuffered = 100 << 10; expandingSession(t, o) })
+	h.serverSend(settingsFrame(Setting{ID: SettingMaxConcurrentStreams, Value: 0}))
+	h.expect(h.toClient, "client", isType(FrameSettings))
+	get := request("GET", hpack.HeaderField{Name: "x-t", Value: strings.Repeat("t1", 100)})
+	swapped := request("GET", hpack.HeaderField{Name: "x-t", Value: strings.Repeat(strings.Repeat("R", 200), 100)})
+	size := fieldsSize(swapped)
+	fit := (100 << 10) / size
+	for i := range fit + 1 {
+		id := uint32(1 + 2*i)
+		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: id, Payload: h.clientBlock(get...)})
+	}
+	h.expect(h.toClient, "client", isRefusal(uint32(1+2*fit)))
+	if _, _, held := h.state(); held != fit*size {
+		t.Fatalf("relay holds %d bytes, want the %d of %d swapped lists", held, fit*size, fit)
+	}
+	h.serverSend(settingsFrame(Setting{ID: SettingMaxConcurrentStreams, Value: 100}))
+	for range fit {
+		h.expect(h.toServer, "server", isType(FrameHeaders))
+	}
+	h.released("sending the requests")
+}
+
+// The same for the headers and trailers of a buffered request, swapped
+// with its body, and for an extended CONNECT's trailers, swapped on their
+// own: a swap that passes the budget ends the request, and nothing of it
+// stays held.
+func TestSwapsPastTheBudgetEndTheRequest(t *testing.T) {
+	standIns := hpack.HeaderField{Name: "x-t", Value: strings.Repeat("t1", 100)}
+	t.Run("buffered", func(t *testing.T) {
+		h := newHarness(t, func(o *Options) { o.MaxBuffered = 10000; expandingSession(t, o) })
+		h.clientSend(
+			Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST", standIns)...)},
+			Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte("body")},
+		)
+		h.expect(h.toClient, "client", isRefusal(1))
+		h.settle("refusing the request")
+		h.quiet(h.toServer, 50*time.Millisecond, isType(FrameHeaders))
+	})
+	t.Run("connect trailers", func(t *testing.T) {
+		h := newHarness(t, func(o *Options) { o.MaxBuffered = 10000; expandingSession(t, o) })
+		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("")...)})
+		h.expect(h.toServer, "server", isType(FrameHeaders))
+		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(standIns)})
+		h.expect(h.toClient, "client", func(f Frame) bool {
+			return f.Type == FrameRSTStream && f.Stream == 1 && binary.BigEndian.Uint32(f.Payload) == errCodeCalm
+		})
+		h.expect(h.toServer, "server", isType(FrameRSTStream))
+		h.quiet(h.toServer, 50*time.Millisecond, isType(FrameHeaders))
+		h.released("resetting the request")
+	})
 }

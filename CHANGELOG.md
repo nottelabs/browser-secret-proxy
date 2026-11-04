@@ -85,13 +85,15 @@ First release, planned as 0.1.0.
   is the principal: the username names it in logs but no longer splits its
   values for masking. Decrypted tokens leave memory at their time even when
   no request comes.
-- Over HTTP/2, a client can no longer make the relay send the destination
-  much more than it sent: its HPACK table is capped at the 4 KiB of the
-  relay's own (it was 64 KiB), and more than 512 stream resets in 10 seconds
-  end the connection with `ENHANCE_YOUR_CALM` (rapid reset,
-  CVE-2023-44487), which also bounds how fast resets can start resolver
-  lookups. Decoded headers and trailers of requests not yet sent upstream
-  count toward the 64 MiB connection budget.
+- Over HTTP/2, a client's HPACK table is capped at the 4 KiB of the relay's
+  own (it was 64 KiB). This cuts, but does not bound, how much more the
+  destination receives than the client sent: several hundred times remain
+  possible. More than 512 streams reset in 10 seconds, by the client or by
+  the relay for the client's frames, end the connection with
+  `ENHANCE_YOUR_CALM` (rapid reset, CVE-2023-44487), which also bounds how
+  fast resets can start resolver lookups. Decoded headers and trailers of
+  requests not yet sent upstream count toward the 64 MiB connection budget,
+  as swapped.
 - Over HTTP/2, a frame longer than the max frame size its sender was told
   ends the connection with `FRAME_SIZE_ERROR`, and a frame's payload takes
   memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value

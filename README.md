@@ -720,12 +720,12 @@ return.
 - Request bodies on allowlisted hosts are buffered: 32 MiB per body and 64 MiB
   per HTTP/2 connection, with at most 256 open streams. The 64 MiB budget also
   counts the decoded headers and trailers of requests that have not gone
-  upstream yet. An HTTP/2 stream over one of these limits is refused with
-  `REFUSED_STREAM`, so the browser can retry it. An HTTP/2 header block over
-  1 MiB, encoded or decoded, ends the whole connection. HTTP/1.1 heads are
-  capped at 1 MiB and chunked trailers at 16 KiB. A swap cannot grow a
-  request past these limits: such a request is refused (HTTP/2) or its
-  connection closed (HTTP/1.1) before anything is sent.
+  upstream yet, as swapped. An HTTP/2 stream over one of these limits is
+  refused with `REFUSED_STREAM`, so the browser can retry it. An HTTP/2
+  header block over 1 MiB, encoded or decoded, ends the whole connection.
+  HTTP/1.1 heads are capped at 1 MiB and chunked trailers at 16 KiB. A swap
+  cannot grow a request past these limits: such a request is refused
+  (HTTP/2) or its connection closed (HTTP/1.1) before anything is sent.
 - `Expect: 100-continue` is answered by the proxy, which needs the whole body
   before forwarding the request.
 - WebSockets (extended CONNECT over HTTP/2, HTTP/1.1 upgrades) are streamed
@@ -737,10 +737,17 @@ return.
 - An HTTP/2 client may use an HPACK table of at most 4 KiB, and no more than
   the destination allows. The proxy lowers a larger
   `SETTINGS_HEADER_TABLE_SIZE` to 4 KiB before the browser sees it. A client
-  that uses a larger table ends the connection.
+  that uses a larger table ends the connection. This does not bound how much
+  more the destination receives than the browser sent. A client can still
+  have the proxy's encoder drop an entry that its own table keeps, by
+  sending a literal it does not index. Each 1-byte reference to a 4 KiB
+  entry then goes upstream as a 4 KiB literal: several hundred times what
+  the client sent.
 - An HTTP/2 client that resets more than 512 streams (twice the open-stream
   limit) in 10 seconds gets `GOAWAY` with `ENHANCE_YOUR_CALM`, which ends the
-  connection.
+  connection. Streams the proxy resets or refuses because of the client's
+  own frames count too: a window over 2^31-1, trailers or data past the
+  buffer budget, a frame after the client ended the stream.
 - An HTTP/2 frame longer than the `SETTINGS_MAX_FRAME_SIZE` its sender was
   told ends the connection with `FRAME_SIZE_ERROR`, from the client or the
   destination. A `PRIORITY_UPDATE` value over 1 KiB ends it with
@@ -760,11 +767,12 @@ return.
   that need no lookup keep the browser's order, and the `file` and `sealed`
   modes, which answer from memory, keep it for every request. At most 16
   lookups run at once per HTTP/2 connection; more wait for one to end. A
-  request reset by the browser, or refused by the destination's `GOAWAY`,
-  while its lookup runs cancels the lookup. Such resets count toward the
-  reset limit above, so they cannot make lookups start much faster than
-  they end. An HTTP/1.1 connection carries one request at a time, so its
-  lookup holds back only that connection.
+  request reset by the browser, reset by the proxy for the browser's frames,
+  or refused by the destination's `GOAWAY`, while its lookup runs cancels
+  the lookup. The first two count toward the reset limit above, so they
+  cannot make lookups start much faster than they end. An HTTP/1.1
+  connection carries one request at a time, so its lookup holds back only
+  that connection.
 
 ## Verifying a release
 
