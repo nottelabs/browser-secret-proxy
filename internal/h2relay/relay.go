@@ -687,8 +687,11 @@ func (r *relay) openStreamsLocked() int {
 }
 
 // dropLocked forgets the request side of a stream and releases what it held.
-// The server mapping stays until the server ends the stream, so its
-// remaining frames still reach the client.
+// Every caller ends the stream toward the client (a refusal or a reset). The
+// server mapping stays until the server ends the stream: without masking,
+// its remaining frames still go to the client, which ignores them after
+// decoding any header block; with masking, the response side ends here
+// (endRespLocked) and the server's remaining frames are absorbed.
 func (r *relay) dropLocked(s *stream) {
 	r.held -= int64(s.body.Len() + len(s.out))
 	if s.streaming && len(s.out) > 0 {
@@ -716,8 +719,11 @@ func (r *relay) dropLocked(s *stream) {
 		s.lookupCancel() // a lookup still in flight is no longer wanted
 		r.dropLookupsLocked(s)
 	}
-	if r.masking && s.serverID == 0 {
-		// Never sent upstream: no response will come.
+	if r.masking {
+		// The stream ends toward the client too (it was refused or reset):
+		// its response, queued or still to come, is released with its
+		// queued bytes and masking worker, and nothing more of it reaches
+		// the client.
 		if rs := r.resp[s.clientID]; rs != nil {
 			r.endRespLocked(rs)
 		}

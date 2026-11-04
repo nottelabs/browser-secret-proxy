@@ -223,3 +223,99 @@ func TestTransferEncodingFieldIsRefused(t *testing.T) {
 	h.serverSend(status(h, id, false, field(":status", "200"), field("transfer-encoding", "gzip")))
 	h.expect(h.toClient, "client", isBadGateway(1))
 }
+
+// respReleased waits until the relay keeps no response state for stream and
+// holds no response bytes.
+func (h *harness) respReleased(stream uint32) {
+	h.t.Helper()
+	deadline := time.Now().Add(waitFor)
+	for {
+		h.r.mu.Lock()
+		_, kept := h.r.resp[stream]
+		held := h.r.respHeld
+		h.r.mu.Unlock()
+		if !kept && held == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("stream %d: response state kept %v, %d response bytes held", stream, kept, held)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// openMaskedResponse opens a masked response on stream 1 whose output waits
+// for a client that granted no window, and returns its server stream ID.
+func openMaskedResponse(t *testing.T, h *harness, method string, extra ...hpack.HeaderField) uint32 {
+	t.Helper()
+	h.clientSend(settingsFrame(Setting{ID: SettingInitialWindowSize, Value: 0}))
+	h.expect(h.toServer, "server", isType(FrameSettings))
+	flags := FlagEndHeaders | FlagEndStream
+	if method == "CONNECT" {
+		flags = FlagEndHeaders
+	}
+	h.clientSend(Frame{Type: FrameHeaders, Flags: flags, Stream: 1, Payload: h.clientBlock(request(method, extra...)...)})
+	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
+	h.serverSend(status(h, id, false, field(":status", "200")), data(id, "t="+realToken, false))
+	c := newClientView(h)
+	c.readHead(1)
+	deadline := time.Now().Add(waitFor)
+	for {
+		h.r.mu.Lock()
+		held := h.r.respHeld
+		h.r.mu.Unlock()
+		if held > 0 {
+			return id
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no response output waits for the client")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// noMoreData grants the client window and checks no response DATA for
+// stream reaches the client, even with more from the server.
+func noMoreData(h *harness, stream, serverID uint32) {
+	h.t.Helper()
+	h.clientSend(windowUpdate(stream, 1<<16), windowUpdate(0, 1<<16))
+	h.serverSend(data(serverID, "more "+realToken, true))
+	h.quiet(h.toClient, 100*time.Millisecond, func(f Frame) bool { return f.Type == FrameData && f.Stream == stream })
+}
+
+// A stream the client resets by sending on it after its END_STREAM, while
+// its masked response waits, releases that response: no more of it reaches
+// the client, and its queued bytes and masking worker are released.
+func TestEndedStreamReleasesItsResponse(t *testing.T) {
+	h := newHarness(t, masking(t, false))
+	id := openMaskedResponse(t, h, "GET")
+	h.clientSend(Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1})
+	h.expect(h.toClient, "client", func(f Frame) bool {
+		return f.Type == FrameRSTStream && f.Stream == 1 && binary.BigEndian.Uint32(f.Payload) == errCodeStreamClosed
+	})
+	h.expect(h.toServer, "server", func(f Frame) bool { return f.Type == FrameRSTStream && f.Stream == id })
+	h.respReleased(1)
+	noMoreData(h, 1, id)
+}
+
+// The server's GOAWAY refusing a stream it was sent releases that stream's
+// waiting response too.
+func TestGoAwayReleasesARefusedStreamsResponse(t *testing.T) {
+	h := newHarness(t, masking(t, false))
+	id := openMaskedResponse(t, h, "GET")
+	h.serverSend(Frame{Type: FrameGoAway, Payload: make([]byte, 8)}) // last stream 0
+	h.expect(h.toClient, "client", isRefusal(1))
+	h.respReleased(1)
+	noMoreData(h, 1, id)
+}
+
+// A stream reset by the relay (abort: a streamed upload over the buffer
+// limit) releases its waiting response.
+func TestAbortReleasesItsResponse(t *testing.T) {
+	h := newHarness(t, func(o *Options) { masking(t, false)(o); o.MaxBuffered = 1000 })
+	id := openMaskedResponse(t, h, "CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})
+	h.clientSend(Frame{Type: FrameData, Stream: 1, Payload: bytes.Repeat([]byte("u"), 2000)})
+	h.expect(h.toClient, "client", func(f Frame) bool { return f.Type == FrameRSTStream && f.Stream == 1 })
+	h.respReleased(1)
+	noMoreData(h, 1, id)
+}
