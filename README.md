@@ -10,7 +10,9 @@ sessions: you run it on infrastructure you control and keep the real values
 (card numbers, API tokens, passwords) there. Notte routes only the allowlisted
 hosts of a session through it, so the real values never reach Notte, the
 browser or the agent. It works with any client that supports HTTP CONNECT
-proxies, Notte or not.
+proxies, Notte or not, as long as the proxy can copy the client's TLS
+handshake: Chromium, Chrome and Go programs, but not curl or other OpenSSL
+clients (see [Limits and known gaps](#limits-and-known-gaps)).
 
 When it connects to an allowlisted destination, the proxy keeps the TLS and
 HTTP/2 parameters the client offered, and it refuses a connection it cannot
@@ -19,24 +21,44 @@ reproduce instead of substituting its own.
 ## How it works
 
 1. The client sends `CONNECT host:443`. If `host` is not on the allowlist, the
-   proxy opens a plain tunnel and copies bytes both ways.
+   proxy opens a plain tunnel and copies bytes both ways. The allowlist names
+   hosts, not ports: a `CONNECT` to any port of an allowlisted host is
+   decrypted.
 2. For an allowlisted host, the proxy opens a TLS connection to the
    destination, then completes the client's TLS handshake with a certificate
    for `host` issued on the fly by your CA. The client must trust that CA.
 3. Each request is relayed (HTTP/2 or HTTP/1.1, whichever the destination
    chose). The proxy finds the stand-ins in header values, the query string
    and the request body, looks up their real values once for that request,
-   and replaces them. A request whose values cannot all be used is answered
-   `502` and not sent (see [Security model](#security-model)). In responses,
-   real values are replaced by their stand-ins before they reach the client
-   (see [Response masking](#response-masking)).
+   and replaces them. A request whose values cannot all be used is not sent:
+   it is answered `502`, or refused in the ways listed under
+   [Security model](#security-model). In responses, real values are replaced
+   by their stand-ins before they reach the client (see
+   [Response masking](#response-masking)).
+
+Terms used below:
+
+- A **stand-in** is the placeholder the client sends where a real value
+  goes, such as `tok_standin_123`.
+- The **principal** is whom a connection's values are looked up for: its
+  proxy username, or in `sealed` mode its token. Outside `sealed` mode the
+  proxy has one username, so all of its clients are one principal.
+- A **detokenize service** is a service of yours that answers with the real
+  value of a stand-in. The `http` mode asks one.
 
 Real values are never logged. Log lines name the host and how many fields
 were swapped.
 
 ## Quick start
 
-You need Go 1.26 or later to build from source, or Docker.
+You need Go 1.26 or later to build from source, or Docker. The commands run
+in a clone of this repository, whose `.gitignore` keeps the keys and value
+files they create out of Git:
+
+```sh
+git clone https://github.com/nottelabs/browser-secret-proxy
+cd browser-secret-proxy
+```
 
 ### 1. Create a CA
 
@@ -87,23 +109,32 @@ when it changes. It holds your real secrets: restrict its permissions
 
 **http.** [`examples/http-resolver`](examples/http-resolver) is a reference
 detokenize service. Create a CA that issues its server certificate and the
-proxy's client certificate (OpenSSL 3):
+proxy's client certificate (OpenSSL 3). Each certificate is limited to its
+role (`serverAuth` or `clientAuth`) and cannot issue others, so neither key
+can pass for the other side:
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
-  -subj "/CN=detokenize CA" -keyout resolver-ca.key -out resolver-ca.pem
+  -subj "/CN=detokenize CA" -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign" -keyout resolver-ca.key -out resolver-ca.pem
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,DNS:host.docker.internal" \
-  -CA resolver-ca.pem -CAkey resolver-ca.key \
+  -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=serverAuth" -CA resolver-ca.pem -CAkey resolver-ca.key \
   -keyout service.key -out service.pem
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
   -subj "/CN=browser-secret-proxy" \
-  -CA resolver-ca.pem -CAkey resolver-ca.key \
+  -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=clientAuth" -CA resolver-ca.pem -CAkey resolver-ca.key \
   -keyout proxy-client.key -out proxy-client.pem
 ```
 
+In production, issue both certificates from your own PKI, and keep the CA
+key away from the proxy and the service.
+
 Give the service its values in `values.json`, as a plain string or with the
-hosts a value may go to:
+hosts a value may go to, and restrict it like the swaps file
+(`chmod 600 values.json`):
 
 ```json
 {
@@ -111,6 +142,8 @@ hosts a value may go to:
   "tok_card_1": {"real": "<real card number>", "hosts": ["api.payments.example"]}
 }
 ```
+
+Start the service in a terminal of its own:
 
 ```sh
 go run ./examples/http-resolver -cert service.pem -key service.key \
@@ -131,17 +164,18 @@ The proxy does not know this mode's stand-ins in advance, so
 
 **sealed.** Create the proxy's key pair and an issuer key pair with the
 `openssl` commands under [sealed](#sealed). Put the values in
-`payload.json`:
+`payload.json` (`chmod 600 payload.json`):
 
 ```json
 {"values": {"tok_standin_123": "<real API token>"}, "hosts": ["api.example.com"], "sub": "session-42"}
 ```
 
-Then sign and seal it into a token that expires in one hour:
+Then sign and seal it into a token that expires in one hour. The token
+carries the real values, so only you may read `token.txt`:
 
 ```sh
-go run ./examples/seal -public-key sealed-public.pem -issuer-key issuer.key \
-  -audience proxy-eu-1 -ttl 1h payload.json > token.txt
+(umask 077 && go run ./examples/seal -public-key sealed-public.pem \
+  -issuer-key issuer.key -audience proxy-eu-1 -ttl 1h payload.json > token.txt)
 ```
 
 In step 3, replace `-swaps swaps.json` with:
@@ -176,7 +210,7 @@ With Docker (the image listens on `:8080` and runs as a non-root user):
 
 ```sh
 make docker
-docker run --rm -p 8080:8080 \
+docker run --rm -p 8080:8080 --user "$(id -u):$(id -g)" \
   -v "$PWD/ca.pem:/etc/browser-secret-proxy/ca.pem:ro" \
   -v "$PWD/ca.key:/etc/browser-secret-proxy/ca.key:ro" \
   -v "$PWD/swaps.json:/etc/browser-secret-proxy/swaps.json:ro" \
@@ -187,7 +221,12 @@ docker run --rm -p 8080:8080 \
   -swaps /etc/browser-secret-proxy/swaps.json -hosts 'api.example.com'
 ```
 
-The image runs as UID 65532, so mounted files must be readable by that user.
+The image runs as UID 65532, and on Linux that user cannot read the files
+you restricted to yourself with `chmod 600`. `--user "$(id -u):$(id -g)"`
+runs the container as you instead, so it reads every key and value file of
+the three modes as they are. Never make the CA key readable by everyone to
+get around this. To keep the image's user, give it the files instead:
+`sudo chown 65532:65532 ca.key swaps.json` (they stay `600`).
 
 In `http` mode, `localhost` inside the container is the container itself,
 so the proxy cannot reach a resolver running on your machine at
@@ -202,29 +241,71 @@ so the proxy cannot reach a resolver running on your machine at
 
 ### 4. Try it locally
 
-Point a Chromium-based browser at the proxy, for example
-`chromium --proxy-server=http://127.0.0.1:8080`, and make it trust `ca.pem`.
-On Linux, add it to the NSS database:
+This check needs no external host: the destination is a test server on
+`localhost`, and the client is Chromium. curl cannot be the client: the
+proxy refuses OpenSSL clients on allowlisted hosts (see
+[Limits and known gaps](#limits-and-known-gaps)).
+
+Make Chromium trust `ca.pem`. On Linux, add it to your NSS database:
 
 ```sh
 certutil -d sql:$HOME/.pki/nssdb -A -t C,, -n browser-secret-proxy -i ca.pem
 ```
 
-Or check a single request with curl:
+If `certutil` reports `SEC_ERROR_BAD_DATABASE`, create the database first:
+`mkdir -p $HOME/.pki/nssdb && certutil -d sql:$HOME/.pki/nssdb -N --empty-password`.
+Remove the CA when you are done
+(`certutil -d sql:$HOME/.pki/nssdb -D -n browser-secret-proxy`): until then,
+whoever holds `ca.key` can impersonate any site to your browser.
+
+In a terminal of its own, start a test destination: `openssl s_server` with
+a throwaway certificate for `localhost`. It prints each request it receives.
 
 ```sh
-curl --proxy http://127.0.0.1:8080 --cacert ca.pem \
-  "https://api.example.com/echo?token=tok_standin_123"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+  -keyout destination.key -out destination.pem
+openssl s_server -accept 127.0.0.1:9443 -cert destination.pem \
+  -key destination.key -quiet
 ```
 
-With proxy authentication on, add `--proxy-user proxy-user:change-me`. In
-`sealed` mode, send the token as the password:
-`--proxy-user "session:$(cat token.txt)"`.
+In another terminal, stop the proxy from step 3 and run one for `localhost`.
+The proxy verifies destinations against the system's roots:
+`SSL_CERT_FILE` makes it trust the test certificate instead (on Linux; Go
+ignores it on macOS). `-allow-private-destinations` lets it connect to a
+loopback address, which it refuses by default.
 
-An echo endpoint shows the stand-in, not the real value: response masking
-(on by default) replaces the value on the way back. The proxy's log line
-`swapped stand-ins` confirms the swap, and `-mask-responses=false` shows the
-real value in the echo.
+```sh
+SSL_CERT_FILE=destination.pem ./bin/browser-secret-proxy -listen 127.0.0.1:8080 \
+  -ca-cert ca.pem -ca-key ca.key -hosts localhost -swaps swaps.json \
+  -allow-private-destinations
+```
+
+Then open a stand-in URL in a new Chromium profile that uses the proxy:
+
+```sh
+chromium --user-data-dir="$(mktemp -d)" --proxy-server=http://127.0.0.1:8080 \
+  --proxy-bypass-list='<-loopback>' "https://localhost:9443/echo?token=tok_standin_123"
+```
+
+`--proxy-bypass-list='<-loopback>'` sends `localhost` through the proxy;
+without it, Chromium connects to `localhost` directly. The new profile keeps
+a Chromium that is already open from taking the URL without the proxy.
+
+The destination's terminal shows `GET /echo?token=<real API token>`: the
+browser only had the stand-in, and the destination got the real value. The
+page stays blank, because `s_server` does not answer. The proxy logs a
+`swapped stand-ins` line.
+
+For the `http` mode, replace `-swaps swaps.json` with that mode's flags from
+step 2. With authentication on, Chromium asks for the proxy credentials. In
+`sealed` mode, give a token as the password, sealed with `localhost` in its
+`hosts`.
+
+On a real allowlisted host, an endpoint that echoes the request shows the
+stand-in, not the real value: response masking (on by default) replaces the
+value on the way back. `-mask-responses=false` shows the real value in the
+echo.
 
 ## Configuration
 
@@ -232,7 +313,7 @@ real value in the echo.
 | --- | --- |
 | `-listen` | Address to listen on (default `127.0.0.1:8080`). The proxy serves plain HTTP; see [Exposing the proxy](#exposing-the-proxy). |
 | `-ca-cert`, `-ca-key` | PEM CA certificate and key (PKCS #8, PKCS #1 or SEC 1). Required. |
-| `-hosts` | Comma-separated hosts to decrypt: exact names, or `*.domain` for every name below `domain` (not `domain` itself). Required. |
+| `-hosts` | Comma-separated hosts to decrypt: exact names, or `*.domain` for every name below `domain` (not `domain` itself). Every port of a listed host is decrypted: entries cannot name a port. Required. |
 | `-resolver` | Where real values come from: `file` (default), `http` or `sealed`. See [Production setup](#production-setup-where-real-values-come-from). |
 | `-swaps` | `file` mode: JSON file of stand-in to real value. Given alone, it selects the `file` mode. |
 | `-swaps-reload` | `file` mode: how often the file is checked for changes (default `2s`, `0` never). |
@@ -266,7 +347,8 @@ value is inserted in the form its place needs:
 
 - query strings and form bodies: query-escaped, whether the stand-in was raw
   or percent-encoded;
-- JSON bodies (`application/json`, `text/json` and `+json` types):
+- JSON bodies (`application/json`, `text/json`, `application/x-ndjson` and
+  `+json` types):
   JSON-escaped inside strings. A stand-in is found there however the client
   escaped it (`a\u0026b` for `a&b`, as Go's `encoding/json` writes it, or
   any character as `\uXXXX`); a string that held one is then written again
@@ -286,7 +368,7 @@ or has expired, the request is answered `502` and nothing of it is sent.
 | Mode | Values live in | Use it when |
 | --- | --- | --- |
 | `file` | A JSON file on the proxy's host, reloaded when it changes. | A secret manager can write a file next to the proxy: Vault Agent templates, the Kubernetes Secrets Store CSI driver, a Kubernetes Secret volume. The simplest setup, with no extra service. |
-| `http` | Your own detokenize service, asked over mutual TLS. | Values are issued per user or per session, change often, or must be checked and audited by a service you already run. |
+| `http` | Your own detokenize service, asked over mutual TLS. | Values change often, or must be checked and audited by a service you already run. The service sees one principal per proxy (its username): for values per user or per session, run one proxy per user or session, or use `sealed`. |
 | `sealed` | The proxy password itself: signed by your issuer, encrypted to the proxy's key. | You want no lookup service and no storage to provision: whoever starts the session seals the values it needs and hands the token over as the proxy password. |
 
 ### file
@@ -305,6 +387,10 @@ Secret volumes and the CSI driver publish a new version) are picked up. If
 the new content does not load (invalid JSON, an empty map), the proxy keeps
 the previous map and logs the error once, without the file's content.
 
+So writing `{}` or deleting the file revokes nothing: the last map that
+loaded stays in use until the proxy restarts. To revoke some values, remove
+their keys and keep at least one other; to revoke them all, stop the proxy.
+
 Point the secret manager at a tmpfs (an `emptyDir` with `medium: Memory`, or
 the CSI driver's own mount) so the values never touch a disk.
 
@@ -313,7 +399,7 @@ the CSI driver's own mount) so the values never touch a disk.
 ```sh
 browser-secret-proxy -ca-cert ca.pem -ca-key ca.key -hosts api.example.com \
   -resolver http -resolver-url https://detokenize.internal:8443/v1/detokenize \
-  -resolver-cert proxy-client.pem -resolver-key proxy-client.key -resolver-ca detokenize-ca.pem \
+  -resolver-cert proxy-client.pem -resolver-key proxy-client.key -resolver-ca resolver-ca.pem \
   -standin-prefixes tok_
 ```
 
@@ -335,9 +421,10 @@ Your service answers `200` with the values it releases:
 
 - `principal_id` is the proxy username of the connection
   (`SECRET_PROXY_USERNAME`), empty when authentication is off. The proxy
-  password is never sent.
+  has one username, so every request of one proxy carries the same
+  `principal_id`. The proxy password is never sent.
 - `hosts` (optional) restricts the value to those hosts, in the `-hosts`
-  syntax. Without it the value may go to any host in `-hosts`.
+  syntax, on any port. Without it the value may go to any host in `-hosts`.
 - `expires_at` (optional) is when the value stops being used.
 - Leave out any stand-in you do not release for this host or principal. The
   request is then refused, as it is for any other status, a malformed answer,
@@ -353,8 +440,8 @@ Your service answers `200` with the values it releases:
 service that answers from a JSON file and requires a client certificate:
 
 ```sh
-go run ./examples/http-resolver -cert server.pem -key server.key \
-  -client-ca proxy-client-ca.pem -values values.json
+go run ./examples/http-resolver -cert service.pem -key service.key \
+  -client-ca resolver-ca.pem -values values.json
 ```
 
 ### sealed
@@ -367,12 +454,25 @@ next to where the real values live; only its public key goes to the proxy.
 # Proxy key: the proxy keeps the private key, issuers get the public one.
 openssl ecparam -name prime256v1 -genkey -noout -out sealed.key
 openssl ec -in sealed.key -pubout -out sealed-public.pem
-# Issuer key (Ed25519; a P-256 key with ES256 works too): the issuer keeps
-# the private key, the proxy gets the public one.
+# Issuer key (Ed25519, for EdDSA): the issuer keeps the private key, the
+# proxy gets the public one.
 openssl genpkey -algorithm ed25519 -out issuer.key
 openssl pkey -in issuer.key -pubout -out issuer-public.pem
 chmod 600 sealed.key issuer.key
+```
 
+For an `ES256` issuer, make a P-256 key with `genpkey` instead. `examples/seal`
+reads only PKCS #8 keys, which `openssl ecparam` does not write:
+
+```sh
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out issuer.key
+openssl pkey -in issuer.key -pubout -out issuer-public.pem
+chmod 600 issuer.key
+```
+
+Then run the proxy with its private key and the issuer's public key:
+
+```sh
 browser-secret-proxy -ca-cert ca.pem -ca-key ca.key -hosts api.example.com \
   -resolver sealed -sealed-key sealed.key \
   -sealed-issuer-key issuer-public.pem -sealed-audience proxy-eu-1
@@ -393,7 +493,8 @@ The signed claims carry the values:
   connection that outlives its token stops swapping.
 - `nbf` and `iat` (optional, Unix seconds): a token is refused before
   `nbf`, or when `iat` is in the future, beyond 30 seconds of clock skew.
-- `hosts` (optional) restricts every value of the token to those hosts.
+- `hosts` (optional) restricts every value of the token to those hosts, on
+  any port.
 - `sub` (optional) names the principal in logs; the username is used when it
   is empty. Neither changes what the token gives: the principal is the token
   itself, so its values are masked on all of its connections, whatever
@@ -404,20 +505,19 @@ signature against the `-sealed-issuer-key` keys, then checks the claims.
 That both admits the client and gives the values, with no lookup service
 and no external storage. A token that does not decrypt with the proxy's
 key, is not signed by a configured issuer key, was altered, is for another
-audience, or has expired gets `407`. So does a token in the earlier
-encrypt-only format, and a token that is not in its canonical compact form
-(five segments of unpadded base64url, without line breaks or non-zero
-unused bits), so a token cannot be presented as several passwords. A
-connection whose token expires while it is open gets `502` for every later
-request to an allowlisted host, whether or not the request holds a
-stand-in.
+audience, or has expired gets `407`. So does a token that is not in its
+canonical compact form (five segments of unpadded base64url, without line
+breaks or non-zero unused bits), so a token cannot be presented as several
+passwords. A connection whose token expires while it is open gets `502` for
+every later request to an allowlisted host, whether or not the request
+holds a stand-in.
 
 What each layer gives:
 
 - **Encryption** keeps the values from everyone but the proxy: the browser,
   the agent and Notte only ever hold an opaque token.
 - **The signature** proves that a configured issuer made the token. The
-  proxy's public key alone no longer lets anyone create tokens the proxy
+  proxy's public key alone does not let anyone create tokens the proxy
   accepts, so it can be shared freely.
 - **The audience** binds the token to one proxy: a token made for
   `proxy-eu-1` is refused by a proxy configured as `proxy-us-1`, even when
@@ -430,8 +530,13 @@ issuer's private key where the real values already are.
 Decrypted tokens, real values included, are kept in memory so each request
 does not decrypt again: at most 256 tokens, each until the earlier of its
 `exp` and 5 minutes after it was decrypted. They leave memory within 5
-seconds of that time, whether or not more requests come. Nothing is written
-to disk.
+seconds of that time, whether or not more requests come. That is not the
+only copy: an open connection keeps its token, still encrypted, and
+decrypts it again when it needs the values, and with response masking on,
+each value looked up stays on record for masking up to 15 minutes after its
+last lookup, never past `exp` (see [Response masking](#response-masking)).
+Nothing is written to disk.
+
 The token's own stand-ins are what the proxy looks for, so no pattern is
 needed.
 
@@ -470,7 +575,10 @@ check, so arbitrary digit runs in a page are not taken for card stand-ins.
 
 ## Using it with a Notte session
 
-Run the proxy on an address Notte can reach, with authentication on. Then add a
+Run the proxy where Notte can reach it, as described in
+[Exposing the proxy](#exposing-the-proxy): with authentication on, and a TLS
+terminator in front of it that gives clients an `https://` address (the proxy
+itself listens on `127.0.0.1` by default and speaks plain HTTP). Then add a
 `secret` entry to the session's `proxies` list next to its normal exit. Hosts
 in the entry go through your proxy; every other host keeps using the exit.
 
@@ -546,7 +654,11 @@ host.
   longer valid (an expired token), every request on its connections gets
   `502`, with or without stand-ins. Neither the client nor the log sees the
   real value or the resolver's error text; the log names only its kind
-  (timeout, refused credential, error).
+  (timeout, refused credential, error). A request refused because a real
+  value cannot go into its header, or because a swap would take it past a
+  [limit](#limits-and-known-gaps), gets no `502`: over HTTP/2 its stream is
+  refused with `REFUSED_STREAM`, and over HTTP/1.1 its connection is closed
+  without an answer.
 - **One version per request.** A resolver whose values change (a reloaded
   file) gives each request one version, for finding its stand-ins and for
   looking them up.
@@ -561,13 +673,18 @@ host.
   principal, and what the resolvers keep in memory cannot serve another
   principal: the `http` cache is keyed by principal, host and stand-in, and
   the `sealed` cache by the token itself, which only its holder can present.
-  The `file` mode has one map for every principal by design.
+  The `file` mode has one map for every principal by design. Outside
+  `sealed` mode, the proxy has one credential, so all of its clients are one
+  principal: to keep users or sessions apart, give each its own proxy, or
+  use `sealed` tokens.
 
 ### What it does not guarantee
 
 - **Single use.** The proxy looks values up once per request and does not
   count uses. A value that must work only once has to be retired by the
   resolver that issues it.
+- **Ports.** Host lists (`-hosts` and a value's own) name hosts only: a value
+  allowed for a host may go to any port of that host.
 - **Responses** are masked for known forms of the values only: see
   [what masking misses](#what-masking-misses).
 - **WebSockets** and other upgraded connections get no swaps once upgraded.
@@ -628,7 +745,9 @@ How a masked response changes:
 
 - `gzip`, `deflate`, `br` and `zstd` bodies are decoded, masked and sent
   without a content-coding: the `Content-Encoding` header is dropped. The
-  proxy never passes a compressed body through unmasked. A decoded body is
+  proxy never passes on a body with a `Content-Encoding` undecoded (data
+  compressed inside the body is another matter: see
+  [What masking misses](#what-masking-misses)). A decoded body is
   capped at 64 MiB; past it the response is cut off (HTTP/1.1: the
   connection closes mid-body; HTTP/2: the stream is reset), so the browser
   sees an error, never an unmasked byte.
@@ -672,10 +791,10 @@ How a masked response changes:
 
 ### What masking misses
 
-- Values the destination transforms: only the last four digits, other
-  groupings or separators, lower-case percent-encoding (the proxy matches
-  the upper-case form Go and browsers produce), base64, hashes, or a value
-  split by markup
+- Values the destination transforms: only the last four digits, only the
+  first characters, a change of case, other groupings or separators,
+  lower-case percent-encoding (the proxy matches the upper-case form Go and
+  browsers produce), base64, hashes, or a value split by markup
   (`4111<span>1111...`).
 - Escaped forms other than the ones Go's encoders write, though they decode
   to the same value. For example: `\/` for `/` (PHP's `json_encode`);
@@ -687,6 +806,14 @@ How a masked response changes:
   upper-case digits (`&#x4A;`); `%20` for a space with `!*'()` left as is
   (`encodeURIComponent`); `%7E` for `~` (`URLSearchParams`); `/` left as is
   with `%20` for a space (Python's `urllib.parse.quote`).
+- Data compressed inside the body, which no `Content-Encoding` names: gRPC
+  messages under `grpc-encoding`, archives and other compressed files, PDF
+  streams, or a body compressed twice under one coding. Masking sees only
+  the compressed bytes.
+- Header and trailer names: only their values are masked.
+- Over HTTP/2, the free-form content of frames other than headers and
+  data, which passes through as it is: the debug data of `GOAWAY`, `PING`
+  payloads, and extension frames such as `ALTSVC` or `ORIGIN`.
 - A value first recorded while a response is already open, such as a
   server-sent events stream or another long response: which values are
   masked is decided when the response head arrives, so a value the
@@ -717,6 +844,15 @@ return.
 - TLS session resumption is not supported. A ClientHello that offers
   `pre_shared_key` or early data on an allowlisted host is refused, and every
   connection to an allowlisted host performs a full handshake.
+- **Supported clients.** On an allowlisted host the proxy sends the
+  destination an exact copy of the client's ClientHello, and refuses a
+  client whose ClientHello it cannot copy. Chromium and Google Chrome (as in
+  Notte sessions) and Go programs (`crypto/tls`, as `net/http` uses) work.
+  Clients built on OpenSSL, such as curl on most Linux distributions, Python
+  and Node.js, send the `encrypt_then_mac` extension (22) and are refused:
+  the client gets a `502` (or, when it did not offer HTTP/1.1, a closed
+  connection) and the proxy logs `ClientHello cannot be replayed exactly`.
+  Hosts that are not allowlisted are tunneled for every client.
 - Request bodies on allowlisted hosts are buffered: 32 MiB per body and 64 MiB
   per HTTP/2 connection, with at most 256 open streams and 1 MiB per header
   block. An HTTP/2 stream over a limit is refused with `REFUSED_STREAM`, so the
@@ -730,6 +866,11 @@ return.
   without swaps once the destination accepts them.
 - Text formats other than JSON and forms (XML, multipart) get real values as
   is; a value that needs escaping in such a body is not escaped.
+- Request bodies with a `Content-Encoding` (`gzip`, `br`, ...) are not
+  decoded, so stand-ins inside them are not found: the destination gets the
+  stand-ins.
+- Request trailers are swapped over HTTP/2 only. Over HTTP/1.1, chunked
+  trailers are passed on as they are, stand-ins included.
 - HTTP/2 clients must respect flow control: a client that sends past its
   window ends the connection with `FLOW_CONTROL_ERROR`.
 - An HTTP/2 frame longer than the `SETTINGS_MAX_FRAME_SIZE` its sender was

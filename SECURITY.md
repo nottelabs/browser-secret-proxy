@@ -52,8 +52,10 @@ In scope:
   [Response masking](README.md#response-masking) section says is masked;
 - bypassing proxy authentication;
 - decrypting traffic to a host that is not allowlisted;
-- issuing a certificate for a host that is not allowlisted, or a certificate
-  usable beyond the connection it was issued for;
+- issuing a certificate for a host that is not allowlisted, or the leaf
+  certificates' key leaving the proxy. By design, the proxy makes one leaf
+  key at start, keeps it in memory only, and reuses each host's certificate
+  (valid for up to 7 days) across connections and principals;
 - memory exhaustion or crashes from a single client within the documented
   limits;
 - the release pipeline: published binaries, container images, checksums,
