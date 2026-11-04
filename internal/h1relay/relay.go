@@ -17,8 +17,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nottelabs/secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 // Options configures a relay.

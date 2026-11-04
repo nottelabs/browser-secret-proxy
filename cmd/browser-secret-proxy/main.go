@@ -1,5 +1,5 @@
-// Command secret-proxy is a forward proxy that swaps stand-in values for real
-// ones on allowlisted hosts while keeping the client's TLS and HTTP/2
+// Command browser-secret-proxy is a forward proxy that swaps stand-in values
+// for real ones on allowlisted hosts while keeping the client's TLS and HTTP/2
 // fingerprints.
 package main
 
@@ -14,11 +14,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/nottelabs/secret-proxy/internal/certs"
-	"github.com/nottelabs/secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/secret-proxy/internal/proxy"
-	"github.com/nottelabs/secret-proxy/internal/swap"
-	"github.com/nottelabs/secret-proxy/internal/upstream"
+	"github.com/nottelabs/browser-secret-proxy/internal/certs"
+	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/proxy"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".

@@ -35,8 +35,8 @@ import (
 
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/nottelabs/secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 // Options configures a relay. Zero limits take the defaults.

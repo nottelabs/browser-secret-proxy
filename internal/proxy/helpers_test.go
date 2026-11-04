@@ -22,10 +22,10 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
-	"github.com/nottelabs/secret-proxy/internal/certs"
-	"github.com/nottelabs/secret-proxy/internal/clienthello"
-	"github.com/nottelabs/secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/certs"
+	"github.com/nottelabs/browser-secret-proxy/internal/clienthello"
+	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 const (
