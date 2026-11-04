@@ -21,6 +21,9 @@ import (
 	"github.com/nottelabs/secret-proxy/internal/upstream"
 )
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "secret-proxy:", err)
@@ -36,7 +39,13 @@ func run() error {
 	swaps := flag.String("swaps", "", "JSON file mapping each stand-in to its real value (required)")
 	parent := flag.String("upstream-proxy", os.Getenv("SECRET_PROXY_UPSTREAM"), "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
 	verbose := flag.Bool("v", false, "debug logging")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return nil
+	}
 
 	level := slog.LevelInfo
 	if *verbose {

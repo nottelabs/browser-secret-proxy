@@ -10,8 +10,7 @@ BIN_DIR := bin
 IMAGE   ?= $(NAME):dev
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-# main.version is set when cmd/secret-proxy declares it; until then the linker
-# ignores the -X flag.
+# Sets the version that `-version` prints.
 LDFLAGS := -s -w -X main.version=$(VERSION)
 GOFLAGS_BUILD := -trimpath -ldflags "$(LDFLAGS)"
 
