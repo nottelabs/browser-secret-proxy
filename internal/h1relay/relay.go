@@ -393,8 +393,9 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 // requires (2.2, 5, 6.1, 6.3): a bare CR or a NUL in any line, a folded
 // (obs-fold) header line, a header name that is not a token (such as one
 // with a space before the colon), Transfer-Encoding with Content-Length,
-// Transfer-Encoding other than a single chunked or on an HTTP/1.0 request,
-// and more than one Content-Length or one that is not a decimal number.
+// Transfer-Encoding other than a single chunked or on a request that is not
+// HTTP/1.1, and more than one Content-Length or one that is not a decimal
+// number.
 func framing(requestLine, version string, headers []header) (chunked bool, contentLength int, err error) {
 	contentLength = -1
 	if strings.ContainsAny(requestLine, "\r\x00") {
@@ -405,16 +406,21 @@ func framing(requestLine, version string, headers []header) (chunked bool, conte
 		if err := checkFieldLine(h.raw); err != nil {
 			return false, 0, err
 		}
+		// Only SP and HTAB are whitespace around a value (RFC 9110 5.6.3).
+		// h.value is trimmed of more, such as VT and FF, which a server may
+		// keep: "chunked\v" is then not chunked to it.
+		_, value, _ := strings.Cut(h.raw, ":")
+		value = strings.Trim(value, " \t")
 		switch h.name {
 		case "transfer-encoding":
 			encodings++
-			chunked = strings.EqualFold(h.value, "chunked")
+			chunked = isChunked(value)
 		case "content-length":
 			lengths++
-			if !isDigits(h.value) {
+			if !isDigits(value) {
 				return false, 0, errors.New("an invalid Content-Length")
 			}
-			if contentLength, err = strconv.Atoi(h.value); err != nil {
+			if contentLength, err = strconv.Atoi(value); err != nil {
 				return false, 0, errors.New("an invalid Content-Length")
 			}
 		}
@@ -424,8 +430,8 @@ func framing(requestLine, version string, headers []header) (chunked bool, conte
 		return false, 0, errors.New("both Transfer-Encoding and Content-Length")
 	case encodings > 1 || encodings == 1 && !chunked:
 		return false, 0, errors.New("a Transfer-Encoding other than a single chunked")
-	case chunked && version == "HTTP/1.0":
-		return false, 0, errors.New("Transfer-Encoding on an HTTP/1.0 request")
+	case chunked && version != "HTTP/1.1":
+		return false, 0, errors.New("Transfer-Encoding on a request that is not HTTP/1.1")
 	case lengths > 1:
 		return false, 0, errors.New("more than one Content-Length")
 	}
@@ -466,6 +472,22 @@ func isToken(s string) bool {
 
 func isTchar(c byte) bool {
 	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
+}
+
+// isChunked reports whether s is the coding name chunked, in any ASCII case
+// (RFC 9112 7). strings.EqualFold is not used: it also folds non-ASCII
+// letters, such as the Kelvin sign to k.
+func isChunked(s string) bool {
+	const name = "chunked"
+	if len(s) != len(name) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i]|0x20 != name[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // isDigits reports whether s is one or more ASCII digits, the syntax of a
