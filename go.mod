@@ -3,6 +3,7 @@ module github.com/nottelabs/browser-secret-proxy
 go 1.26.0
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.8
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.62.0
 )

@@ -7,6 +7,8 @@
 // The response direction is forwarded byte for byte, flow control included.
 // In the request direction the relay decodes each header block, swaps
 // stand-ins on allowlisted authorities and encodes it again for the upstream.
+// A request whose stand-ins cannot be swapped (see package scope) is answered
+// 502 by the relay and never sent upstream.
 // A request body that may hold a stand-in is buffered until the client ends
 // it, swapped, and sent with a corrected content-length; the relay is the
 // flow-control endpoint for request bodies on both sides. Upstream stream IDs
@@ -21,6 +23,7 @@ package h2relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -36,13 +39,16 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 // Options configures a relay. Zero limits take the defaults.
 type Options struct {
-	Hosts   *hostmatch.List // stand-ins are swapped only for these authorities
-	Swapper *swap.Swapper
+	Hosts *hostmatch.List // stand-ins are swapped only for these authorities
+	// Session resolves the stand-ins of each request on an allowlisted
+	// authority.
+	Session *scope.Session
 	// MaxBody caps one buffered request body (default 32 MiB).
 	MaxBody int
 	// MaxBuffered caps the request bytes the relay holds for the whole
@@ -62,10 +68,15 @@ type Options struct {
 
 // continueBlock is ":status: 100" as a literal without indexing on the static
 // ":status" name (index 8), so it leaves the client's dynamic table, which
-// belongs to the server's encoder, untouched.
-var continueBlock = []byte{0x08, 0x03, '1', '0', '0'}
+// belongs to the server's encoder, untouched. badGatewayBlock is ":status:
+// 502" the same way.
+var (
+	continueBlock   = []byte{0x08, 0x03, '1', '0', '0'}
+	badGatewayBlock = []byte{0x08, 0x03, '5', '0', '2'}
+)
 
 const (
+	errCodeNoError       = 0x0
 	errCodeInternal      = 0x2
 	errCodeFlowControl   = 0x3
 	errCodeRefusedStream = 0x7
@@ -83,6 +94,9 @@ const (
 type relay struct {
 	opts           Options
 	client, server net.Conn
+	// ctx ends with the relay, canceling a resolver call in progress.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	clientMu sync.Mutex // serializes writes to the client
 	// The server's first SETTINGS must be the first frame the client gets
@@ -144,6 +158,7 @@ type relay struct {
 type stream struct {
 	clientID, serverID uint32
 	swap               bool
+	authority          string
 	buffering          bool
 	headers            []hpack.HeaderField
 	priority           *Priority
@@ -209,6 +224,7 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 		nextServerID: 1, connWindow: defaultWindow, initialWindow: defaultWindow, maxFrame: defaultMaxFrame,
 		recvConn: defaultWindow, clientInitial: defaultWindow, maxConcurrent: -1, ackedInitial: defaultWindow, maxInitialSent: defaultWindow,
 	}
+	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
@@ -262,6 +278,7 @@ func (r *relay) run() error {
 // also ends a write in progress. After them, the client socket closes
 // without the lock, which ends any client write.
 func (r *relay) shutdown() {
+	r.cancel()
 	r.mu.Lock()
 	r.closed = true
 	r.cond.Broadcast()
@@ -726,19 +743,32 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 				}
 			}
 		}
-		s = &stream{clientID: clientID, swap: r.opts.Hosts.Match(authority), clientEnded: endStream}
-		if s.swap {
-			if err := r.swapFields(fields, authority); err != nil {
-				// Nothing went upstream, so the client may retry elsewhere.
-				r.opts.Logger.Error("refusing a request whose swapped headers cannot be sent", "stream", clientID, "error", err)
-				return r.writeClient(refusal(clientID))
+		// Every request goes to the CONNECT host: one naming another host is
+		// refused, so no value scoped to that host goes with it.
+		if err := r.opts.Session.CheckAuthority(authority); err != nil {
+			return r.badGateway(clientID, authority, endStream, err)
+		}
+		s = &stream{clientID: clientID, swap: r.opts.Hosts.Match(authority), authority: authority, clientEnded: endStream}
+		// A request with a body is swapped once the body is complete
+		// (finish), with a single lookup for its headers, body and trailers.
+		buffered := !endStream && s.swap && method != "CONNECT"
+		if s.swap && !buffered {
+			swapper, err := r.opts.Session.Swapper(r.ctx, fieldText(fields)...)
+			if err != nil {
+				return r.badGateway(clientID, authority, endStream, err)
+			}
+			if swapper != nil {
+				if err := r.swapFields(swapper, fields, authority); err != nil {
+					// Nothing went upstream, so the client may retry elsewhere.
+					r.opts.Logger.Error("refusing a request whose swapped headers cannot be sent", "stream", clientID, "error", err)
+					return r.writeClient(refusal(clientID))
+				}
 			}
 		}
 		// Every field other goroutines read is set before the stream is
 		// published in r.streams; serverLoop scans buffering streams when
 		// the server's SETTINGS arrive, sendLoop and dropLocked read
 		// streaming.
-		buffered := !endStream && s.swap && method != "CONNECT"
 		if buffered {
 			s.buffering, s.headers, s.priority = true, fields, priority
 		} else {
@@ -770,10 +800,19 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		return nil
 	}
 
-	// Trailers.
-	if s.swap {
-		if err := r.swapFields(fields, ""); err != nil {
-			r.opts.Logger.Error("resetting a request whose swapped trailers cannot be sent", "stream", clientID, "error", err)
+	// Trailers. A buffered request's are swapped with its body in finish;
+	// a streamed request (extended CONNECT) on an allowlisted authority gets
+	// a lookup of its own.
+	r.mu.Lock()
+	buffering := s.buffering
+	r.mu.Unlock()
+	if s.swap && !buffering {
+		swapper, err := r.opts.Session.Swapper(r.ctx, fieldText(fields)...)
+		if err == nil && swapper != nil {
+			err = r.swapFields(swapper, fields, s.authority)
+		}
+		if err != nil {
+			r.opts.Logger.Error("resetting a request whose trailers cannot be sent", "stream", clientID, "error", err)
 			return r.abort(s, errCodeCalm)
 		}
 	}
@@ -794,11 +833,44 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 	return nil
 }
 
+// fieldText is the text of a header list that stand-ins are swapped in: the
+// query part of :path and the values of fields that are neither
+// pseudo-headers nor framing headers.
+func fieldText(fields []hpack.HeaderField) []swap.Part {
+	parts := make([]swap.Part, 0, len(fields))
+	for _, f := range fields {
+		switch {
+		case f.Name == ":path":
+			if _, query, ok := strings.Cut(f.Value, "?"); ok {
+				query, _, _ = strings.Cut(query, "#")
+				parts = append(parts, swap.Part{Place: swap.Query, Text: query})
+			}
+		case strings.HasPrefix(f.Name, ":"), framingHeaders[f.Name]:
+		default:
+			parts = append(parts, swap.Part{Place: swap.Literal, Text: f.Value})
+		}
+	}
+	return parts
+}
+
+// badGateway answers a request that must not be sent with a 502 of the
+// relay's own, ending the stream. A client still sending its body is told to
+// stop with RST_STREAM NO_ERROR (RFC 9113 8.1).
+func (r *relay) badGateway(clientID uint32, authority string, clientEnded bool, cause error) error {
+	r.opts.Logger.Warn("refusing a request", "stream", clientID, "authority", authority,
+		"principal", r.opts.Session.Principal().ID, "reason", cause.Error())
+	frames := []Frame{{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: clientID, Payload: badGatewayBlock}}
+	if !clientEnded {
+		frames = append(frames, Frame{Type: FrameRSTStream, Stream: clientID, Payload: binary.BigEndian.AppendUint32(nil, errCodeNoError)})
+	}
+	return r.writeClient(frames...)
+}
+
 // swapFields swaps stand-ins in header values and in the query string of
 // :path; other pseudo-headers are left alone. The swapped list stays within
 // MaxHeaderBytes (decoded size), and a real value that would put a line
 // break into a header is refused. Errors name the header, never a value.
-func (r *relay) swapFields(fields []hpack.HeaderField, authority string) error {
+func (r *relay) swapFields(swapper *swap.Swapper, fields []hpack.HeaderField, authority string) error {
 	size := 0
 	for _, f := range fields {
 		size += len(f.Name) + len(f.Value) + 32
@@ -812,11 +884,11 @@ func (r *relay) swapFields(fields []hpack.HeaderField, authority string) error {
 		var err error
 		switch {
 		case f.Name == ":path":
-			value, changed, err = r.opts.Swapper.Target(f.Value, room)
+			value, changed, err = swapper.Target(f.Value, room)
 		case strings.HasPrefix(f.Name, ":"), framingHeaders[f.Name]:
 			continue
 		default:
-			value, changed, err = r.opts.Swapper.Header(f.Value, room)
+			value, changed, err = swapper.Header(f.Value, room)
 		}
 		if err != nil {
 			return fmt.Errorf("header %s: %w", f.Name, err)
@@ -1070,9 +1142,10 @@ func (r *relay) finish(s *stream) error {
 		r.mu.Unlock()
 		return nil // dropped meanwhile (reset, refused, server going away)
 	}
-	// s.body is not written again: the client ended the stream.
+	// s.body is not written again: the client ended the stream, and so its
+	// trailers are final too.
 	original := s.body.Bytes()
-	headers, priority := s.headers, s.priority
+	headers, priority, trailers := s.headers, s.priority, s.trailers
 	s.headers = nil
 	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
 	r.mu.Unlock()
@@ -1083,7 +1156,31 @@ func (r *relay) finish(s *stream) error {
 			contentType = h.Value
 		}
 	}
-	body, changed, err := r.opts.Swapper.Body(contentType, original, int(max(limit, 0)))
+	parts := append(fieldText(headers), fieldText(trailers)...)
+	parts = append(parts, swap.Part{Place: swap.BodyPlace(contentType), Text: string(original)})
+	swapper, err := r.opts.Session.Swapper(r.ctx, parts...)
+	if err != nil {
+		r.mu.Lock()
+		current := r.streams[s.clientID] == s
+		if current {
+			r.dropLocked(s)
+		}
+		r.mu.Unlock()
+		if !current {
+			return nil
+		}
+		return r.badGateway(s.clientID, s.authority, true, err)
+	}
+	body, changed := original, false
+	if swapper != nil {
+		for _, list := range [][]hpack.HeaderField{headers, trailers} {
+			if err := r.swapFields(swapper, list, s.authority); err != nil {
+				r.opts.Logger.Error("refusing a request whose swapped headers cannot be sent", "stream", s.clientID, "error", err)
+				return r.abort(s, errCodeRefusedStream)
+			}
+		}
+		body, changed, err = swapper.Body(contentType, original, int(max(limit, 0)))
+	}
 	if err != nil {
 		r.opts.Logger.Error("refusing a request whose swapped body passes the buffer limits",
 			"stream", s.clientID, "body_limit_bytes", r.opts.MaxBody, "connection_limit_bytes", r.opts.MaxBuffered)
