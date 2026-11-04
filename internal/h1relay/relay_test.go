@@ -226,7 +226,7 @@ func TestTunnelRequestsAreAnswered502(t *testing.T) {
 	for name, request := range map[string]string{
 		"CONNECT":                    "CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\nX-Token: tok_standin\r\n\r\n",
 		"CONNECT in origin-form":     "CONNECT /echo?q=tok_standin HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
-		"lower-case connect":         "connect allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n",
+		"lower-case connect":         "connect /echo?q=tok_standin HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
 		"upgrade to h2c":             "GET /echo?q=tok_standin HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n",
 		"websocket or h2c":           "GET /socket HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: websocket, h2c\r\n\r\n",
 		"websocket, then another":    "GET /socket HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nUpgrade: TLS/1.2\r\n\r\n",

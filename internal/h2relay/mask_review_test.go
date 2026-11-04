@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"strconv"
 	"testing"
 	"time"
 
@@ -96,6 +97,49 @@ func TestExtendedConnectTunnelIsNotMasked(t *testing.T) {
 				t.Fatalf("client got %q, want the frame untouched", f.Payload)
 			}
 		})
+	}
+}
+
+// Nothing in an RFC 8441 response shows that a WebSocket endpoint answered
+// (there is no Sec-WebSocket-Accept), so a 2xx from any handler accepts an
+// extended CONNECT for a WebSocket. On a destination that supports extended
+// CONNECT, a catch-all handler that answers every method with what the
+// request carried returns the swapped value unmasked. This pins that known
+// gap, which the README states under the security model: a change that
+// closes it changes this test.
+func TestExtendedConnectToACatchAllHandlerIsNotMasked(t *testing.T) {
+	h := newHarness(t, masking(t, false))
+	c := newClientView(h)
+	fields := request("CONNECT", field(":protocol", "websocket"))
+	fields[3].Value = "/?q=" + tokenSIn
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(fields...)})
+	f := h.expect(h.toServer, "server", isType(FrameHeaders))
+	_, fragment, err := HeadersPayload(f.Flags, f.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent, err := hpack.NewDecoder(4096, nil).DecodeFull(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := ""
+	for _, sf := range sent {
+		if sf.Name == ":path" {
+			path = sf.Value
+		}
+	}
+	if path != "/?q="+realToken {
+		t.Fatalf("server got :path %q, want the value swapped in", path)
+	}
+	echo := "method CONNECT q " + realToken
+	h.serverSend(status(h, f.Stream, false, field(":status", "200"),
+		field("content-type", "text/plain; charset=utf-8"), field("content-length", strconv.Itoa(len(echo)))))
+	if head := c.readHead(1); head[":status"] != "200" {
+		t.Fatalf("head %v", head)
+	}
+	h.serverSend(data(f.Stream, echo, true))
+	if got := h.expect(h.toClient, "client", isType(FrameData)); string(got.Payload) != echo {
+		t.Fatalf("client got %q, want the echo untouched", got.Payload)
 	}
 }
 

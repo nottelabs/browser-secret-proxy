@@ -576,11 +576,17 @@ host.
   `websocket`. The handshake request is swapped like any other and the head
   of its answer is masked, but once the destination accepts it, the frames
   pass through untouched both ways. A WebSocket endpoint that echoes a value
-  from its handshake (`wss://host/ws?token=...`) returns it unmasked. Every
-  other tunnel is answered `502` and not sent, so its answer cannot pass
-  through unmasked: a `CONNECT` inside an intercepted connection (HTTP/1.1,
-  or HTTP/2 without `:protocol`), another HTTP/2 `:protocol`, and an
-  HTTP/1.1 upgrade to another protocol, such as `h2c`.
+  from its handshake (`wss://host/ws?token=...`) returns it unmasked.
+  Over HTTP/1.1 only a `101` opens the stream, which a handler that is not a
+  WebSocket endpoint does not send. Over HTTP/2 any `2xx` to a WebSocket
+  extended `CONNECT` opens it: nothing in the answer shows that a WebSocket
+  endpoint sent it. So on a destination that supports extended `CONNECT`
+  (it advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`), any handler that
+  answers `2xx` to every method returns the values swapped into the
+  handshake unmasked. Every other tunnel is answered `502` and not sent:
+  a `CONNECT` inside an intercepted connection (HTTP/1.1, or HTTP/2 without
+  `:protocol`), another HTTP/2 `:protocol`, and an HTTP/1.1 upgrade to
+  another protocol, such as `h2c`.
 
 ## Exposing the proxy
 
@@ -715,8 +721,10 @@ How a masked response changes:
   are not masked on this one's connections.
 - WebSocket frames (after an HTTP/1.1 upgrade or an HTTP/2 extended
   `CONNECT` the destination accepted), which pass through untouched, even a
-  value the destination echoes from the swapped handshake. Other tunnels
-  are refused: see [what it does not guarantee](#what-it-does-not-guarantee).
+  value the destination echoes from the swapped handshake. Over HTTP/2 any
+  `2xx` accepts an extended `CONNECT`, so on a destination that supports
+  it, a handler that answers every method does the same. Other tunnels are
+  refused: see [what it does not guarantee](#what-it-does-not-guarantee).
 - Responses on hosts that are not allowlisted (they are never decrypted).
 
 Allowlist only the endpoints that need the values, and check what they

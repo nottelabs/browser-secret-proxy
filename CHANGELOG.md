@@ -78,7 +78,8 @@ First release, planned as 0.1.0.
   protocol than `websocket` (such as `h2c`) are answered `502` and not
   sent. Before, any `2xx` to a `CONNECT`, or a `101` to an `h2c` upgrade,
   passed the rest of the connection to the client unmasked, with the real
-  values swapped into the request that opened it.
+  values swapped into the request that opened it. WebSockets still pass
+  through unmasked once accepted, over HTTP/2 after any `2xx`.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).

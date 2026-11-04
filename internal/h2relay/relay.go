@@ -1021,7 +1021,9 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // (RFC 8441), a :protocol on any other request, and more than one :method,
 // of which a server may use another than the relay: the response to an
 // accepted CONNECT is a tunnel that passes through unmasked, and a plain
-// CONNECT is accepted by any catch-all handler that answers 200.
+// CONNECT is accepted by any catch-all handler that answers 200. So is an
+// extended CONNECT on a destination that supports it (see
+// maskResponseHead), which is why only a WebSocket gets one.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
 	methodFields, authorityFields, hostFields, uppercase := 0, 0, 0, ""
 	var protocols []string
