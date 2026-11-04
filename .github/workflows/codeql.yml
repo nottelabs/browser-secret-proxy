@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   visibility:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON('{"github":"ubuntu-24.04","blacksmith":"blacksmith-2vcpu-ubuntu-2404"}')[vars.CI_RUNNER_PROVIDER || 'blacksmith'] }}
     outputs:
       public: ${{ steps.check.outputs.public }}
     steps:
@@ -42,7 +42,7 @@ jobs:
   analyze:
     needs: visibility
     if: needs.visibility.outputs.public == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON('{"github":"ubuntu-24.04","blacksmith":"blacksmith-2vcpu-ubuntu-2404"}')[vars.CI_RUNNER_PROVIDER || 'blacksmith'] }}
     permissions:
       contents: read
       security-events: write # upload results to code scanning

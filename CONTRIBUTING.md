@@ -112,6 +112,14 @@ make docker
 NOTTE_API_KEY=... NGROK_AUTHTOKEN=... scripts/e2e-notte.sh
 ```
 
+## CI runners
+
+Workflow jobs run on Blacksmith (`blacksmith-2vcpu-ubuntu-2404`). During a
+Blacksmith outage, set the repository Actions variable `CI_RUNNER_PROVIDER`
+to `github` to move every job to GitHub's `ubuntu-24.04`, then re-run the
+queued runs. Delete the variable afterwards. Any other value leaves the job
+without a runner, so it fails instead of waiting forever.
+
 ## Pull requests
 
 - Keep each pull request to one purpose, and describe what changed and why.
