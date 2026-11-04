@@ -414,7 +414,9 @@ func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn,
 	if protocol != "" {
 		serverConfig.NextProtos = []string{protocol}
 	}
-	tlsConn := tls.Server(clientConn, serverConfig)
+	// Request heads are timed from the first byte of their TLS record.
+	records := h1relay.WatchRecords(clientConn)
+	tlsConn := tls.Server(records, serverConfig)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		if errors.Is(err, io.EOF) {
 			log.Debug("client closed during the TLS handshake")
@@ -431,7 +433,7 @@ func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn,
 	if protocol == "h2" {
 		err = h2relay.Serve(tlsConn, uconn, h2relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, Logger: log})
 	} else {
-		err = h1relay.Serve(tlsConn, uconn, h1relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, HeadTimeout: s.cfg.HeaderTimeout, Logger: log})
+		err = h1relay.Serve(tlsConn, uconn, h1relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, HeadTimeout: s.cfg.HeaderTimeout, Records: records, Logger: log})
 	}
 	if err != nil {
 		log.Warn("connection ended with an error", "error", err)

@@ -4,9 +4,11 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -115,6 +117,30 @@ func TestIdleInterceptedConnectionIsClosed(t *testing.T) {
 	}
 }
 
+// A large write that a slow reader keeps draining counts as traffic while
+// it goes on, though the whole write takes longer than IdleTimeout.
+func TestSlowlyDrainedWriteIsNotIdle(t *testing.T) {
+	ours, peer := net.Pipe()
+	defer peer.Close()
+	idle := newIdleTimer(200 * time.Millisecond)
+	conn := idle.wrap(ours)
+	idle.start(slog.New(slog.DiscardHandler), conn)
+	defer idle.stop()
+	go func() {
+		buf := make([]byte, 4<<10)
+		for {
+			if _, err := peer.Read(buf); err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	// 128 reads of 4 KiB, 10ms apart, take over a second.
+	if _, err := conn.Write(make([]byte, 512<<10)); err != nil {
+		t.Fatalf("a write that was being drained ended with %v", err)
+	}
+}
+
 // The CONNECT head must arrive within HeaderTimeout, however long the
 // handshake may take.
 func TestSlowConnectHeadIsClosed(t *testing.T) {
@@ -152,6 +178,55 @@ func TestSlowRequestHeadIsClosed(t *testing.T) {
 			}
 			time.Sleep(30 * time.Millisecond)
 		}
+	}()
+	expectClosed(t, tlsConn, 3*time.Second)
+}
+
+// dripConn writes one byte at a time once drip is set, so a TLS record
+// reaches the proxy in many pieces.
+type dripConn struct {
+	net.Conn
+	drip atomic.Bool
+}
+
+func (c *dripConn) Write(p []byte) (int, error) {
+	if !c.drip.Load() {
+		return c.Conn.Write(p)
+	}
+	for i := range p {
+		if _, err := c.Conn.Write(p[i : i+1]); err != nil {
+			return i, err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return len(p), nil
+}
+
+// HeaderTimeout counts from the first byte of the TLS record that carries a
+// request head, so a client cannot put the deadline off by dripping that
+// record's encrypted bytes, each of which keeps IdleTimeout from firing.
+// Waiting between requests is still not counted.
+func TestDrippedTLSRecordIsClosed(t *testing.T) {
+	dest := startDestination(t, allowedHost, []string{"http/1.1"}, respondOK)
+	p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, func(c *Config) {
+		c.HeaderTimeout = 300 * time.Millisecond
+		c.IdleTimeout = time.Second
+	})
+	conn, resp := connect(t, p.addr, allowedHost+":443", "")
+	_ = resp.Body.Close()
+	dripping := &dripConn{Conn: conn}
+	tlsConn := tls.Client(dripping, &tls.Config{ServerName: allowedHost, RootCAs: p.ca, NextProtos: []string{"http/1.1"}})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	getOK(t, tlsConn, allowedHost)
+	time.Sleep(2 * 300 * time.Millisecond)
+	getOK(t, tlsConn, allowedHost)
+
+	// One record of about 270 bytes takes over 5s to arrive.
+	dripping.drip.Store(true)
+	go func() {
+		_, _ = io.WriteString(tlsConn, "GET / HTTP/1.1\r\nHost: "+allowedHost+"\r\nX-Pad: "+strings.Repeat("p", 200)+"\r\n\r\n")
 	}()
 	expectClosed(t, tlsConn, 3*time.Second)
 }

@@ -724,7 +724,8 @@ return.
 - The CONNECT head must arrive within `-header-timeout` (10 seconds by
   default), and the head, the destination dial and both TLS handshakes within
   30 seconds. On a decrypted HTTP/1.1 connection, each request head must
-  arrive within `-header-timeout` of its first byte. HTTP/2 heads have no time
+  arrive within `-header-timeout` of the first byte of the TLS record that
+  carries it, however slowly that record comes. HTTP/2 heads have no time
   limit of their own: an HTTP/2 connection is bounded by the idle timeout
   below and by its buffer caps.
 - A connection with no bytes moving either way for `-idle-timeout` (5 minutes

@@ -10,8 +10,9 @@ import (
 
 // idleTimer closes a client connection and its destination connection once
 // no bytes have moved either way for timeout. Reads and writes on the
-// connections it wraps count as traffic; a read or write that waits does not,
-// so a peer that stops reading is cut off too.
+// connections it wraps count as traffic, a long write each time a chunk of
+// it is taken; a read or write that waits does not, so a peer that stops
+// reading is cut off too.
 type idleTimer struct {
 	timeout time.Duration
 	last    atomic.Int64 // when bytes last moved, in Unix nanoseconds
@@ -82,12 +83,26 @@ func (c *countedConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// writeChunk is the most a write hands the connection at once, so a long
+// write that a slow reader drains counts as traffic as it goes. It is
+// io.Copy's buffer size: tunnels write as before, and TLS records are
+// smaller.
+const writeChunk = 32 << 10
+
 func (c *countedConn) Write(p []byte) (int, error) {
-	n, err := c.Conn.Write(p)
-	if n > 0 {
-		c.idle.touch()
+	written := 0
+	for len(p) > 0 {
+		n, err := c.Conn.Write(p[:min(len(p), writeChunk)])
+		if n > 0 {
+			c.idle.touch()
+		}
+		written += n
+		p = p[n:]
+		if err != nil {
+			return written, err
+		}
 	}
-	return n, err
+	return written, nil
 }
 
 // CloseWrite half-closes the connection when it can, as tunnels expect, and

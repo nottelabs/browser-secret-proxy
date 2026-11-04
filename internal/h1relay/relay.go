@@ -46,7 +46,12 @@ type Options struct {
 	// its end (zero: no limit), so a client cannot hold the connection by
 	// dripping a head. Waiting between requests is not counted.
 	HeadTimeout time.Duration
-	Logger      *slog.Logger
+	// Records is the connection beneath the client's TLS, wrapped by
+	// WatchRecords. When set, HeadTimeout counts from the first byte of the
+	// record that carries a head rather than from the head's decryption, so
+	// a client cannot put the deadline off by dripping an encrypted record.
+	Records *RecordConn
+	Logger  *slog.Logger
 }
 
 const (
@@ -85,7 +90,7 @@ func Serve(client, server net.Conn, opts Options) error {
 		done <- responses(bufio.NewReader(server), toClient, queue, progress, opts)
 	}()
 	go func() {
-		done <- requests(ctx, bufio.NewReader(client), headTimer{conn: client, timeout: opts.HeadTimeout}, server, toClient, queue, responsesDone, progress, opts)
+		done <- requests(ctx, bufio.NewReader(client), headTimer{conn: client, records: opts.Records, timeout: opts.HeadTimeout}, server, toClient, queue, responsesDone, progress, opts)
 	}()
 	err := <-done
 	cancel()
@@ -404,26 +409,84 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 // arrives, from its first byte.
 type headTimer struct {
 	conn    net.Conn
+	records *RecordConn // nil: the head's first byte is its first plaintext byte
 	timeout time.Duration
 }
 
 // start waits for the first byte of the next head, then sets the deadline.
+// With records, the deadline is set as soon as the first byte of the record
+// carrying the head arrives, while the record is still being decrypted.
 func (h headTimer) start(br *bufio.Reader) error {
 	if h.timeout <= 0 {
 		return nil
 	}
+	if h.records != nil && br.Buffered() == 0 {
+		h.records.arm(h.timeout)
+	}
 	if _, err := br.Peek(1); err != nil {
 		return err
 	}
-	_ = h.conn.SetReadDeadline(time.Now().Add(h.timeout))
+	// The head was already buffered, or the deadline was set when its
+	// record arrived.
+	if h.records == nil || !h.records.fired() {
+		_ = h.conn.SetReadDeadline(time.Now().Add(h.timeout))
+	}
 	return nil
 }
 
 func (h headTimer) stop() {
 	if h.timeout > 0 {
+		if h.records != nil {
+			h.records.disarm()
+		}
 		_ = h.conn.SetReadDeadline(time.Time{})
 	}
 }
+
+// RecordConn is the connection a client's TLS records arrive on. Armed, its
+// next read that receives bytes sets its read deadline, which is how a
+// request head is timed from the first byte of its record.
+type RecordConn struct {
+	net.Conn
+	mu      sync.Mutex
+	timeout time.Duration // nonzero while armed
+	set     bool          // the armed deadline was set
+}
+
+// WatchRecords wraps conn for Options.Records; pass the result to
+// tls.Server.
+func WatchRecords(conn net.Conn) *RecordConn { return &RecordConn{Conn: conn} }
+
+func (c *RecordConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		if c.timeout > 0 {
+			_ = c.SetReadDeadline(time.Now().Add(c.timeout))
+			c.timeout, c.set = 0, true
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+// arm sets the read deadline to timeout from the next bytes received.
+func (c *RecordConn) arm(timeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timeout, c.set = timeout, false
+}
+
+// fired reports whether the armed deadline was set, and disarms it.
+func (c *RecordConn) fired() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set := c.set
+	c.timeout, c.set = 0, false
+	return set
+}
+
+func (c *RecordConn) disarm() { _ = c.fired() }
 
 // wrap names a deadline error as a head that came too slowly.
 func (h headTimer) wrap(err error) error {
