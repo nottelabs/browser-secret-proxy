@@ -589,9 +589,9 @@ func (r *relay) clientLoop() error {
 			err = r.onPriorityUpdate(f)
 		case FramePushPromise:
 			return errors.New("client sent PUSH_PROMISE")
-		default:
-			// SETTINGS (and their ACKs), PING, GOAWAY and unknown frame
-			// types go upstream exactly as the client sent them.
+		case FrameSettings, FramePing, FrameGoAway:
+			// SETTINGS (and their ACKs), PING and GOAWAY go upstream exactly
+			// as the client sent them.
 			if f.Type == FrameSettings && f.Flags&FlagAck != 0 {
 				r.clientFrames.ack()
 				if err := r.applyClientAck(); err != nil {
@@ -607,6 +607,8 @@ func (r *relay) clientLoop() error {
 				r.serverFrames.sent(f.Payload)
 			}
 			err = r.writeServer(f)
+		default:
+			err = r.onUnknown(f)
 		}
 		if err != nil {
 			return err
@@ -859,6 +861,25 @@ func (r *relay) onPriorityUpdate(f Frame) error {
 	return r.writeServer(f)
 }
 
+// onUnknown forwards a client frame of an unknown or extension type. One on
+// stream 0 goes upstream as the client sent it. One on a stream goes under
+// that stream's server ID, as the client's ID may be another stream's
+// upstream; with no stream upstream for it (still buffering, closed or
+// idle), it is dropped, as RFC 9113 5.5 lets an endpoint do.
+func (r *relay) onUnknown(f Frame) error {
+	if f.Stream != 0 {
+		r.mu.Lock()
+		s := r.streams[f.Stream]
+		if s == nil || s.serverID == 0 {
+			r.mu.Unlock()
+			return nil
+		}
+		f.Stream = s.serverID
+		r.mu.Unlock()
+	}
+	return r.writeServer(f)
+}
+
 func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, block []byte) error {
 	// Every block is decoded, even for refused or closed streams, to keep the
 	// HPACK table in step with the client's encoder.
@@ -1023,14 +1044,16 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 }
 
 // requestHead returns a request's :method and the authorities it names
-// (:authority, host), refusing a malformed request (RFC 9113 8.2.1, 8.3.1)
+// (:authority, host), refusing a malformed request (RFC 9113 8.2.1, 8.3)
 // that a server could read differently from the relay: a field name with an
 // uppercase character, which the relay would not take for the framing field
-// it is ("Content-Length" would keep its length after a body swap), or more
+// it is ("Content-Length" would keep its length after a body swap); more
 // than one :authority or host, of which a server may use another than the
-// one checked, or a field value a server could split or read differently
-// (malformedValue). Session.CheckAuthority refuses a host that disagrees with
-// :authority.
+// one checked; or a pseudo-header that is repeated, unknown, or after a
+// regular field, which a server may read otherwise or not at all (with two
+// :method fields, the relay would take a POST for a CONNECT, whose response
+// it does not mask), or a malformed field value. Session.CheckAuthority
+// refuses a host that disagrees with :authority.
 //
 // It also refuses every CONNECT, an extended CONNECT (RFC 8441) for a
 // WebSocket included, any request with a :protocol, and more than one
@@ -1043,10 +1066,24 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // one.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
 	methodFields, authorityFields, hostFields, protocolFields, uppercase := 0, 0, 0, 0, ""
+	pseudo, badPseudo, regular := map[string]bool{}, "", false
 	malformed, hasMalformed := malformedValue(fields)
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
+		}
+		if !strings.HasPrefix(f.Name, ":") {
+			regular = true
+		} else if badPseudo == "" {
+			switch {
+			case !requestPseudo[f.Name]:
+				badPseudo = fmt.Sprintf("unknown pseudo-header %q", f.Name)
+			case pseudo[f.Name]:
+				badPseudo = "more than one " + f.Name + " field"
+			case regular:
+				badPseudo = f.Name + " after a regular field"
+			}
+			pseudo[f.Name] = true
 		}
 		switch f.Name {
 		case ":method":
@@ -1067,6 +1104,8 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
 	case authorityFields > 1 || hostFields > 1:
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
+	case badPseudo != "":
+		err = fmt.Errorf("%w: %s", scope.ErrRefused, badPseudo)
 	case methodFields > 1:
 		err = fmt.Errorf("%w: more than one :method field", scope.ErrRefused)
 	case strings.EqualFold(method, "CONNECT") || protocolFields > 0:
@@ -1076,6 +1115,10 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 	}
 	return method, authorities, err
 }
+
+// requestPseudo are the pseudo-headers a request may have (RFC 9113 8.3.1,
+// and :protocol for extended CONNECT, RFC 8441).
+var requestPseudo = map[string]bool{":method": true, ":scheme": true, ":authority": true, ":path": true, ":protocol": true}
 
 // malformedValue returns the name of the first field whose value RFC 9113
 // 8.2.1 forbids: one holding a NUL, CR or LF, which a server or a later

@@ -112,9 +112,10 @@ func TestInScopeValueIsSwapped(t *testing.T) {
 
 // A request whose fields a server could read as naming another host than
 // the CONNECT one, or whose framing it could read differently from the
-// relay, is malformed (RFC 9113 8.2.1, 8.3.1): it is answered 502, with or
+// relay, is malformed (RFC 9113 8.2.1, 8.3): it is answered 502, with or
 // without a stand-in, and nothing of it reaches the server. An uppercase
-// Content-Length would keep its length after a body swap.
+// Content-Length would keep its length after a body swap; a repeated,
+// unknown or misplaced pseudo-header could be read either way.
 func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 	withPath := func(path string, fields []hpack.HeaderField) []hpack.HeaderField {
 		fields[3].Value = path
@@ -135,7 +136,22 @@ func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
 			{Name: ":method", Value: "GET"}, {Name: ":authority", Value: "evil.test"}, {Name: ":authority", Value: "allowed.test"},
 			{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/?k=tok_standin"},
 		}},
-		"a second host":        {fields: request("GET", hpack.HeaderField{Name: "host", Value: "allowed.test"}, hpack.HeaderField{Name: "host", Value: "allowed.test"})},
+		"a second host": {fields: request("GET", hpack.HeaderField{Name: "host", Value: "allowed.test"}, hpack.HeaderField{Name: "host", Value: "allowed.test"})},
+		// A server reading the first :method would answer a POST, which the
+		// relay, reading the last, would take for a tunnel and not mask.
+		"a second :method": {fields: []hpack.HeaderField{
+			{Name: ":method", Value: "POST"}, {Name: ":method", Value: "CONNECT"}, {Name: ":authority", Value: "allowed.test"},
+			{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/?k=tok_standin"},
+		}},
+		"a second :path":           {fields: request("GET", hpack.HeaderField{Name: ":path", Value: "/?k=tok_standin"})},
+		"a second :scheme":         {fields: request("GET", hpack.HeaderField{Name: ":scheme", Value: "http"})},
+		"a second :protocol":       {fields: request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"}, hpack.HeaderField{Name: ":protocol", Value: "websocket"})},
+		"an unknown pseudo-header": {fields: request("GET", hpack.HeaderField{Name: ":token", Value: "tok_standin"})},
+		"a response pseudo-header": {fields: request("GET", hpack.HeaderField{Name: ":status", Value: "200"})},
+		"a pseudo-header after a regular field": {fields: []hpack.HeaderField{
+			{Name: ":method", Value: "GET"}, {Name: ":authority", Value: "allowed.test"}, {Name: ":scheme", Value: "https"},
+			{Name: "x-token", Value: "tok_standin"}, {Name: ":path", Value: "/"},
+		}},
 		"uppercase field name": {fields: request("GET", hpack.HeaderField{Name: "X-Token", Value: "tok_standin"})},
 		"uppercase Content-Length": {
 			fields: request("POST",

@@ -969,6 +969,28 @@ func TestPriorityNeverPointsAtTheWrongStream(t *testing.T) {
 	}
 }
 
+// A client frame of an unknown type on a stream goes upstream under that
+// stream's server ID, never under its client ID, which can be another
+// stream's server ID (RFC 9113 5.5). One for a stream with nothing upstream
+// (still buffering, closed, or idle) is dropped. One on stream 0 goes as is.
+func TestUnknownClientFramesFollowTheirStream(t *testing.T) {
+	h := newHarness(t, nil)
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)}) // buffering
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 3, Payload: h.clientBlock(request("GET")...)})
+	if f := h.expect(h.toServer, "server", isType(FrameHeaders)); f.Stream != 1 {
+		t.Fatalf("client stream 3 went upstream on %d, want 1", f.Stream)
+	}
+	frame := func(stream uint32, b byte) Frame { return Frame{Type: unknownType, Stream: stream, Payload: []byte{b}} }
+	h.clientSend(frame(1, 'a'), frame(3, 'b'), frame(101, 'c'), frame(0, 'd'))
+	for _, want := range []Frame{frame(1, 'b'), frame(0, 'd')} {
+		f := h.expect(h.toServer, "server", isType(unknownType))
+		if f.Stream != want.Stream || !bytes.Equal(f.Payload, want.Payload) {
+			t.Fatalf("server got %q on %d, want %q on %d", f.Payload, f.Stream, want.Payload, want.Stream)
+		}
+	}
+	h.quiet(h.toServer, 50*time.Millisecond, isType(unknownType))
+}
+
 // With a server limit of one concurrent stream, an upload that got its final
 // response early still counts upstream while its last bytes wait for credit;
 // the client's next request waits for that slot instead of passing the limit.

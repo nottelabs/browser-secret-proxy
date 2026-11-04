@@ -147,6 +147,14 @@ First release, planned as 0.1.0.
   memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value
   over 1 KiB ends the connection with `PROTOCOL_ERROR`. Before, one client
   could make the relay hold gigabytes on one connection.
+- Over HTTP/2, malformed messages no longer get past swapping or masking: a
+  request with a repeated, unknown or misplaced pseudo-header (two
+  `:method` fields made a `POST` look like a `CONNECT`, whose response is
+  not masked) is answered `502`; with masking on, response DATA before the
+  final head resets the stream, a real value in `content-length` is refused
+  with `502`, and trailers are masked with the values chosen at the head.
+  Client frames of unknown types go upstream under their stream's server
+  ID, or are dropped.
 - Real values with a line break or NUL are refused in every header, also
   when the client's header already holds such a byte (a NUL after a
   stand-in let a multi-line value through). Over HTTP/2, a request whose
