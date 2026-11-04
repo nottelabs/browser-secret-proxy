@@ -298,6 +298,7 @@ func newSealedFixture(t *testing.T, issuers int) *sealedFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(f.resolver.Close)
 	return f
 }
 

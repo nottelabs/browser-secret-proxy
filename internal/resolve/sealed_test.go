@@ -43,9 +43,14 @@ var testIssuer = func() ed25519.PrivateKey {
 
 const testAudience = "proxy-test"
 
-// testSealed is a Sealed resolver for key that trusts testIssuer.
-func testSealed(key *ecdsa.PrivateKey) (*Sealed, error) {
-	return NewSealed(SealedConfig{Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{testIssuer.Public()}, Audience: testAudience})
+// testSealed is a Sealed resolver for key that trusts testIssuer, closed
+// when the test ends so its expiry sweep stops.
+func testSealed(t *testing.T, key *ecdsa.PrivateKey) (*Sealed, error) {
+	s, err := NewSealed(SealedConfig{Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{testIssuer.Public()}, Audience: testAudience})
+	if err == nil {
+		t.Cleanup(s.Close)
+	}
+	return s, err
 }
 
 func seal(t *testing.T, key *ecdsa.PrivateKey, p SealedPayload) string {
@@ -69,7 +74,7 @@ func payload(exp time.Time) SealedPayload {
 
 func TestSealedAuthenticatesAndResolves(t *testing.T) {
 	key := ecKey(t)
-	s, err := testSealed(key)
+	s, err := testSealed(t, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +117,7 @@ func TestSealedAuthenticatesAndResolves(t *testing.T) {
 
 func TestSealedPrincipalFallsBackToTheUsername(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	p := payload(time.Now().Add(time.Hour))
 	p.Sub = ""
 	principal, err := s.Authenticate("proxy-user", seal(t, key, p))
@@ -131,7 +136,7 @@ func TestSealedPrincipalFallsBackToTheUsername(t *testing.T) {
 // another principal nor another cache entry.
 func TestSealedAcceptsOnlyTheCanonicalForm(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	token := seal(t, key, payload(time.Now().Add(time.Hour)))
 	parts := strings.Split(token, ".")
 	if len(parts) != 5 || parts[1] == "" {
@@ -182,7 +187,7 @@ func TestSealedAcceptsOnlyTheCanonicalForm(t *testing.T) {
 
 func TestSealedRefusesBadTokens(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	good := seal(t, key, payload(time.Now().Add(time.Hour)))
 
 	tamper := func(token string, part int) string {
@@ -246,7 +251,7 @@ func TestSealedRefusesBadTokens(t *testing.T) {
 
 func TestSealedTokenExpiresAfterConnect(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	token := seal(t, key, payload(now.Add(time.Minute)))
@@ -323,7 +328,7 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	if _, err := s.Authenticate("u", token); err != nil {
 		t.Fatalf("a token Seal accepted was refused: %v", err)
 	}
@@ -331,7 +336,7 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 
 func TestSealedCacheIsBoundedByExpiryTTLAndSize(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	cached := func() int {
@@ -392,7 +397,7 @@ func TestSealedCacheIsBoundedByExpiryTTLAndSize(t *testing.T) {
 // a sweep drops them, and leaves the ones whose time has not come.
 func TestSealedCacheIsSweptWhileIdle(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	defer s.Close()
 	s.sweepEvery = 10 * time.Millisecond
 	short := payload(time.Now().Add(time.Hour))
@@ -428,7 +433,7 @@ func TestSealedCacheIsSweptWhileIdle(t *testing.T) {
 // afterwards, without being kept.
 func TestSealedCloseStopsTheSweep(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	token := seal(t, key, payload(time.Now().Add(time.Hour)))
 	if _, err := s.Authenticate("u", token); err != nil {
 		t.Fatal(err)
@@ -447,7 +452,7 @@ func TestSealedCloseStopsTheSweep(t *testing.T) {
 
 func TestSealedViewFailsClosedOnExpiry(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
@@ -479,7 +484,7 @@ var (
 
 func TestSealedSnapshotIsTheView(t *testing.T) {
 	key := ecKey(t)
-	s, _ := testSealed(key)
+	s, _ := testSealed(t, key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
@@ -541,7 +546,7 @@ func signJWS(t *testing.T, alg jose.SignatureAlgorithm, issuer any, p SealedPayl
 
 func TestSealedRequiresASignatureAndTheAudience(t *testing.T) {
 	key := ecKey(t)
-	s, err := testSealed(key)
+	s, err := testSealed(t, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,6 +619,7 @@ func TestSealedIssuerKeyRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close)
 	for name, issuer := range map[string]crypto.Signer{"old EdDSA key": oldIssuer, "new ES256 key": newIssuer} {
 		token, err := Seal(&key.PublicKey, issuer, payload(time.Now().Add(time.Hour)))
 		if err != nil {
