@@ -90,3 +90,15 @@ First release, planned as 0.1.0.
   memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value
   over 1 KiB ends the connection with `PROTOCOL_ERROR`. Before, one client
   could make the relay hold gigabytes on one connection.
+
+### Changed
+
+- Behavior change: a `CONNECT` to an internal address is refused with `403`,
+  for tunneled and decrypted hosts alike. Internal means loopback, private,
+  link-local (`169.254.169.254` included), unspecified, multicast and
+  `100.64.0.0/10`, also in IPv4-mapped or IPv4-compatible form. The proxy
+  resolves a name once, refuses it when any of its addresses is internal,
+  and dials the addresses it checked. Through `-upstream-proxy`, only
+  IP-literal destinations are checked. `-allow-private-destinations` turns
+  the check off. Tunnels without decryption are logged at info level, with
+  their host, port and principal.

@@ -247,7 +247,8 @@ real value in the echo.
 | `-standin-pattern` | Regular expression (RE2) matching stand-ins. Repeatable. See [Finding stand-ins](#finding-stand-ins). |
 | `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
 | `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
-| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
+| `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. The parent resolves destination names, so only IP-literal destinations are checked against internal addresses. |
+| `-allow-private-destinations` | Let `CONNECT` reach loopback, private, link-local and other internal addresses (default `false`: they are refused with `403`). See [Security model](#security-model). |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty; a `SECRET_PROXY_PASSWORD` without it is refused at start. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
@@ -547,6 +548,19 @@ host.
   `502`, with or without stand-ins. Neither the client nor the log sees the
   real value or the resolver's error text; the log names only its kind
   (timeout, refused credential, error).
+- **Internal addresses are not reached.** A `CONNECT`, tunneled or
+  decrypted, to an internal address is answered `403` and nothing is
+  dialed. Internal means loopback, private (RFC 1918, `fc00::/7`),
+  link-local (`169.254.0.0/16`, where cloud metadata services live, and
+  `fe80::/10`), unspecified (`0.0.0.0/8`, `::`), multicast and shared
+  (`100.64.0.0/10`), also in IPv4-mapped (`::ffff:127.0.0.1`) or
+  IPv4-compatible (`::127.0.0.1`) form. The proxy resolves a name once,
+  refuses it when any of its addresses is internal, and connects to the
+  addresses it checked, never to the name, so a second DNS answer cannot
+  redirect the connection. The name still goes in SNI and `Host`. A host
+  that ends in a number but is not a standard IP address (`127.1`,
+  `2130706433`) is refused too. `-allow-private-destinations` turns this
+  check off.
 - **One version per request.** A resolver whose values change (a reloaded
   file) gives each request one version, for finding its stand-ins and for
   looking them up.
@@ -571,6 +585,13 @@ host.
 - **Responses** are masked for known forms of the values only: see
   [what masking misses](#what-masking-misses).
 - **WebSockets** and other upgraded connections get no swaps once upgraded.
+- **Which public hosts are reached.** The allowlist decides what is
+  decrypted, not where a client may connect: a client that passes
+  authentication can tunnel to any public host and port.
+- **Internal addresses behind a parent proxy.** With `-upstream-proxy`, the
+  parent resolves destination names, so the proxy checks only destinations
+  given as IP addresses. A name that resolves to an internal address is
+  passed on: restrict what the parent can reach.
 
 ## Exposing the proxy
 
@@ -584,6 +605,13 @@ host.
   balancer, stunnel, or a reverse proxy in TCP mode) and give clients the
   `https://` address.
 - **Network.** Restrict inbound access to the clients that need it.
+- **Egress.** Whoever holds the proxy credential, a Notte session included,
+  can open tunnels from your network to any public host and port. Internal
+  addresses are refused (see [Security model](#security-model)). Set
+  `-allow-private-destinations` only when an allowlisted host is internal,
+  and then firewall what the proxy host can reach. Every tunnel is logged at
+  info level with its host, port and principal, and every refusal at warn
+  level.
 
 ## Response masking
 

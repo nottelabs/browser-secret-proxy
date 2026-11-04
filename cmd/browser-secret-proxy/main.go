@@ -39,6 +39,7 @@ func run() error {
 	resolverOpts := registerResolverFlags(flag.CommandLine)
 	parent := flag.String("upstream-proxy", os.Getenv("SECRET_PROXY_UPSTREAM"), "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
 	maskResponses := flag.Bool("mask-responses", true, "replace real values with their stand-ins in responses from allowlisted hosts")
+	allowPrivate := flag.Bool("allow-private-destinations", false, "let CONNECT reach loopback, private, link-local and other internal addresses")
 	verbose := flag.Bool("v", false, "debug logging")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -98,6 +99,10 @@ func run() error {
 		Logger:         logger,
 		// Real values in responses are replaced by their stand-ins.
 		MaskResponses: *maskResponses,
+		// Internal destinations are refused unless allowed. A parent proxy
+		// resolves names itself, so only IP literals are checked then.
+		AllowPrivateDestinations: *allowPrivate,
+		ParentProxy:              parentURL != nil,
 	})
 	if err != nil {
 		return err
@@ -109,7 +114,7 @@ func run() error {
 	parentDescription := describeParent(parentURL)
 	attrs := append([]any{"address", ln.Addr().String(), "hosts", *hosts}, values.logAttrs...)
 	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed",
-		"mask_responses", *maskResponses)
+		"mask_responses", *maskResponses, "allow_private_destinations", *allowPrivate)
 	logger.Info("listening", attrs...)
 
 	ctx, cancel := context.WithCancel(context.Background())
