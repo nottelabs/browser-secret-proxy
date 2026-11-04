@@ -96,9 +96,8 @@ session for each:
 | `masking` | The capture server receives the real value and sends it back; the page sees the stand-in, and the proxy log shows the swap |
 | `not-allowlisted` | `httpbingo.org`, outside the session's secret proxy hosts, receives the stand-ins unchanged |
 
-`password-json` runs on the `file` resolver because stand-in patterns and
-prefixes match the raw request text, so the `http` resolver would not find a
-stand-in written with escapes. The program prints a PASS or FAIL line per
+`password-json` and `masking` run on the second proxy, which uses the `file`
+resolver, so both resolver modes are covered. The program prints a PASS or FAIL line per
 scenario and exits non-zero when one fails.
 
 The E2E workflow runs it against Notte staging on pull requests from this

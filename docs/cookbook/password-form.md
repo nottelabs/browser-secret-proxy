@@ -55,17 +55,26 @@ The real password is query-escaped into the form body: a password with
 `&`, `=`, `+`, `%`, spaces or quotes arrives as the same characters,
 never as extra fields.
 
-For per-session passwords from a vault, use the
-[`http` resolver](../resolvers.md#http) with `-standin-prefixes pw_,user_`
-and a `hosts` list of `["login.example.com"]` on each value. In `http` and
-`sealed` modes the proxy finds stand-ins in the raw request text, and a
-prefix match stops at the first character other than a letter, digit, `_`
-or `-`. Use stand-ins made only of those characters there, such as
-`user_acme_ops_1`. An email-shaped stand-in does not work in these modes:
-the prefix match stops at `@`, and a form body sends `@` as `%40`, so a
-`-standin-pattern` for the full address does not match it either. If the
-username field only accepts an email address, keep that value in `file`
-mode, which also matches the escaped forms of its keys.
+For per-session values from a vault, use the
+[`http` resolver](../resolvers.md#http) or [`sealed` tokens](../resolvers.md#sealed),
+with a `hosts` list of `["login.example.com"]` on each value. The proxy
+looks for stand-ins in the request as sent and after query, path and JSON
+decoding, so a form body that sends `@` as `%40` still matches:
+
+- `sealed` finds the token's keys in all those forms, email-shaped ones
+  included.
+- In `http` mode, a prefix stops at the first character other than a
+  letter, digit, `_` or `-`, so `-standin-prefixes user_` would find only
+  `user_acme_ops_1` in `user_acme_ops_1@standin.example`. For an
+  email-shaped stand-in, match the whole address with a pattern instead,
+  and keep its prefix out of `-standin-prefixes`: a partial match is
+  looked up too, and the resolver refuses it.
+
+```sh
+  -resolver http ... \
+  -standin-prefixes pw_ \
+  -standin-pattern 'user_[a-z0-9_]+@standin\.example'
+```
 
 ## Browser side
 
