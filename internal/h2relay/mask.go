@@ -592,7 +592,8 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 	// HTTP/1.1 upgrade. A refused one has an ordinary body, masked like any
 	// other.
 	tunnel := method == "CONNECT" && len(status) == 3 && status[0] == '2'
-	bodiless := method == "HEAD" || status == "204" || status == "304"
+	// A 2xx to CONNECT, 204 included, is a tunnel: its DATA is the tunnel's.
+	bodiless := !tunnel && (method == "HEAD" || status == "204" || status == "304")
 	plan := respPlan{
 		body:     !ends && !tunnel && !bodiless,
 		bodiless: bodiless,
@@ -745,11 +746,15 @@ func (r *relay) onServerDataMasked(f Frame) error {
 // resetMalformed ends a masked stream whose response has content in DATA
 // though its head says it has none (a HEAD, 204 or 304): malformed (RFC 9113
 // 8.1.1), and never masked, so its content is not passed on. Both sides get
-// RST_STREAM; the server is credited the n bytes the relay dropped.
+// RST_STREAM; the server is credited the n bytes the relay dropped. The
+// client stops sending once reset, so the request ends here too, even when
+// the server already ended the stream: one still uploading (a CONNECT) would
+// otherwise keep its stream slot, and the server's stream is reset as well.
 func (r *relay) resetMalformed(s *stream, rs *respState, n int, serverDone bool) error {
 	r.opts.Logger.Warn("resetting a response with content it cannot have", "stream", s.clientID)
 	r.mu.Lock()
 	r.endRespLocked(rs)
+	uploading := !s.sentEnd
 	if !serverDone {
 		if r.streams[s.clientID] == s {
 			r.dropLocked(s)
@@ -764,8 +769,10 @@ func (r *relay) resetMalformed(s *stream, rs *respState, n int, serverDone bool)
 		return err
 	}
 	if serverDone {
-		r.serverEnded(s, false)
-		return nil
+		r.serverEnded(s, true)
+		if !uploading {
+			return nil // both sides ended: the stream is closed
+		}
 	}
 	return r.writeServer(Frame{Type: FrameRSTStream, Stream: s.serverID, Payload: binary.BigEndian.AppendUint32(nil, errCodeProtocol)})
 }
