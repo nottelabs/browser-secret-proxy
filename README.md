@@ -886,6 +886,12 @@ return.
   connection. Streams the proxy resets or refuses because of the client's
   own frames count too: a window over 2^31-1, trailers or data past the
   buffer budget, a frame after the client ended the stream.
+- An HTTP/2 client must send its connection preface within 10 seconds of the
+  TLS handshake, and acknowledge each `SETTINGS` frame within 10 seconds of
+  receiving it. Otherwise the connection ends, with `GOAWAY` and
+  `SETTINGS_TIMEOUT` for a missing acknowledgement. A destination that
+  leaves a response header block unfinished (waiting for `CONTINUATION`)
+  for 10 seconds ends the connection too. These timeouts have no flag.
 - An HTTP/2 frame longer than the `SETTINGS_MAX_FRAME_SIZE` its sender was
   told ends the connection with `FRAME_SIZE_ERROR`, from the client or the
   destination. A `PRIORITY_UPDATE` value over 1 KiB ends it with

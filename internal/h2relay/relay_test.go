@@ -56,6 +56,14 @@ func newHarnessWith(t *testing.T, mutate func(*Options), setup func(*relay)) *ha
 // from the server yet.
 func newRawHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *harness {
 	t.Helper()
+	h := newSilentHarness(t, mutate, setup)
+	h.write(h.client, []byte(Preface))
+	return h
+}
+
+// newSilentHarness starts the relay with nothing sent from either side.
+func newSilentHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *harness {
+	t.Helper()
 	hosts, err := hostmatch.New([]string{"allowed.test"})
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +119,6 @@ func newRawHarness(t *testing.T, mutate func(*Options), setup func(*relay)) *har
 			t.Error("relay did not stop")
 		}
 	})
-	h.write(h.client, []byte(Preface))
 	return h
 }
 
