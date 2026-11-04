@@ -130,6 +130,8 @@ curl --proxy http://127.0.0.1:8080 --cacert ca.pem \
 | `-resolver-timeout` | `http` mode: timeout of one lookup, connection included (default `2s`). |
 | `-resolver-cache-ttl` | `http` mode: longest a looked-up value is kept in memory (default `1m`, `0` no cache). |
 | `-sealed-key` | `sealed` mode: PEM EC private key (P-256, P-384 or P-521) that proxy passwords are sealed to. Several keys in the file are all accepted. |
+| `-sealed-issuer-key` | `sealed` mode: PEM public key (Ed25519 or P-256) of an issuer allowed to sign tokens. Repeatable; required. |
+| `-sealed-audience` | `sealed` mode: this proxy's identity. A token's `aud` must contain it. Required. |
 | `-standin-pattern` | Regular expression (RE2) matching stand-ins. Repeatable. See [Finding stand-ins](#finding-stand-ins). |
 | `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
 | `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
@@ -166,7 +168,7 @@ or has expired, the request is answered `502` and nothing of it is sent.
 | --- | --- | --- |
 | `file` | A JSON file on the proxy's host, reloaded when it changes. | A secret manager can write a file next to the proxy: Vault Agent templates, the Kubernetes Secrets Store CSI driver, a Kubernetes Secret volume. The simplest setup, with no extra service. |
 | `http` | Your own detokenize service, asked over mutual TLS. | Values are issued per user or per session, change often, or must be checked and audited by a service you already run. |
-| `sealed` | The proxy password itself, encrypted to the proxy's key. | You want no lookup service and no storage to provision: whoever starts the session seals the values it needs and hands the token over as the proxy password. |
+| `sealed` | The proxy password itself: signed by your issuer, encrypted to the proxy's key. | You want no lookup service and no storage to provision: whoever starts the session seals the values it needs and hands the token over as the proxy password. |
 
 ### file
 
@@ -238,56 +240,90 @@ go run ./examples/http-resolver -cert server.pem -key server.key \
 
 ### sealed
 
+Two key pairs: the proxy's (tokens are encrypted to it) and the issuer's
+(tokens are signed with it). The issuer is the system that creates tokens,
+next to where the real values live; only its public key goes to the proxy.
+
 ```sh
+# Proxy key: the proxy keeps the private key, issuers get the public one.
 openssl ecparam -name prime256v1 -genkey -noout -out sealed.key
 openssl ec -in sealed.key -pubout -out sealed-public.pem
-chmod 600 sealed.key
+# Issuer key (Ed25519; a P-256 key with ES256 works too): the issuer keeps
+# the private key, the proxy gets the public one.
+openssl genpkey -algorithm ed25519 -out issuer.key
+openssl pkey -in issuer.key -pubout -out issuer-public.pem
+chmod 600 sealed.key issuer.key
 
 browser-secret-proxy -ca-cert ca.pem -ca-key ca.key -hosts api.example.com \
-  -resolver sealed -sealed-key sealed.key
+  -resolver sealed -sealed-key sealed.key \
+  -sealed-issuer-key issuer-public.pem -sealed-audience proxy-eu-1
 ```
 
-The proxy password is a compact JWE encrypted to the proxy's public key
-(`ECDH-ES+A256KW` key agreement, `A256GCM` content encryption; no other
-algorithm is accepted). Its payload carries the values:
+The proxy password is a nested JWT (RFC 7519, section 5.2): the issuer signs
+the claims as a JWS (`EdDSA` with an Ed25519 key, or `ES256` with a P-256
+key), then encrypts that JWS as a compact JWE to the proxy's public key
+(`ECDH-ES+A256KW`, `A256GCM`, `cty` `JWT`). No other algorithm is accepted.
+The signed claims carry the values:
 
 ```json
-{"values": {"tok_standin_123": "<real API token>"}, "hosts": ["api.example.com"], "exp": 1767366245, "sub": "session-42"}
+{"values": {"tok_standin_123": "<real API token>"}, "hosts": ["api.example.com"], "aud": "proxy-eu-1", "exp": 1767366245, "iat": 1767362645, "sub": "session-42"}
 ```
 
+- `aud` is required and must contain the proxy's `-sealed-audience`.
 - `exp` (Unix seconds) is required. An expired token is refused, and a
   connection that outlives its token stops swapping.
+- `nbf` and `iat` (optional, Unix seconds): a token is refused before
+  `nbf`, or when `iat` is in the future, beyond 30 seconds of clock skew.
 - `hosts` (optional) restricts every value of the token to those hosts.
 - `sub` (optional) names the principal in logs; the username is used when it
   is empty.
 
-The proxy decrypts the token on every `CONNECT`: that both admits the client
-and gives the values, with no lookup service and no external storage. A
-token that does not decrypt with the proxy's key, was altered, or has
-expired gets `407`. A connection whose token expires while it is open gets
+The proxy opens the token on every `CONNECT`: it decrypts it, verifies the
+signature against the `-sealed-issuer-key` keys, then checks the claims.
+That both admits the client and gives the values, with no lookup service
+and no external storage. A token that does not decrypt with the proxy's
+key, is not signed by a configured issuer key, was altered, is for another
+audience, or has expired gets `407`. So does a token in the earlier
+encrypt-only format. A connection whose token expires while it is open gets
 `502` for every later request to an allowlisted host, whether or not the
 request holds a stand-in.
+
+What each layer gives:
+
+- **Encryption** keeps the values from everyone but the proxy: the browser,
+  the agent and Notte only ever hold an opaque token.
+- **The signature** proves that a configured issuer made the token. The
+  proxy's public key alone no longer lets anyone create tokens the proxy
+  accepts, so it can be shared freely.
+- **The audience** binds the token to one proxy: a token made for
+  `proxy-eu-1` is refused by a proxy configured as `proxy-us-1`, even when
+  both trust the same issuer and share an encryption key.
+
+The token is still a bearer credential: whoever holds it can use its values
+through the proxy until `exp`. Give tokens a short `exp`, and keep the
+issuer's private key where the real values already are.
 
 Decrypted tokens, real values included, are kept in memory so each request
 does not decrypt again: at most 256 tokens, each until the earlier of its
 `exp` and 5 minutes after it was decrypted. Nothing is written to disk.
 The token's own stand-ins are what the proxy looks for, so no pattern is
-needed. To rotate the key, put the new and the old key in the `-sealed-key`
-file until the old tokens have expired.
+needed.
 
-A token proves only that it was made for this proxy, not who made it: anyone
-who holds the public key can seal values of their own and use the proxy
-with them on the `-hosts` allowlist. That gives them nothing they did not
-already have (a token cannot reveal another token's values), but it is
-access to the proxy, so share the public key only with the systems that
-create tokens and restrict who can reach the proxy (see
-[Exposing the proxy](#exposing-the-proxy)). The token is as sensitive as the
-values it carries: create tokens where the real values already are, and give
-them a short `exp`. For testing,
-[`examples/seal`](examples/seal) seals a payload file:
+Key rotation:
+
+- **Issuer keys:** give `-sealed-issuer-key` once per key (or several PUBLIC
+  KEY blocks in one file). Add the new key, switch the issuer to it, and
+  remove the old key once its tokens have expired.
+- **The proxy's key:** put the new and the old private key in the
+  `-sealed-key` file, give issuers the new public key, and remove the old
+  key once the tokens encrypted to it have expired.
+
+For testing, [`examples/seal`](examples/seal) signs and seals a payload
+file:
 
 ```sh
-go run ./examples/seal -public-key sealed-public.pem -ttl 1h payload.json
+go run ./examples/seal -public-key sealed-public.pem -issuer-key issuer.key \
+  -audience proxy-eu-1 -ttl 1h payload.json
 ```
 
 ### Finding stand-ins

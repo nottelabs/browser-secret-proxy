@@ -36,11 +36,16 @@ First release, planned as 0.1.0.
     request, with a timeout (`-resolver-timeout`) and an in-memory cache per
     principal, host and stand-in. A reference service is in
     `examples/http-resolver`.
-  - `sealed`: the proxy password is a JWE (ECDH-ES+A256KW, A256GCM) sealed
-    to the proxy's key that carries the values, so no lookup service or
-    external storage is needed. Decrypted tokens stay in memory until their
-    `exp`, at most 5 minutes. Invalid or expired tokens get `407`, and a
-    connection whose token expires gets `502`. `examples/seal` creates
-    tokens.
+  - `sealed`: the proxy password is a nested JWT that carries the values,
+    so no lookup service or external storage is needed. It is signed by an
+    issuer key the proxy trusts (`-sealed-issuer-key`, EdDSA or ES256,
+    repeatable for rotation), then encrypted to the proxy's key (JWE,
+    ECDH-ES+A256KW, A256GCM), and its `aud` must name the proxy
+    (`-sealed-audience`), so a token cannot be forged with the proxy's
+    public key or replayed on another proxy. Decrypted tokens stay in memory
+    until their `exp`, at most 5 minutes. Unsigned, wrongly signed, foreign,
+    wrong-audience or expired tokens get `407`, and a connection whose token
+    expires gets `502`. `examples/seal` signs and seals tokens. Tokens in
+    the earlier encrypt-only format, from before this release, are refused.
 - Stand-in detection by pattern (`-standin-pattern`, `-standin-prefixes`),
   with an optional Luhn check for card-like stand-ins (`-standin-luhn`).

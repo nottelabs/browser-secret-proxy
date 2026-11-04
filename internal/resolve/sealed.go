@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
@@ -12,46 +14,68 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 )
 
-// The only algorithms a sealed token may use.
+// The only algorithms a sealed token may use: the outer JWE, and the JWS it
+// carries.
 var (
-	sealedKeyAlgorithms = []jose.KeyAlgorithm{jose.ECDH_ES_A256KW}
-	sealedEncryption    = []jose.ContentEncryption{jose.A256GCM}
+	sealedKeyAlgorithms       = []jose.KeyAlgorithm{jose.ECDH_ES_A256KW}
+	sealedEncryption          = []jose.ContentEncryption{jose.A256GCM}
+	sealedSignatureAlgorithms = []jose.SignatureAlgorithm{jose.EdDSA, jose.ES256}
 )
+
+// sealedClockSkew is how far the issuer's clock may be ahead of the proxy's
+// for nbf and iat. exp gets no leeway.
+const sealedClockSkew = 30 * time.Second
 
 // maxSealedToken caps a token before it is parsed.
 const maxSealedToken = 32 << 10
 
-// SealedPayload is what a sealed token carries.
+// SealedPayload is what a sealed token carries: the claims the issuer
+// signs.
 type SealedPayload struct {
 	// Values maps each stand-in to its real value.
 	Values map[string]string `json:"values"`
 	// Hosts the values may be sent to; empty means the proxy's -hosts.
 	Hosts []string `json:"hosts,omitempty"`
+	// Aud names the proxies the token is for; it must contain the proxy's
+	// configured audience. Required.
+	Aud jwt.Audience `json:"aud"`
 	// Exp is the expiry, in Unix seconds. Required.
 	Exp int64 `json:"exp"`
+	// Nbf and Iat, in Unix seconds, are optional: a token is refused before
+	// nbf, or when iat is in the future, beyond sealedClockSkew.
+	Nbf int64 `json:"nbf,omitempty"`
+	Iat int64 `json:"iat,omitempty"`
 	// Sub names the principal (logged and passed as its ID).
 	Sub string `json:"sub,omitempty"`
 }
 
-// Sealed resolves stand-ins from the proxy credential itself: the Basic
-// password is a compact JWE (ECDH-ES+A256KW, A256GCM) encrypted to the
-// proxy's key, whose payload is a SealedPayload. Decrypting it at CONNECT
-// both admits the client and yields the values, with no lookup service and
-// no external storage. An expired, tampered or foreign token is refused with
+// Sealed resolves stand-ins from the proxy credential itself. The Basic
+// password is a nested JWT (RFC 7519 section 5.2): the issuer signs a
+// SealedPayload as a JWS (EdDSA or ES256), then encrypts that JWS as a
+// compact JWE (ECDH-ES+A256KW, A256GCM, cty "JWT") to the proxy's key.
+// Opening it at CONNECT both admits the client and yields the values, with
+// no lookup service and no external storage. The encryption keeps the values
+// from anyone but the proxy; the signature proves a configured issuer made
+// the token; the audience keeps a token for one proxy from working on
+// another. A token that fails any of these, or has expired, is refused with
 // 407.
 //
 // Decrypted tokens, real values included, are kept in memory so a request
 // does not pay an ECDH per lookup: at most maxSealedCache of them, each
 // until the earlier of its exp and sealedCacheTTL after it was decrypted.
 type Sealed struct {
-	keys []crypto.PrivateKey
-	now  func() time.Time
+	keys       []crypto.PrivateKey // decrypt tokens
+	issuerKeys []crypto.PublicKey  // verify their signature
+	audience   string
+	now        func() time.Time
 
 	mu    sync.Mutex
 	cache map[[sha256.Size]byte]*sealedEntry // decrypted tokens, by hash
@@ -72,10 +96,23 @@ const (
 	sealedCacheTTL = 5 * time.Minute
 )
 
-// LoadSealed reads the proxy's private key: a PEM file with one or more EC
-// keys (P-256, P-384 or P-521; PKCS #8 or SEC 1). With several, a token
-// encrypted to any of them is accepted, so keys can be rotated.
-func LoadSealed(keyFile string) (*Sealed, error) {
+// SealedConfig configures a Sealed resolver.
+type SealedConfig struct {
+	// Keys decrypt tokens: EC private keys (P-256, P-384 or P-521). A token
+	// encrypted to any of them is accepted, so keys can be rotated.
+	Keys []crypto.PrivateKey
+	// IssuerKeys verify the token's signature: Ed25519 (EdDSA) or P-256
+	// (ES256) public keys. A token signed by any of them is accepted, so
+	// issuer keys can be rotated.
+	IssuerKeys []crypto.PublicKey
+	// Audience is this proxy's identity: a token's aud must contain it.
+	Audience string
+}
+
+// LoadSealed reads the proxy's private keys (keyFile: one or more EC keys,
+// PKCS #8 or SEC 1) and the issuers' public keys (each file: one or more
+// PKIX PUBLIC KEY blocks).
+func LoadSealed(keyFile string, issuerKeyFiles []string, audience string) (*Sealed, error) {
 	data, err := os.ReadFile(keyFile)
 	if err != nil {
 		return nil, err
@@ -98,7 +135,42 @@ func LoadSealed(keyFile string) (*Sealed, error) {
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("%s: no EC private key", keyFile)
 	}
-	return NewSealed(keys...)
+	var issuerKeys []crypto.PublicKey
+	for _, file := range issuerKeyFiles {
+		found, err := loadIssuerKeys(file)
+		if err != nil {
+			return nil, err
+		}
+		issuerKeys = append(issuerKeys, found...)
+	}
+	return NewSealed(SealedConfig{Keys: keys, IssuerKeys: issuerKeys, Audience: audience})
+}
+
+func loadIssuerKeys(file string) ([]crypto.PublicKey, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	var keys []crypto.PublicKey
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type != "PUBLIC KEY" {
+			return nil, fmt.Errorf("%s: unexpected PEM block %q, want PUBLIC KEY", file, block.Type)
+		}
+		key, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", file, err)
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%s: no PUBLIC KEY", file)
+	}
+	return keys, nil
 }
 
 func parseECKey(block *pem.Block) (crypto.PrivateKey, error) {
@@ -121,12 +193,44 @@ func parseECKey(block *pem.Block) (crypto.PrivateKey, error) {
 	return nil, fmt.Errorf("unexpected PEM block %q", block.Type)
 }
 
-// NewSealed builds a Sealed resolver from private keys.
-func NewSealed(keys ...crypto.PrivateKey) (*Sealed, error) {
-	if len(keys) == 0 {
-		return nil, errors.New("no private key")
+// signingAlgorithm is the JWS algorithm a sealed token uses with key, which
+// is an issuer's private or public key.
+func signingAlgorithm(key any) (jose.SignatureAlgorithm, error) {
+	switch k := key.(type) {
+	case ed25519.PrivateKey, ed25519.PublicKey:
+		return jose.EdDSA, nil
+	case *ecdsa.PrivateKey:
+		if k.Curve == elliptic.P256() {
+			return jose.ES256, nil
+		}
+	case *ecdsa.PublicKey:
+		if k.Curve == elliptic.P256() {
+			return jose.ES256, nil
+		}
 	}
-	return &Sealed{keys: keys, now: time.Now, cache: map[[sha256.Size]byte]*sealedEntry{}}, nil
+	return "", errors.New("an issuer key must be Ed25519 (EdDSA) or P-256 (ES256)")
+}
+
+// NewSealed builds a Sealed resolver.
+func NewSealed(cfg SealedConfig) (*Sealed, error) {
+	if len(cfg.Keys) == 0 {
+		return nil, errors.New("no private key to decrypt sealed tokens")
+	}
+	if len(cfg.IssuerKeys) == 0 {
+		return nil, errors.New("no issuer key to verify sealed tokens")
+	}
+	for _, key := range cfg.IssuerKeys {
+		if _, err := signingAlgorithm(key); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Audience == "" {
+		return nil, errors.New("no audience: a sealed token's aud must name this proxy")
+	}
+	return &Sealed{
+		keys: cfg.Keys, issuerKeys: cfg.IssuerKeys, audience: cfg.Audience,
+		now: time.Now, cache: map[[sha256.Size]byte]*sealedEntry{},
+	}, nil
 }
 
 // Authenticate decrypts the token in password. The principal's ID is the
@@ -213,7 +317,7 @@ func (s *Sealed) open(token string) (*sealedEntry, error) {
 	s.mu.Unlock()
 	if !ok {
 		var err error
-		if e, err = s.decrypt(token); err != nil {
+		if e, err = s.decrypt(token, now); err != nil {
 			return nil, err
 		}
 		e.until = e.expires
@@ -249,28 +353,57 @@ func (s *Sealed) store(sum [sha256.Size]byte, e *sealedEntry, now time.Time) {
 	s.cache[sum] = e
 }
 
-func (s *Sealed) decrypt(token string) (*sealedEntry, error) {
-	obj, err := jose.ParseEncryptedCompact(token, sealedKeyAlgorithms, sealedEncryption)
+// decrypt opens a token: decrypts it, verifies its signature, then checks
+// its claims at now.
+func (s *Sealed) decrypt(token string, now time.Time) (*sealedEntry, error) {
+	// go-jose's jwt package refuses asymmetric key encryption for JWTs, so
+	// the nesting (RFC 7519 section 5.2) is done with its JWE and JWS
+	// primitives: decrypt, require cty JWT, then verify the JWS inside.
+	encrypted, err := jose.ParseEncryptedCompact(token, sealedKeyAlgorithms, sealedEncryption)
 	if err != nil {
-		return nil, fmt.Errorf("%w: not a sealed token (compact JWE, ECDH-ES+A256KW, A256GCM)", ErrUnauthenticated)
+		return nil, fmt.Errorf("%w: not a sealed token (a compact JWE with ECDH-ES+A256KW and A256GCM)", ErrUnauthenticated)
 	}
-	var plaintext []byte
+	if cty, _ := encrypted.Header.ExtraHeaders[jose.HeaderContentType].(string); !strings.EqualFold(cty, "JWT") {
+		return nil, fmt.Errorf("%w: the sealed token is not a nested JWT (cty JWT): it must be signed, then encrypted", ErrUnauthenticated)
+	}
+	var inner []byte
 	for _, key := range s.keys {
-		if plaintext, err = obj.Decrypt(key); err == nil {
+		if inner, err = encrypted.Decrypt(key); err == nil {
 			break
 		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: the sealed token does not decrypt with the proxy's key", ErrUnauthenticated)
 	}
+	signed, err := jose.ParseSignedCompact(string(inner), sealedSignatureAlgorithms)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the sealed token does not hold a JWS signed with EdDSA or ES256", ErrUnauthenticated)
+	}
+	var claims []byte
+	for _, key := range s.issuerKeys {
+		if claims, err = signed.Verify(key); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: the sealed token is not signed by a configured issuer key", ErrUnauthenticated)
+	}
 	var payload SealedPayload
-	if err := json.Unmarshal(plaintext, &payload); err != nil {
-		return nil, fmt.Errorf("%w: the sealed token's payload is not the expected JSON", ErrUnauthenticated)
+	if err := json.Unmarshal(claims, &payload); err != nil {
+		return nil, fmt.Errorf("%w: the sealed token's claims are not the expected JSON", ErrUnauthenticated)
 	}
-	if payload.Exp <= 0 {
+	switch {
+	case payload.Exp <= 0:
 		return nil, fmt.Errorf("%w: the sealed token has no exp", ErrUnauthenticated)
-	}
-	if len(payload.Values) == 0 {
+	case len(payload.Aud) == 0:
+		return nil, fmt.Errorf("%w: the sealed token has no aud", ErrUnauthenticated)
+	case !payload.Aud.Contains(s.audience):
+		return nil, fmt.Errorf("%w: the sealed token is for another audience", ErrUnauthenticated)
+	case payload.Nbf > 0 && now.Add(sealedClockSkew).Before(time.Unix(payload.Nbf, 0)):
+		return nil, fmt.Errorf("%w: the sealed token is not valid yet (nbf)", ErrUnauthenticated)
+	case payload.Iat > 0 && now.Add(sealedClockSkew).Before(time.Unix(payload.Iat, 0)):
+		return nil, fmt.Errorf("%w: the sealed token was issued in the future (iat)", ErrUnauthenticated)
+	case len(payload.Values) == 0:
 		return nil, fmt.Errorf("%w: the sealed token holds no values", ErrUnauthenticated)
 	}
 	e := &sealedEntry{payload: &payload, expires: time.Unix(payload.Exp, 0)}
@@ -284,22 +417,40 @@ func (s *Sealed) decrypt(token string) (*sealedEntry, error) {
 	return e, nil
 }
 
-// Seal encrypts a payload to a proxy's public key, as the proxy expects. It
-// refuses a token longer than the proxy accepts.
-func Seal(key crypto.PublicKey, payload SealedPayload) (string, error) {
-	plaintext, err := json.Marshal(payload)
+// Seal makes a sealed token: it signs payload with the issuer's private key
+// (Ed25519 for EdDSA, or P-256 for ES256), then encrypts the signed JWT to
+// the proxy's public key. It refuses a token longer than the proxy accepts.
+func Seal(proxyKey crypto.PublicKey, issuerKey crypto.Signer, payload SealedPayload) (string, error) {
+	alg, err := signingAlgorithm(issuerKey)
 	if err != nil {
 		return "", err
 	}
-	enc, err := jose.NewEncrypter(jose.A256GCM, jose.Recipient{Algorithm: jose.ECDH_ES_A256KW, Key: key}, nil)
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: alg, Key: issuerKey}, (&jose.SignerOptions{}).WithType("JWT"))
 	if err != nil {
 		return "", err
 	}
-	obj, err := enc.Encrypt(plaintext)
+	claims, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
-	token, err := obj.CompactSerialize()
+	signed, err := signer.Sign(claims)
+	if err != nil {
+		return "", err
+	}
+	jws, err := signed.CompactSerialize()
+	if err != nil {
+		return "", err
+	}
+	encrypter, err := jose.NewEncrypter(jose.A256GCM, jose.Recipient{Algorithm: jose.ECDH_ES_A256KW, Key: proxyKey},
+		(&jose.EncrypterOptions{}).WithContentType("JWT"))
+	if err != nil {
+		return "", err
+	}
+	encrypted, err := encrypter.Encrypt([]byte(jws))
+	if err != nil {
+		return "", err
+	}
+	token, err := encrypted.CompactSerialize()
 	if err != nil {
 		return "", err
 	}
