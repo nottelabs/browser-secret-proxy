@@ -95,6 +95,7 @@ const (
 	errCodeStreamClosed  = 0x5
 	errCodeInternal      = 0x2
 	errCodeFlowControl   = 0x3
+	errCodeFrameSize     = 0x6
 	errCodeRefusedStream = 0x7
 	errCodeCancel        = 0x8
 	errCodeCalm          = 0xb // ENHANCE_YOUR_CALM
@@ -105,6 +106,9 @@ const (
 	maxResetStreams = 1024
 	// maxUnackedSettings bounds server SETTINGS frames awaiting the client's ACK.
 	maxUnackedSettings = 64
+	// maxPriorityValue caps the Priority Field Value of a PRIORITY_UPDATE
+	// frame. RFC 9218 values are a few bytes ("u=3, i").
+	maxPriorityValue = 1024
 )
 
 type relay struct {
@@ -125,6 +129,10 @@ type relay struct {
 	// streamErrors counts the client's stream errors (frames on a stream it
 	// ended); past maxStreamErrors they end the connection. clientLoop only.
 	streamErrors int
+	// The largest frame each side may send: the client, what the server's
+	// SETTINGS told it; the server, what the client's told it. A longer one
+	// ends the connection with FRAME_SIZE_ERROR.
+	clientFrames, serverFrames frameLimit
 
 	clientMu sync.Mutex // serializes writes to the client
 	// The server's first SETTINGS must be the first frame the client gets
@@ -536,7 +544,10 @@ func (r *relay) clientLoop() error {
 		return nil
 	}
 	for {
-		f, err := ReadFrame(r.client)
+		f, err := readFrame(r.client, r.clientFrames.size)
+		if errors.Is(err, ErrFrameSize) {
+			return r.connectionError(errCodeFrameSize, fmt.Errorf("client: %w", err))
+		}
 		if err != nil {
 			return err
 		}
@@ -581,14 +592,18 @@ func (r *relay) clientLoop() error {
 			// SETTINGS (and their ACKs), PING, GOAWAY and unknown frame
 			// types go upstream exactly as the client sent them.
 			if f.Type == FrameSettings && f.Flags&FlagAck != 0 {
+				r.clientFrames.ack()
 				if err := r.applyClientAck(); err != nil {
 					return err
 				}
 			}
-			if f.Type == FrameSettings && f.Flags&FlagAck == 0 && r.masking {
-				if err := r.onClientSettings(f.Payload); err != nil {
-					return err
+			if f.Type == FrameSettings && f.Flags&FlagAck == 0 {
+				if r.masking {
+					if err := r.onClientSettings(f.Payload); err != nil {
+						return err
+					}
 				}
+				r.serverFrames.sent(f.Payload)
 			}
 			err = r.writeServer(f)
 		}
@@ -818,6 +833,11 @@ func (r *relay) onPriority(f Frame) error {
 func (r *relay) onPriorityUpdate(f Frame) error {
 	if len(f.Payload) < 4 {
 		return errors.New("PRIORITY_UPDATE frame too short")
+	}
+	if len(f.Payload)-4 > maxPriorityValue {
+		// The latest value is kept for each stream not upstream yet, outside
+		// the buffer budget, so it must stay small.
+		return r.connectionError(errCodeProtocol, fmt.Errorf("client sent a PRIORITY_UPDATE value over %d bytes", maxPriorityValue))
 	}
 	target := binary.BigEndian.Uint32(f.Payload) & 0x7fffffff
 	r.mu.Lock()
@@ -1571,7 +1591,7 @@ func (r *relay) serverLoop() error {
 	blockEnds := false
 	sawPreface := false
 	for {
-		f, err := ReadFrame(r.server)
+		f, err := r.readServerFrame()
 		if err != nil {
 			return err
 		}
@@ -1589,6 +1609,8 @@ func (r *relay) serverLoop() error {
 					return err
 				}
 				f.Payload = clientSettings(f.Payload)
+			} else {
+				r.serverFrames.ack()
 			}
 			if !sawPreface {
 				sawPreface = true
@@ -1671,6 +1693,20 @@ func (r *relay) serverLoop() error {
 			return err
 		}
 	}
+}
+
+// readServerFrame reads the server's next frame. One longer than the client
+// allowed is a connection error: the server gets GOAWAY with
+// FRAME_SIZE_ERROR, and the relay ends.
+func (r *relay) readServerFrame() (Frame, error) {
+	f, err := readFrame(r.server, r.serverFrames.size)
+	if errors.Is(err, ErrFrameSize) {
+		// Last stream 0: the relay accepts no stream the server opens.
+		payload := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 0), errCodeFrameSize)
+		_ = r.writeServer(Frame{Type: FrameGoAway, Payload: payload})
+		return Frame{}, fmt.Errorf("server: %w", err)
+	}
+	return f, err
 }
 
 // serverStreamLocked finds the stream for a server stream ID: an open one,
@@ -1831,6 +1867,9 @@ func (r *relay) onServerSettings(payload []byte) error {
 	if err != nil {
 		return err
 	}
+	// Before the client can read the frame, so its frames sized to the new
+	// value are let through.
+	r.clientFrames.sent(payload)
 	initial := int64(-1)
 	for _, s := range settings {
 		if s.ID == SettingInitialWindowSize {

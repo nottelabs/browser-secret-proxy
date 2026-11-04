@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"sync"
+	"sync/atomic"
 )
 
 // Preface is the HTTP/2 client connection preface.
@@ -57,18 +60,48 @@ type Frame struct {
 	Payload []byte
 }
 
-// ReadFrame reads one frame.
+// ErrFrameSize is a frame longer than the SETTINGS_MAX_FRAME_SIZE its sender
+// was told (RFC 9113 4.2).
+var ErrFrameSize = errors.New("frame is larger than the max frame size")
+
+// ReadFrame reads one frame of any length.
 func ReadFrame(r io.Reader) (Frame, error) {
+	return readFrame(r, nil)
+}
+
+// readFrame reads one frame. maxSize, when not nil, is the largest payload
+// the peer may send. It is called once the frame header has arrived, so it
+// sees settings that changed while the read waited, and only for a frame
+// over 16,384 bytes, which every peer may send. A longer frame is an
+// ErrFrameSize error, and its payload is not read.
+//
+// The payload buffer grows as bytes arrive rather than taking the declared
+// length at once: a peer that declares a large frame and stalls holds only
+// about twice what it sent.
+func readFrame(r io.Reader, maxSize func() int) (Frame, error) {
 	var header [frameHeaderLength]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return Frame{}, err
 	}
 	length := int(header[0])<<16 | int(header[1])<<8 | int(header[2])
+	if maxSize != nil && length > defaultMaxFrame {
+		if limit := maxSize(); length > limit {
+			return Frame{}, fmt.Errorf("%w: %d bytes, at most %d", ErrFrameSize, length, limit)
+		}
+	}
 	f := Frame{Type: header[3], Flags: header[4], Stream: binary.BigEndian.Uint32(header[5:9]) & 0x7fffffff}
-	f.Payload = make([]byte, length)
-	if _, err := io.ReadFull(r, f.Payload); err != nil {
+	payload := make([]byte, min(length, defaultMaxFrame))
+	if _, err := io.ReadFull(r, payload); err != nil {
 		return Frame{}, err
 	}
+	for len(payload) < length {
+		n := len(payload)
+		payload = slices.Grow(payload, min(n, length-n))[:n+min(n, length-n)]
+		if _, err := io.ReadFull(r, payload[n:]); err != nil {
+			return Frame{}, err
+		}
+	}
+	f.Payload = payload
 	return f, nil
 }
 
@@ -96,6 +129,88 @@ func ParseSettings(payload []byte) ([]Setting, error) {
 		out = append(out, Setting{ID: binary.BigEndian.Uint16(payload[i:]), Value: binary.BigEndian.Uint32(payload[i+2:])})
 	}
 	return out, nil
+}
+
+// maxFrameSetting returns the last SETTINGS_MAX_FRAME_SIZE in a SETTINGS
+// payload, kept between 16,384 and 2^24-1, or 0 when there is none. A
+// malformed payload is the receiver's to refuse; only whole parameters are
+// read.
+func maxFrameSetting(payload []byte) int {
+	v := 0
+	for i := 0; i+6 <= len(payload); i += 6 {
+		if binary.BigEndian.Uint16(payload[i:]) == SettingMaxFrameSize {
+			v = min(max(int(binary.BigEndian.Uint32(payload[i+2:])), defaultMaxFrame), maxFrameLength)
+		}
+	}
+	return v
+}
+
+// frameLimit is the largest frame a peer may send: the
+// SETTINGS_MAX_FRAME_SIZE in the SETTINGS frames the relay forwarded to it.
+// A new value applies once the peer acknowledges its frame (RFC 9113
+// 6.5.3), but the peer may use it as soon as it arrives, so the limit is the
+// largest value the peer may be using: the one as of its last ACK, or the
+// one after any prefix of the frames it has not acknowledged yet. A frame
+// that is legal for the peer is never refused.
+type frameLimit struct {
+	mu      sync.Mutex
+	acked   int   // 0: the default
+	unacked []int // one per SETTINGS frame not acknowledged yet, oldest first; 0: without the setting
+	// overflow is set once unacked overflowed: from then on the largest
+	// value ever sent applies.
+	overflow bool
+	largest  int
+	limit    atomic.Int64 // 0: the default
+}
+
+// sent records a SETTINGS frame forwarded to the peer, before the peer can
+// read it.
+func (l *frameLimit) sent(payload []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	v := maxFrameSetting(payload)
+	l.largest = max(l.largest, v)
+	l.unacked = append(l.unacked, v)
+	if len(l.unacked) > maxUnackedSettings {
+		l.unacked = l.unacked[1:]
+		l.overflow = true
+	}
+	l.update()
+}
+
+// ack records the peer's ACK of the oldest SETTINGS frame it was sent.
+func (l *frameLimit) ack() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.unacked) == 0 {
+		return
+	}
+	if v := l.unacked[0]; v != 0 {
+		l.acked = v
+	}
+	l.unacked = l.unacked[1:]
+	l.update()
+}
+
+func (l *frameLimit) update() {
+	if l.overflow {
+		l.limit.Store(int64(l.largest))
+		return
+	}
+	state := l.acked
+	largest := state
+	for _, v := range l.unacked {
+		if v != 0 {
+			state = v
+		}
+		largest = max(largest, state)
+	}
+	l.limit.Store(int64(largest))
+}
+
+// size returns the limit; it is safe to call from any goroutine.
+func (l *frameLimit) size() int {
+	return max(int(l.limit.Load()), defaultMaxFrame)
 }
 
 // Priority is the priority block of a HEADERS or PRIORITY frame.

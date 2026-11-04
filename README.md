@@ -692,6 +692,10 @@ return.
   is; a value that needs escaping in such a body is not escaped.
 - HTTP/2 clients must respect flow control: a client that sends past its
   window ends the connection with `FLOW_CONTROL_ERROR`.
+- An HTTP/2 frame longer than the `SETTINGS_MAX_FRAME_SIZE` its sender was
+  told ends the connection with `FRAME_SIZE_ERROR`, from the client or the
+  destination. A `PRIORITY_UPDATE` value over 1 KiB ends it with
+  `PROTOCOL_ERROR`.
 - When the destination sends GOAWAY, requests it will not process are refused
   with `REFUSED_STREAM`.
 - Server push is not supported.

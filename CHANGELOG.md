@@ -77,3 +77,8 @@ First release, planned as 0.1.0.
   is the principal: the username names it in logs but no longer splits its
   values for masking. Decrypted tokens leave memory at their time even when
   no request comes.
+- Over HTTP/2, a frame longer than the max frame size its sender was told
+  ends the connection with `FRAME_SIZE_ERROR`, and a frame's payload takes
+  memory as it arrives rather than all at once. A `PRIORITY_UPDATE` value
+  over 1 KiB ends the connection with `PROTOCOL_ERROR`. Before, one client
+  could make the relay hold gigabytes on one connection.
