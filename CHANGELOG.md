@@ -26,3 +26,16 @@ First release, planned as 0.1.0.
   allows and before it expires, and only for the principal (proxy
   credential) it was looked up for. A request that breaks a scope, or whose
   lookup fails, is answered `502` and not sent.
+- Pluggable sources of real values (`-resolver file|http|sealed`):
+  - `file`: the `-swaps` JSON file (`-swaps` alone still selects it),
+    reloaded when it changes (`-swaps-reload`). A file that does not load
+    keeps the previous values.
+  - `http`: a detokenize service you run, called over mutual TLS once per
+    request, with a timeout and an in-memory cache per principal and
+    stand-in. A reference service is in `examples/http-resolver`.
+  - `sealed`: the proxy password is a JWE (ECDH-ES+A256KW, A256GCM) sealed
+    to the proxy's key that carries the values, so no lookup service or
+    storage is needed. Invalid or expired tokens get `407`. `examples/seal`
+    creates tokens.
+- Stand-in detection by pattern (`-standin-pattern`, `-standin-prefixes`),
+  with an optional Luhn check for card-like stand-ins (`-standin-luhn`).

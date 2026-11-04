@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -17,7 +18,6 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/certs"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
 	"github.com/nottelabs/browser-secret-proxy/internal/proxy"
-	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
 )
 
@@ -36,11 +36,13 @@ func run() error {
 	caCert := flag.String("ca-cert", "", "PEM CA certificate used to issue leaf certificates (required)")
 	caKey := flag.String("ca-key", "", "PEM private key of the CA (required)")
 	hosts := flag.String("hosts", "", "comma-separated hosts to intercept: exact names or a leading \"*.\" (required)")
-	swaps := flag.String("swaps", "", "JSON file mapping each stand-in to its real value (required)")
+	resolverOpts := registerResolverFlags(flag.CommandLine)
 	parent := flag.String("upstream-proxy", os.Getenv("SECRET_PROXY_UPSTREAM"), "parent proxy URL: http://, https:// or socks5://, credentials in the URL (env SECRET_PROXY_UPSTREAM)")
 	verbose := flag.Bool("v", false, "debug logging")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+	resolverOpts.set = map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { resolverOpts.set[f.Name] = true })
 
 	if *showVersion {
 		fmt.Println(version)
@@ -53,9 +55,9 @@ func run() error {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	if *caCert == "" || *caKey == "" || *hosts == "" || *swaps == "" {
+	if *caCert == "" || *caKey == "" || *hosts == "" {
 		flag.Usage()
-		return fmt.Errorf("-ca-cert, -ca-key, -hosts and -swaps are required")
+		return fmt.Errorf("-ca-cert, -ca-key and -hosts are required")
 	}
 	authority, err := certs.LoadFiles(*caCert, *caKey)
 	if err != nil {
@@ -65,11 +67,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	resolver, err := resolve.LoadFile(*swaps)
-	if err != nil {
-		return err
-	}
-	detector, err := resolve.NewDetector(resolver, resolve.Patterns{})
+	values, err := resolverOpts.build(os.Getenv("SECRET_PROXY_USERNAME"), logger)
 	if err != nil {
 		return err
 	}
@@ -86,8 +84,8 @@ func run() error {
 	server, err := proxy.New(proxy.Config{
 		Authority: authority,
 		Hosts:     allow,
-		Resolver:  resolver,
-		Detector:  detector,
+		Resolver:  values.resolver,
+		Detector:  values.detector,
 		Dialer:    dialer,
 		Username:  os.Getenv("SECRET_PROXY_USERNAME"),
 		Password:  os.Getenv("SECRET_PROXY_PASSWORD"),
@@ -101,8 +99,15 @@ func run() error {
 		return err
 	}
 	parentDescription := describeParent(parentURL)
-	logger.Info("listening", "address", ln.Addr().String(), "hosts", *hosts, "stand_ins", resolver.Count(), "upstream_proxy", parentDescription,
-		"proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "")
+	attrs := append([]any{"address", ln.Addr().String(), "hosts", *hosts}, values.logAttrs...)
+	attrs = append(attrs, "upstream_proxy", parentDescription, "proxy_auth", os.Getenv("SECRET_PROXY_USERNAME") != "" || values.mode == "sealed")
+	logger.Info("listening", attrs...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if values.watch != nil {
+		go values.watch(ctx)
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
