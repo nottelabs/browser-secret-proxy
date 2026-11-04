@@ -258,20 +258,22 @@ func (e *e2e) setup(ctx context.Context) error {
 
 	// Check each public address before starting sessions, so a tunnel
 	// failure is reported as one. Locally the proxy gets a few seconds to
-	// start; through the tunnel one answer is enough (any status, such as
-	// the proxy's 407).
+	// start. ngrok can report a TCP tunnel started before its edge accepts
+	// connections on the new port (one CI run was refused within the same
+	// second), so the tunnel gets a few seconds too. Any answer counts,
+	// such as the proxy's 407. No scenario is retried.
 	for _, p := range []*proxyRun{e.swapProxy, e.maskProxy} {
 		if _, err := waitHTTP(ctx, fmt.Sprintf("http://127.0.0.1:%d/", p.port), nil, 10*time.Second); err != nil {
 			return fmt.Errorf("the %s proxy did not start: %w", p.role, err)
 		}
-		status, err := waitHTTP(ctx, p.publicURL+"/", nil, 0)
+		status, err := waitHTTP(ctx, p.publicURL+"/", nil, 15*time.Second)
 		if err != nil {
 			return fmt.Errorf("the tunnel at %s does not reach the %s proxy: %w", p.publicURL, p.role, err)
 		}
 		logf("%s proxy is public at %s (HTTP %d)", p.role, p.publicURL, status)
 	}
 	skip := http.Header{ngrokSkipHeader: {"1"}}
-	status, err := waitHTTP(ctx, "https://"+e.captureHost+"/", skip, 0)
+	status, err := waitHTTP(ctx, "https://"+e.captureHost+"/", skip, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("the capture server is not reachable at %s: %w", e.captureHost, err)
 	}
