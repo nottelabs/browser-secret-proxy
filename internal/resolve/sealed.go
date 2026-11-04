@@ -228,7 +228,8 @@ func (s *Sealed) decrypt(token string) (*sealedEntry, error) {
 	return e, nil
 }
 
-// Seal encrypts a payload to a proxy's public key, as the proxy expects.
+// Seal encrypts a payload to a proxy's public key, as the proxy expects. It
+// refuses a token longer than the proxy accepts.
 func Seal(key crypto.PublicKey, payload SealedPayload) (string, error) {
 	plaintext, err := json.Marshal(payload)
 	if err != nil {
@@ -242,5 +243,12 @@ func Seal(key crypto.PublicKey, payload SealedPayload) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return obj.CompactSerialize()
+	token, err := obj.CompactSerialize()
+	if err != nil {
+		return "", err
+	}
+	if len(token) > maxSealedToken {
+		return "", fmt.Errorf("the sealed token is %d bytes, more than the %d the proxy accepts: seal fewer or shorter values", len(token), maxSealedToken)
+	}
+	return token, nil
 }

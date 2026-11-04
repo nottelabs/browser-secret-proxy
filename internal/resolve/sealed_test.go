@@ -219,3 +219,21 @@ func TestLoadSealedKeys(t *testing.T) {
 		t.Error("a missing file was accepted")
 	}
 }
+
+func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
+	key := ecKey(t)
+	p := payload(time.Now().Add(time.Hour))
+	p.Values = map[string]string{"tok_a": strings.Repeat("x", maxSealedToken)}
+	if _, err := Seal(&key.PublicKey, p); err == nil {
+		t.Fatal("an oversized token was sealed")
+	}
+	p.Values = map[string]string{"tok_a": strings.Repeat("x", maxSealedToken/2)}
+	token, err := Seal(&key.PublicKey, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := NewSealed(key)
+	if _, err := s.Authenticate("u", token); err != nil {
+		t.Fatalf("a token Seal accepted was refused: %v", err)
+	}
+}
