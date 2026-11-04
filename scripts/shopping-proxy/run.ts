@@ -39,7 +39,21 @@ async function extendToCard() {
     else {const id=await radio.getAttribute('id');if(id){const label=page.locator(`label[for=${JSON.stringify(id)}]`);if(await label.isVisible())await label.click({timeout:10000});}}
     await page.waitForTimeout(1500);
   }
-  result.paymentInventory=await inventory();emit('paymentInventory',{frames:result.paymentInventory});
+  // The observed Birkenstock payment UI uses a Cards accordion, not a radio.
+  // This exact row was visible in run41867915431; never click an order control.
+  const cardRow=page.getByText(/^Cards$/).filter({visible:true}).first();
+  if(await cardRow.isVisible().catch(()=>false)){
+    const descriptor=await cardRow.evaluate((e:any)=>({text:e.innerText,tag:e.tagName,ancestorButtonType:e.closest('button')?.getAttribute('type')||null}));
+    if(descriptor.ancestorButtonType==='submit')throw Error('Cards row unexpectedly belongs to a submit control');
+    await cardRow.click({timeout:10000});emit('cardsAccordionOpened',descriptor);
+  }
+  const fieldsDeadline=Date.now()+45000;
+  do{
+    result.paymentInventory=await inventory();
+    if(result.paymentInventory.some((f:any)=>f.inputs.some((i:any)=>/card.?number|cc-number|encryptedCardNumber/i.test([i.name,i.id,i.placeholder,i.autocomplete,i.ariaLabel,i.label].join(' ')))))break;
+    await page.waitForTimeout(1000);
+  }while(Date.now()<fieldsDeadline);
+  emit('paymentInventory',{frames:result.paymentInventory});
   const fields:Record<string,any>={};
   for(const f of result.paymentInventory)for(const input of f.inputs){
     if(['radio','checkbox'].includes(input.type))continue;
@@ -66,6 +80,7 @@ async function extendToCard() {
   result.cardOriginSubstitutionProven=false;
   result.cardSubstitutionLimit='Stopped after field entry; browser observations cannot prove what the payment origin received; client encryption may hide numeric stand-ins from the proxy.';
   emit('cardEntryResult',{reached:result.cardFormReached,allRequiredSet:result.cardFieldsSet,cardOriginSubstitutionProven:false});
+  if(!result.cardFieldsSet)throw Error('Dummy card number, expiry and CVV were not all set');
 }
 let cleanupPromise:Promise<void>|undefined;
 function cleanup(){
