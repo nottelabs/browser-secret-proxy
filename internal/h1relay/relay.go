@@ -3,11 +3,12 @@
 // header order, header name casing and spacing; only stand-ins change, plus
 // content-length when a swap changes the body size. A request whose
 // stand-ins cannot be swapped (see package scope) is answered 502 and not
-// sent. Responses are copied byte for byte, unless the connection's
-// principal has values on record for masking (see package scope): then every
-// real value in a response's header values, body and trailers is replaced by
-// its stand-in before it reaches the client, a compressed body being decoded
-// to do so.
+// sent. A response head that the client could read differently from the
+// relay is answered 502 instead. Responses are otherwise copied byte for
+// byte, unless the connection's principal has values on record for masking
+// (see package scope): then every real value in a response's header values,
+// body and trailers is replaced by its stand-in before it reaches the
+// client, a compressed body being decoded to do so.
 package h1relay
 
 import (
@@ -181,7 +182,7 @@ const maxPipelined = 64
 type header struct {
 	raw   string // the line without CRLF
 	name  string // lower case
-	value string // trimmed
+	value string // without the SP and HTAB around it
 }
 
 // errRefused ends a connection after a request was answered 502 instead of
@@ -223,7 +224,7 @@ func requests(ctx context.Context, br *bufio.Reader, head headTimer, server io.W
 			// A line without a colon or otherwise malformed is refused by
 			// framing below.
 			name, value, _ := strings.Cut(line, ":")
-			headers = append(headers, header{raw: line, name: strings.ToLower(strings.TrimSpace(name)), value: strings.TrimSpace(value)})
+			headers = append(headers, header{raw: line, name: strings.ToLower(name), value: trimOWS(value)})
 		}
 		head.stop()
 
@@ -585,7 +586,8 @@ func websocketOnly(value string) bool {
 // Content-Length (-1 when absent). It refuses, as RFC 9112 allows or
 // requires (2.2, 5, 6.1, 6.3): a bare CR or a NUL in any line, a folded
 // (obs-fold) header line, a header name that is not a token (such as one
-// with a space before the colon), Transfer-Encoding with Content-Length,
+// with a space before the colon), a control character other than HTAB in a
+// header value (RFC 9110 5.5), Transfer-Encoding with Content-Length,
 // Transfer-Encoding other than a single chunked or on a request that is not
 // HTTP/1.1, and more than one Content-Length or one that is not a decimal
 // number.
@@ -596,24 +598,19 @@ func framing(requestLine, version string, headers []header) (chunked bool, conte
 	}
 	encodings, lengths := 0, 0
 	for _, h := range headers {
-		if err := checkFieldLine(h.raw); err != nil {
+		if err := checkRequestFieldLine(h.raw); err != nil {
 			return false, 0, err
 		}
-		// Only SP and HTAB are whitespace around a value (RFC 9110 5.6.3).
-		// h.value is trimmed of more, such as VT and FF, which a server may
-		// keep: "chunked\v" is then not chunked to it.
-		_, value, _ := strings.Cut(h.raw, ":")
-		value = strings.Trim(value, " \t")
 		switch h.name {
 		case "transfer-encoding":
 			encodings++
-			chunked = isChunked(value)
+			chunked = isChunked(h.value)
 		case "content-length":
 			lengths++
-			if !isDigits(value) {
+			if !isDigits(h.value) {
 				return false, 0, errors.New("an invalid Content-Length")
 			}
-			if contentLength, err = strconv.Atoi(value); err != nil {
+			if contentLength, err = strconv.Atoi(h.value); err != nil {
 				return false, 0, errors.New("an invalid Content-Length")
 			}
 		}
@@ -648,6 +645,29 @@ func checkFieldLine(line string) error {
 	}
 	return nil
 }
+
+// checkRequestFieldLine is checkFieldLine for a request, which also refuses
+// a control character other than HTAB in the value (RFC 9110 5.5): a server
+// may trim one from the ends of a value, as strings.TrimSpace does with VT
+// and FF, or keep it, so "Host: allowed.test\v" could name another host to
+// it than to the relay.
+func checkRequestFieldLine(line string) error {
+	if err := checkFieldLine(line); err != nil {
+		return err
+	}
+	_, value, _ := strings.Cut(line, ":")
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c < ' ' && c != '\t' || c == 0x7f {
+			return errors.New("a control character in a header value")
+		}
+	}
+	return nil
+}
+
+// trimOWS trims the whitespace around a header value: SP and HTAB only (RFC
+// 9110 5.6.3). strings.TrimSpace also trims VT, FF and spaces that are not
+// ASCII, such as NBSP, which a server or client may keep.
+func trimOWS(s string) string { return strings.Trim(s, " \t") }
 
 // isToken reports whether s is an RFC 9110 5.6.2 token, the syntax of a
 // header name.
@@ -754,6 +774,13 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 	var current *exchange
 	for {
 		head, status, length, chunked, err := readResponseHead(br)
+		if errors.Is(err, errUnclearResponse) {
+			// Nothing of this response was passed on yet.
+			opts.Logger.Warn("refusing a response the client could read differently", "reason", err.Error())
+			body := "secret-proxy: malformed response from the server\n"
+			_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			return errRefused
+		}
 		if err != nil {
 			return err
 		}
@@ -837,9 +864,19 @@ func responses(br *bufio.Reader, client io.Writer, queue <-chan *exchange, progr
 	}
 }
 
+// errUnclearResponse is a response head that a client could read
+// differently from the relay. It is answered 502: the relay follows each
+// response's framing to know where the next one, which it may have to mask,
+// begins.
+var errUnclearResponse = errors.New("unclear response head")
+
 // readResponseHead reads a status line and headers, returning their raw
 // bytes, the status code, the content length (-1 when absent) and whether
-// the body is chunked.
+// the body is chunked. It returns errUnclearResponse for a status line with
+// a bare CR or NUL, a header line that checkFieldLine refuses, or a
+// Content-Length that is not a decimal number: only SP and HTAB may surround
+// it, and the coding name chunked is matched in ASCII only, as a client
+// matches them.
 func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, chunked bool, err error) {
 	length = -1
 	for {
@@ -848,8 +885,14 @@ func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, 
 			return nil, 0, 0, false, err
 		}
 		head = append(head, line...)
-		text := strings.TrimRight(string(line), "\r\n")
+		// One line ending only: a line of "\r\r\n" does not end the head.
+		text := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
 		if status == 0 {
+			// A client ends the status line at a bare CR and reads what
+			// follows as header lines the relay would not see.
+			if strings.ContainsAny(text, "\r\x00") {
+				return nil, 0, 0, false, fmt.Errorf("%w: a bare CR or NUL in the status line", errUnclearResponse)
+			}
 			fields := strings.Fields(text)
 			if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") {
 				return nil, 0, 0, false, fmt.Errorf("malformed status line")
@@ -862,16 +905,22 @@ func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, 
 		if text == "" {
 			return head, status, length, chunked, nil
 		}
+		if err := checkFieldLine(text); err != nil {
+			return nil, 0, 0, false, fmt.Errorf("%w: %w", errUnclearResponse, err)
+		}
 		name, value, _ := strings.Cut(text, ":")
-		value = strings.TrimSpace(value)
-		switch strings.ToLower(strings.TrimSpace(name)) {
+		value = trimOWS(value)
+		switch strings.ToLower(name) {
 		case "content-length":
-			if length, err = strconv.ParseInt(value, 10, 64); err != nil || length < 0 {
-				return nil, 0, 0, false, fmt.Errorf("invalid content-length in a response")
+			if !isDigits(value) {
+				return nil, 0, 0, false, fmt.Errorf("%w: an invalid Content-Length", errUnclearResponse)
+			}
+			if length, err = strconv.ParseInt(value, 10, 64); err != nil {
+				return nil, 0, 0, false, fmt.Errorf("%w: an invalid Content-Length", errUnclearResponse)
 			}
 		case "transfer-encoding":
-			codings := strings.Split(strings.ToLower(value), ",")
-			chunked = strings.TrimSpace(codings[len(codings)-1]) == "chunked"
+			codings := strings.Split(value, ",")
+			chunked = isChunked(trimOWS(codings[len(codings)-1]))
 		}
 	}
 }
@@ -895,7 +944,11 @@ func readRawLine(br *bufio.Reader, limit int) ([]byte, error) {
 	}
 }
 
-// copyChunked copies a chunked body unchanged, trailers included.
+// copyChunked copies a chunked body unchanged, trailers included. The
+// trailer section is read whole, up to maxHeadBytes, before it is copied: a
+// line in it that checkFieldLine refuses ends the connection with none of it
+// passed on, since the client could read the end of the body elsewhere than
+// the relay.
 func copyChunked(br *bufio.Reader, w io.Writer) error {
 	for {
 		line, err := readRawLine(br, maxChunkLine)
@@ -911,16 +964,19 @@ func copyChunked(br *bufio.Reader, w io.Writer) error {
 			return errors.New("invalid chunk size in a response")
 		}
 		if size == 0 {
+			var trailers []byte
 			for {
-				trailer, err := readRawLine(br, maxHeadBytes)
+				trailer, err := readRawLine(br, maxHeadBytes-len(trailers))
 				if err != nil {
 					return err
 				}
-				if _, err := w.Write(trailer); err != nil {
+				trailers = append(trailers, trailer...)
+				if isEmptyLine(trailer) {
+					_, err := w.Write(trailers)
 					return err
 				}
-				if strings.TrimRight(string(trailer), "\r\n") == "" {
-					return nil
+				if err := checkFieldLine(strings.TrimSuffix(strings.TrimSuffix(string(trailer), "\n"), "\r")); err != nil {
+					return fmt.Errorf("malformed trailer line in a response: %w", err)
 				}
 			}
 		}
@@ -928,6 +984,12 @@ func copyChunked(br *bufio.Reader, w io.Writer) error {
 			return err
 		}
 	}
+}
+
+// isEmptyLine reports whether a raw line is the empty line that ends a head
+// or a trailer section: a line ending alone, so "\r\r\n" is not one.
+func isEmptyLine(line []byte) bool {
+	return string(line) == "\r\n" || string(line) == "\n"
 }
 
 // readLine reads one line without its CRLF, refusing it once it is longer
@@ -988,7 +1050,7 @@ func readChunked(br *bufio.Reader, limit int) ([]byte, []byte, error) {
 		if line == "" {
 			return body.Bytes(), trailer.Bytes(), nil
 		}
-		if err := checkFieldLine(line); err != nil {
+		if err := checkRequestFieldLine(line); err != nil {
 			return nil, nil, fmt.Errorf("malformed trailer line: %w", err)
 		}
 		trailer.WriteString(line + "\r\n")

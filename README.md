@@ -576,8 +576,9 @@ host.
   than a single `chunked` or on a request that is not HTTP/1.1, more than
   one `Content-Length` or one that is not a decimal number (only spaces and
   tabs may surround either value), a folded (obs-fold) header line, a
-  header name that is not a token (`Name : value`), and a bare CR or NUL
-  in the request line or a header line. A chunked trailer
+  header name that is not a token (`Name : value`), a control character
+  other than a tab in a header value (`Host: allowed.test\v`), and a bare
+  CR or NUL in the request line or a header line. A chunked trailer
   line like that closes the connection before anything is sent.
 - **Expired values are not used.** A value whose expiry has passed is not
   swapped.
@@ -733,12 +734,12 @@ How a masked response changes:
   error, never an unmasked byte.
 - A response that cannot be masked gets a `502` from the proxy instead: an
   unknown or stacked content-coding (`compress`, `gzip, br`, or several
-  `Content-Encoding` headers), a folded (obs-fold) HTTP/1.1 header line,
-  transfer-codings other than a single `chunked` across every
-  `Transfer-Encoding` header (any `transfer-encoding` field over HTTP/2), or
-  any `206` partial response. Ranges would be masked one by one, so a client
-  could ask for the pieces of a value (`bytes=0-7`, then `bytes=8-15`) and
-  put it back together, even with a stand-in of the same length.
+  `Content-Encoding` headers), transfer-codings other than a single
+  `chunked` across every `Transfer-Encoding` header (any
+  `transfer-encoding` field over HTTP/2), or any `206` partial response.
+  Ranges would be masked one by one, so a client could ask for the pieces
+  of a value (`bytes=0-7`, then `bytes=8-15`) and put it back together,
+  even with a stand-in of the same length.
 - Also refused with a `502`: a real value in a header that frames the
   HTTP/1.1 message or connection (`Content-Length`, `Transfer-Encoding`,
   `Content-Encoding`, `Connection`, `Keep-Alive`, `Trailer`, `Upgrade`), or
@@ -748,6 +749,14 @@ How a masked response changes:
   request that did not ask to upgrade is refused the same way, with masking
   on or off: it would turn the rest of the connection into a raw stream,
   neither swapped nor masked.
+- So is an HTTP/1.1 response head that a browser could split, unfold or
+  frame differently from the proxy, with masking on or off, since the proxy
+  follows each response's framing to find where the next one, which it may
+  mask, begins (RFC 9112): a folded (obs-fold) header line, a header name
+  that is not a token (`Name : value`), a line without a colon, a bare CR
+  or NUL in the status line or a header line, or a `Content-Length` that
+  is not a decimal number (only spaces and tabs may surround it). A trailer
+  line like that cuts the response off before any trailer is passed on.
 - Over HTTP/2, DATA before the final response head (none yet, or only a
   `1xx`), and content in DATA on a response that cannot have any (to a
   `HEAD`, or a `204` or `304`), are malformed (RFC 9113 8.1): the stream is
