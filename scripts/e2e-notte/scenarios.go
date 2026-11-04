@@ -267,7 +267,7 @@ func (e *e2e) captureJSON(ctx context.Context, name, body string) (int, string, 
 // in the raw text, so it would not see an escaped one.
 func (e *e2e) passwordJSON(ctx context.Context) error {
 	v := e.values
-	escaped := strings.ReplaceAll(v.jsonStandIn, "_", `_`)
+	escaped := strings.ReplaceAll(v.jsonStandIn, "_", "\\u005f")
 	body := `{"username":"e2e-user","password":"` + escaped + `"}`
 	status, answer, err := e.captureJSON(ctx, "password-json", body)
 	if err != nil {

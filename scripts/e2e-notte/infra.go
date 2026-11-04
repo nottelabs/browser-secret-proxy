@@ -27,7 +27,7 @@ type proxyRun struct {
 	username  string
 	password  string
 	publicURL string // the ngrok TCP address, http://host:port
-	started   bool
+	started   bool   // docker run was attempted, so cleanup removes the container
 }
 
 // startProxy starts the container on the host network, so the proxy and an
