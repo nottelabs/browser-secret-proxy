@@ -301,7 +301,7 @@ func TestParseEncoding(t *testing.T) {
 	}
 }
 
-func encode(t *testing.T, e Encoding, data []byte) []byte {
+func encode(t testing.TB, e Encoding, data []byte) []byte {
 	t.Helper()
 	var b bytes.Buffer
 	var w io.WriteCloser

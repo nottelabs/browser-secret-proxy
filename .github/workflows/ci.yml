@@ -59,6 +59,30 @@ jobs:
           cache-dependency-path: go.sum
       - run: make race
 
+  fuzz:
+    name: fuzz targets
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: go.sum
+      - run: go mod download
+      - run: make fuzz FUZZTIME=20s
+      - name: Print failing inputs
+        if: failure()
+        run: |
+          git ls-files --others --exclude-standard -- '*/testdata/fuzz/*' | while read -r file; do
+            echo "== $file"
+            cat "$file"
+          done
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-24.04
