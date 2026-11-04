@@ -333,6 +333,64 @@ func TestDestinationAddressesAreTriedInTurn(t *testing.T) {
 	}
 }
 
+// stallingDialer never answers for stall: it waits until the dial's context
+// ends and records how long that took. Other addresses go to next.
+type stallingDialer struct {
+	stall  string
+	next   *recordingDialer
+	mu     sync.Mutex
+	waited time.Duration
+}
+
+func (d *stallingDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if addr != d.stall {
+		return d.next.DialContext(ctx, network, addr)
+	}
+	_, _ = d.next.DialContext(ctx, network, addr) // records it; no route
+	start := time.Now()
+	<-ctx.Done()
+	d.mu.Lock()
+	d.waited = time.Since(start)
+	d.mu.Unlock()
+	return nil, &net.OpError{Op: "dial", Net: network, Err: ctx.Err()}
+}
+
+func (d *stallingDialer) stalled() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.waited
+}
+
+// When the first checked address does not answer at all, its dial gives up
+// on a share of the handshake timeout, leaving time for the next address.
+func TestStalledDestinationAddressLeavesTimeForTheNext(t *testing.T) {
+	const timeout = 4 * time.Second // the stalled address gets 2s of it
+	dest := startDestination(t, otherHost, []string{"http/1.1"}, respondOK)
+	lookup := &fakeLookup{answers: map[string][]string{otherHost: {"2001:db8::7", "203.0.113.8"}}}
+	dialer := &stallingDialer{
+		stall: "[2001:db8::7]:443",
+		next:  &recordingDialer{routes: mapDialer{"203.0.113.8:443": dest.addr}},
+	}
+	p := startProxy(t, nil, dest.ca, func(c *Config) {
+		c.Dialer = dialer
+		c.AllowPrivateDestinations = false
+		c.HandshakeTimeout = timeout
+		c.lookup = lookup.lookup
+	})
+	conn, resp := connect(t, p.addr, otherHost+":443", "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT answered %s", resp.Status)
+	}
+	getOK(t, tlsClient(t, conn, otherHost, dest.ca), otherHost)
+	if got := dialer.next.dialed(); len(got) != 2 || got[0] != "[2001:db8::7]:443" || got[1] != "203.0.113.8:443" {
+		t.Fatalf("dialed %v", got)
+	}
+	if waited := dialer.stalled(); waited <= 0 || waited >= timeout*3/4 {
+		t.Fatalf("the stalled address held the dial for %v of %v", waited, timeout)
+	}
+}
+
 // A name that does not resolve is answered 502, like a destination that
 // cannot be reached.
 func TestUnresolvableDestination(t *testing.T) {
