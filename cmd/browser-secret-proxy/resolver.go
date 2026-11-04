@@ -68,6 +68,8 @@ type resolverSetup struct {
 	mode     string
 	resolver resolve.Resolver
 	detector *resolve.Detector
+	// timeout bounds one lookup (0: the proxy's default).
+	timeout time.Duration
 	// watch, when set, runs until ctx ends (file reloads).
 	watch func(ctx context.Context)
 	// logAttrs describe the setup for the start log line, without secrets.
@@ -127,6 +129,7 @@ func (f *resolverFlags) build(fixedUsername string, logger *slog.Logger) (*resol
 			return nil, err
 		}
 		setup.resolver = h
+		setup.timeout = f.timeout
 		setup.logAttrs = append(setup.logAttrs, "timeout", f.timeout.String(), "cache_ttl", f.cacheTTL.String())
 		if fixedUsername == "" {
 			logger.Warn("proxy authentication is off: every client shares one principal for the detokenize service")

@@ -90,6 +90,14 @@ func TestEachModeBuilds(t *testing.T) {
 	if _, ok := setup.resolver.(*resolve.HTTP); !ok {
 		t.Fatal("not an http resolver")
 	}
+	if setup.timeout != 2*time.Second {
+		t.Fatalf("the proxy's lookup deadline is %v, want -resolver-timeout's default 2s", setup.timeout)
+	}
+	long, err := parseResolverFlags(t, "-resolver", "http", "-resolver-url", "https://detokenize.test/v1", "-resolver-cert", cert,
+		"-resolver-key", key, "-resolver-timeout", "30s", "-standin-prefixes", "tok_").build("user", quiet)
+	if err != nil || long.timeout != 30*time.Second {
+		t.Fatalf("-resolver-timeout 30s gave the proxy a %v deadline (%v)", long.timeout, err)
+	}
 	if got := setup.detector.Find(resolve.Principal{}, "tok_1 card_2 4242424242424242 4242424242424241"); strings.Join(got, ",") != "4242424242424242,card_2,tok_1" {
 		t.Fatalf("detected %q", got)
 	}

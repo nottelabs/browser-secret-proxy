@@ -743,12 +743,17 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 				}
 			}
 		}
+		// Every request goes to the CONNECT host: one naming another host is
+		// refused, so no value scoped to that host goes with it.
+		if err := r.opts.Session.CheckAuthority(authority); err != nil {
+			return r.badGateway(clientID, authority, endStream, err)
+		}
 		s = &stream{clientID: clientID, swap: r.opts.Hosts.Match(authority), authority: authority, clientEnded: endStream}
 		// A request with a body is swapped once the body is complete
 		// (finish), with a single lookup for its headers, body and trailers.
 		buffered := !endStream && s.swap && method != "CONNECT"
 		if s.swap && !buffered {
-			swapper, err := r.opts.Session.Swapper(r.ctx, authority, fieldText(fields)...)
+			swapper, err := r.opts.Session.Swapper(r.ctx, fieldText(fields)...)
 			if err != nil {
 				return r.badGateway(clientID, authority, endStream, err)
 			}
@@ -802,7 +807,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 	buffering := s.buffering
 	r.mu.Unlock()
 	if s.swap && !buffering {
-		swapper, err := r.opts.Session.Swapper(r.ctx, s.authority, fieldText(fields)...)
+		swapper, err := r.opts.Session.Swapper(r.ctx, fieldText(fields)...)
 		if err == nil && swapper != nil {
 			err = r.swapFields(swapper, fields, s.authority)
 		}
@@ -1145,7 +1150,7 @@ func (r *relay) finish(s *stream) error {
 	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
 	r.mu.Unlock()
 
-	swapper, err := r.opts.Session.Swapper(r.ctx, s.authority, append(append(fieldText(headers), fieldText(trailers)...), string(original))...)
+	swapper, err := r.opts.Session.Swapper(r.ctx, append(append(fieldText(headers), fieldText(trailers)...), string(original))...)
 	if err != nil {
 		r.mu.Lock()
 		current := r.streams[s.clientID] == s

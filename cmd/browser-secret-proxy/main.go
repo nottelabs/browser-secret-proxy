@@ -86,10 +86,12 @@ func run() error {
 		Hosts:     allow,
 		Resolver:  values.resolver,
 		Detector:  values.detector,
-		Dialer:    dialer,
-		Username:  os.Getenv("SECRET_PROXY_USERNAME"),
-		Password:  os.Getenv("SECRET_PROXY_PASSWORD"),
-		Logger:    logger,
+		// The proxy's own deadline on a lookup follows -resolver-timeout.
+		ResolveTimeout: values.timeout,
+		Dialer:         dialer,
+		Username:       os.Getenv("SECRET_PROXY_USERNAME"),
+		Password:       os.Getenv("SECRET_PROXY_PASSWORD"),
+		Logger:         logger,
 	})
 	if err != nil {
 		return err

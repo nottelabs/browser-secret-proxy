@@ -74,6 +74,14 @@ func (l *List) Match(host string) bool {
 	return false
 }
 
+// SameHost reports whether a and b (each with or without a port) name the
+// same host: ports are ignored, case and a trailing dot too. An empty name
+// matches nothing.
+func SameHost(a, b string) bool {
+	x, y := canonical(stripPort(a)), canonical(stripPort(b))
+	return x != "" && x == y
+}
+
 func canonical(s string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s)), ".")
 }

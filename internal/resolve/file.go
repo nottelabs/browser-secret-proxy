@@ -157,8 +157,16 @@ func newSnapshot(values map[string]string) (*fileSnapshot, error) {
 }
 
 // Resolve answers every requested stand-in the file holds.
-func (f *File) Resolve(_ context.Context, req Request) (Result, error) {
-	snapshot := f.current.Load()
+func (f *File) Resolve(ctx context.Context, req Request) (Result, error) {
+	return f.current.Load().Resolve(ctx, req)
+}
+
+// Snapshot returns the file's current version, whose StandIns and Resolve
+// stay the same whatever is loaded afterwards.
+func (f *File) Snapshot(Principal) (Snapshot, error) { return f.current.Load(), nil }
+
+// Resolve answers every requested stand-in the snapshot holds.
+func (snapshot *fileSnapshot) Resolve(_ context.Context, req Request) (Result, error) {
 	out := Result{Values: make(map[string]Value, len(req.StandIns))}
 	for _, standIn := range req.StandIns {
 		if v, ok := snapshot.values[standIn]; ok {
@@ -170,6 +178,9 @@ func (f *File) Resolve(_ context.Context, req Request) (Result, error) {
 
 // StandIns returns the file's stand-ins, whoever asks.
 func (f *File) StandIns(Principal) []string { return f.current.Load().standIns }
+
+// StandIns returns the snapshot's stand-ins, whoever asks.
+func (snapshot *fileSnapshot) StandIns(Principal) []string { return snapshot.standIns }
 
 // Count is the number of stand-ins currently loaded.
 func (f *File) Count() int { return len(f.current.Load().standIns) }

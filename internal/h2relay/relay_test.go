@@ -573,12 +573,12 @@ func settingsFrame(settings ...Setting) Frame {
 	return Frame{Type: FrameSettings, Payload: payload}
 }
 
-// otherRequest is a request for a host that is not allowlisted: its body is
-// streamed upstream, not buffered.
-func otherRequest(method string) []hpack.HeaderField {
-	fields := request(method)
-	fields[1].Value = "other.test"
-	return fields
+// otherRequest is a request whose body is streamed upstream, not buffered:
+// an extended CONNECT (RFC 8441), the only request on an intercepted
+// connection whose body is not swapped, since every request there goes to
+// the allowlisted CONNECT host. method is ignored.
+func otherRequest(string) []hpack.HeaderField {
+	return request("CONNECT", hpack.HeaderField{Name: ":protocol", Value: "websocket"})
 }
 
 func isGoAway(code uint32) func(Frame) bool {

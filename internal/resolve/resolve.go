@@ -66,6 +66,23 @@ type KnownStandIns interface {
 	StandIns(p Principal) []string
 }
 
+// Snapshot is one consistent view of a resolver for one principal: its
+// known stand-ins and the values it resolves come from the same version.
+type Snapshot interface {
+	Resolver
+	KnownStandIns
+}
+
+// Snapshotter is implemented by resolvers whose stand-ins and values change
+// over time (a reloaded file) or end (an expiring credential). The proxy
+// takes one Snapshot per request, so detection and resolution never mix two
+// versions. An error refuses the request, whether or not it holds a
+// stand-in; it wraps ErrUnauthenticated when the principal's credential is
+// no longer valid.
+type Snapshotter interface {
+	Snapshot(p Principal) (Snapshot, error)
+}
+
 // Authenticator is implemented by resolvers whose proxy credential carries
 // the values (sealed). When the configured resolver implements it, the proxy
 // calls it on every CONNECT instead of comparing a fixed username and

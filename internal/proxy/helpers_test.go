@@ -86,6 +86,7 @@ type destination struct {
 	addr   string
 	hellos chan []byte // raw ClientHello handshake messages
 	ca     *x509.CertPool
+	caCert *x509.Certificate
 }
 
 func startDestination(t *testing.T, host string, nextProtos []string, handle func(*tls.Conn)) *destination {
@@ -100,7 +101,7 @@ func startDestination(t *testing.T, host string, nextProtos []string, handle fun
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	d := &destination{addr: ln.Addr().String(), hellos: make(chan []byte, 16), ca: pool}
+	d := &destination{addr: ln.Addr().String(), hellos: make(chan []byte, 16), ca: pool, caCert: authority.CA()}
 	go func() {
 		for {
 			conn, err := ln.Accept()

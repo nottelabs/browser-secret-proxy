@@ -322,3 +322,29 @@ func TestSealedViewFailsClosedOnExpiry(t *testing.T) {
 		t.Fatalf("an expired token gave a view: %v", err)
 	}
 }
+
+// Both resolvers that change over time give the proxy one snapshot per request.
+var (
+	_ Snapshotter = (*Sealed)(nil)
+	_ Snapshotter = (*File)(nil)
+)
+
+func TestSealedSnapshotIsTheView(t *testing.T) {
+	key := ecKey(t)
+	s, _ := NewSealed(key)
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.Snapshot(p)
+	if err != nil || len(snap.StandIns(p)) != 2 {
+		t.Fatalf("snapshot: %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+	snap, err = s.Snapshot(p)
+	if !errors.Is(err, ErrUnauthenticated) || snap != nil {
+		t.Fatalf("an expired token gave snapshot %v, err %v", snap, err)
+	}
+}

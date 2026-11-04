@@ -323,3 +323,39 @@ func TestSealedResolverEndToEnd(t *testing.T) {
 		t.Fatal("the proxy log shows a real value or a token")
 	}
 }
+
+// A connection whose sealed token expires while it is open gets 502 for
+// every later request, stand-in or not, and nothing more reaches the
+// destination.
+func TestSealedTokenExpiringMidConnectionFailsClosed(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	resolver, err := resolve.NewSealed(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, proto := range protocols {
+		t.Run(proto, func(t *testing.T) {
+			t.Parallel()
+			exp := time.Now().Add(2 * time.Second).Truncate(time.Second).Add(time.Second)
+			token, err := resolve.Seal(&key.PublicKey, resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Exp: exp.Unix()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := &echoed{}
+			dest := startDestination(t, allowedHost, []string{proto}, echoDestination(got))
+			p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, func(c *Config) { setResolver(t, c, resolver, resolve.Patterns{}) })
+			client := proxiedClient(t, p, "any", token, proto)
+			expectStatus(t, "before exp", get(t, client, "tok_a"), http.StatusOK)
+			time.Sleep(time.Until(exp) + 100*time.Millisecond)
+			// No stand-in at all: the token's stand-ins can no longer be found,
+			// so nothing is sent.
+			expectStatus(t, "plain request after exp", get(t, client, "nothing"), http.StatusBadGateway)
+			if proto == "h2" { // HTTP/1.1 closes the connection after a 502
+				expectStatus(t, "stand-in after exp", get(t, client, "tok_a"), http.StatusBadGateway)
+			}
+			if seen := got.all(); seen != "/?q=real_a " {
+				t.Errorf("destination received:\n%s", seen)
+			}
+		})
+	}
+}
