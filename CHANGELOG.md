@@ -77,7 +77,9 @@ First release, planned as 0.1.0.
   held back only possible beginnings, so a client that had a destination
   echo its guesses could rebuild a value from the size and timing of the
   HTTP/1.1 chunks or HTTP/2 DATA frames it got. A streamed body now runs
-  that many bytes behind until it ends.
+  that many bytes behind until it ends. `-mask-stream-window=minimal`
+  restores the old behavior, and the oracle with it, for deployments that
+  trust every allowlisted host not to reflect input.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).

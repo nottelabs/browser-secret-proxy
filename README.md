@@ -250,6 +250,7 @@ real value in the echo.
 | `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
 | `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty; a `SECRET_PROXY_PASSWORD` without it is refused at start. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
+| `-mask-stream-window` | What masking holds back at the end of a streamed response: `fixed` (default), a window of bytes whatever they are, or `minimal`, only bytes that could begin a real value. `minimal` lowers streaming latency, but lets any allowlisted endpoint that reflects input reveal real values. Any other value is refused at start. See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
 | `-version` | Print the version and exit. |
 
@@ -620,12 +621,13 @@ What is masked:
   JSON-escaped in JSON and JavaScript bodies, query-escaped in form bodies
   and in `Location`, `Content-Location`, `Link`, `Refresh` and `Set-Cookie`,
   HTML-escaped in HTML and XML bodies, as is elsewhere;
-- values split across HTTP/1.1 chunks or HTTP/2 DATA frames. The proxy holds
-  back a window of the last bytes of a body it has received: one byte fewer
-  than the longest form of a value on record, so about six bytes per
-  character of the longest value, since a character reference (`&#x73;`)
-  takes up to six (149 bytes for a 25-character token). See below for what
-  this does to streams.
+- values split across HTTP/1.1 chunks or HTTP/2 DATA frames. By default
+  (`-mask-stream-window=fixed`) the proxy holds back a window of the last
+  bytes of a body it has received: one byte fewer than the longest form of a
+  value on record, so about six bytes per character of the longest value,
+  since a character reference (`&#x73;`) takes up to six (149 bytes for a
+  25-character token). See below for what this does to streams, and for
+  `-mask-stream-window=minimal`.
 
 How a masked response changes:
 
@@ -671,11 +673,17 @@ How a masked response changes:
   events (a short keep-alive comment passes on only as many bytes as it
   has), and an application that waits for the browser to act on an event
   before it sends more stalls. A response that ends, such as a long poll,
-  is complete when it ends. Holding back only bytes that could begin a
-  value would keep streams flowing, but a client that has a destination
-  echo its guesses could then tell, from the size and timing of what it
-  gets, how much of a value each guess matched, and rebuild the value byte
-  by byte.
+  is complete when it ends.
+- `-mask-stream-window=minimal` holds back only bytes that could begin a
+  value, at most the length of the longest form, so streams keep flowing.
+  But it reopens a prefix oracle against every allowlisted endpoint that
+  reflects input: a client that has the destination echo its guesses (a
+  search page, an error message that quotes a parameter) can tell, from the
+  size and timing of the HTTP/1.1 chunks, HTTP/2 DATA frames or TLS records
+  it gets, how much of a value each guess matched, and rebuild the value
+  byte by byte without ever receiving it. Use it only when you trust every
+  allowlisted host not to reflect what a client sends, and streaming
+  latency matters more to you than that.
 - Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
   the proxy is the flow-control endpoint for a masked stream, and keeps every
   other stream within the browser's windows. The request direction, and so

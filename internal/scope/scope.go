@@ -52,8 +52,10 @@ type Config struct {
 	// Now is the clock that expiry is checked against (default time.Now).
 	Now func() time.Time
 	// Mask keeps resolved values on record for masking responses.
-	Mask   bool
-	Logger *slog.Logger
+	Mask bool
+	// MaskWindow is what a masked stream holds back (default mask.Fixed).
+	MaskWindow mask.Window
+	Logger     *slog.Logger
 }
 
 // Scope builds a Session for each intercepted connection.
@@ -76,7 +78,9 @@ func New(cfg Config) (*Scope, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Scope{cfg: cfg, record: newRecord(cfg.Now)}, nil
+	rec := newRecord(cfg.Now)
+	rec.window = cfg.MaskWindow
+	return &Scope{cfg: cfg, record: rec}, nil
 }
 
 // Close stops the expiry sweep of the values kept for masking and drops

@@ -88,9 +88,15 @@ func TestLongestFormWins(t *testing.T) {
 }
 
 // Whatever the write boundaries, a stream is masked exactly as a whole
-// buffer is, and what is held back stays below the longest form.
+// buffer is, and what is held back stays below the longest form, with
+// either window.
 func TestWriterSplitsAnywhere(t *testing.T) {
-	m := testMasker(t)
+	for _, window := range []Window{Fixed, Minimal} {
+		t.Run(window.String(), func(t *testing.T) { testWriterSplitsAnywhere(t, testMasker(t).WithWindow(window)) })
+	}
+}
+
+func testWriterSplitsAnywhere(t *testing.T, m *Masker) {
 	text := "a " + card + " b 4111 1111 1111 1111 c " + `"sk_live_a\u0026b\u003cc\u003e\"d"` + " d sk_live_a&b<c>\"d" + card
 	want := m.String(Text, text)
 	for split := 0; split <= len(text); split++ {
@@ -150,6 +156,85 @@ func TestWriterHoldsBackAFixedWindow(t *testing.T) {
 	_ = w.Close()
 	if want := "data: {\"x\":1}\n\n" + text + "id 411112"; out.String() != want {
 		t.Fatalf("got %q, want %q", out.String(), want)
+	}
+}
+
+// The Minimal window holds back only bytes that could begin a real value,
+// as the masker did before the fixed window: text that cannot is passed on
+// at once, so a stream of events is not delayed.
+func TestMinimalWindowHoldsBackOnlyPossibleBeginnings(t *testing.T) {
+	m := testMasker(t).WithWindow(Minimal)
+	var out bytes.Buffer
+	w := m.NewWriter(&out, Text)
+	_, _ = w.Write([]byte("data: {\"x\":1}\n\n"))
+	if out.String() != "data: {\"x\":1}\n\n" || w.Pending() != 0 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	_, _ = w.Write([]byte("id 41111"))
+	if out.String() != "data: {\"x\":1}\n\nid " || w.Pending() != 5 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	_, _ = w.Write([]byte("2"))
+	if w.Pending() != 0 || !strings.HasSuffix(out.String(), "id 411112") {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	// A value split across writes is still masked.
+	out.Reset()
+	for _, part := range []string{"card 4111", " 1111 11", "11 1111!"} {
+		_, _ = w.Write([]byte(part))
+	}
+	if out.String() != "card 4242 4242 4242 4242!" || w.Pending() != 0 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	_, _ = w.Write([]byte("t=sk_live_a&b<c"))
+	if out.String() != "card 4242 4242 4242 4242!t=" || w.Pending() != 13 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+	_, _ = w.Write([]byte(">\"d."))
+	if out.String() != "card 4242 4242 4242 4242!t="+tokenSIn+"." || w.Pending() != 0 {
+		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	}
+}
+
+// What the Minimal window passes on depends on whether the end of the text
+// could begin a real value: the oracle the Fixed window closes (critic-1)
+// is open with it, which is why it is not the default.
+func TestMinimalWindowRevealsPrefixes(t *testing.T) {
+	m := testMasker(t).WithWindow(Minimal)
+	written := func(parts ...string) sizes {
+		var s sizes
+		w := m.NewWriter(&s, Text)
+		for _, p := range parts {
+			_, _ = w.Write([]byte(p))
+		}
+		_ = w.Close()
+		return s
+	}
+	hit, other := written("results for 41111", " end"), written("results for ~~~~~", " end")
+	if slices.Equal(hit, other) {
+		t.Fatalf("pieces %v for both", hit)
+	}
+}
+
+func TestWindowText(t *testing.T) {
+	for _, window := range []Window{Fixed, Minimal} {
+		text, err := window.MarshalText()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Window
+		if err := got.UnmarshalText(text); err != nil || got != window {
+			t.Fatalf("%q: got %v, %v", text, got, err)
+		}
+	}
+	if Window(0) != Fixed {
+		t.Fatal("the zero Window is not Fixed")
+	}
+	for _, bad := range []string{"", "Fixed", "min", "none"} {
+		w := Minimal
+		if err := w.UnmarshalText([]byte(bad)); err == nil || w != Minimal {
+			t.Fatalf("%q: got %v, %v", bad, w, err)
+		}
 	}
 }
 

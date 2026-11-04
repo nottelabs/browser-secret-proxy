@@ -16,6 +16,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/h2relay"
+	"github.com/nottelabs/browser-secret-proxy/internal/mask"
 )
 
 // A destination that reflects a client's input and flushes after it does
@@ -28,6 +29,30 @@ import (
 // that extends the value must now get the same framing as one that does
 // not.
 func TestMaskingFramingDoesNotRevealPrefixes(t *testing.T) {
+	protos(t, func(t *testing.T, proto string) {
+		if leaked, of := framingLeaks(t, proto, mask.Fixed); leaked > 0 {
+			t.Fatalf("the framing told a matching guess from a wrong one at %d of %d bytes", leaked, of)
+		}
+	})
+}
+
+// -mask-stream-window=minimal holds back only bytes that could begin a
+// value, as the masker used to, and so gives the oracle back: this is the
+// trade-off an operator accepts with it.
+func TestMinimalMaskWindowRevealsPrefixes(t *testing.T) {
+	protos(t, func(t *testing.T, proto string) {
+		if leaked, _ := framingLeaks(t, proto, mask.Minimal); leaked == 0 {
+			t.Fatal("the framing of a matching guess was the same as of a wrong one at every byte")
+		}
+	})
+}
+
+// framingLeaks has a streaming destination reflect a guess at each prefix of
+// a real value, and one with a wrong last byte, through a proxy that masks
+// streams with window. It returns at how many of the prefixes the framing
+// of the two responses differed, of how many.
+func framingLeaks(t *testing.T, proto string, window mask.Window) (leaked, of int) {
+	t.Helper()
 	const real = "sk_live_real_secret_value"
 	page := strings.Repeat("<p>results</p>\n", 40) + "results for "
 	// The client signals once it has the first piece of a search response,
@@ -51,40 +76,36 @@ func TestMaskingFramingDoesNotRevealPrefixes(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, " end")
 	})
-	protos(t, func(t *testing.T, proto string) {
-		p := maskingSetup(t, proto, serveWith(&echoed{}, handler), map[string]string{"tok_standin": real})
-		conn, resp := connect(t, p.addr, allowedHost+":443", "")
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatal(resp.Status)
+	p := maskingSetup(t, proto, serveWith(&echoed{}, handler), map[string]string{"tok_standin": real},
+		func(c *Config) { c.MaskStreamWindow = window })
+	conn, resp := connect(t, p.addr, allowedHost+":443", "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.Status)
+	}
+	tc := tls.Client(conn, &tls.Config{ServerName: allowedHost, RootCAs: p.ca, NextProtos: []string{proto}})
+	if err := tc.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	pieces := h1Pieces(t, tc)
+	if proto == "h2" {
+		pieces = h2Pieces(t, tc)
+	}
+	// A request with the stand-in puts the real value on record.
+	pieces(http.MethodPost, "/login", "pw=tok_standin", nil)
+	for n := 1; n < len(real); n++ {
+		miss := byte('z')
+		if real[n-1] == miss {
+			miss = 'y'
 		}
-		tc := tls.Client(conn, &tls.Config{ServerName: allowedHost, RootCAs: p.ca, NextProtos: []string{proto}})
-		if err := tc.Handshake(); err != nil {
-			t.Fatal(err)
+		hit := pieces(http.MethodGet, "/search?q="+real[:n], "", seen)
+		other := pieces(http.MethodGet, "/search?q="+real[:n-1]+string(miss), "", seen)
+		if !slices.Equal(hit, other) {
+			leaked++
+			t.Logf("%d bytes of the value: pieces %v, %v for a wrong last byte", n, hit, other)
 		}
-		pieces := h1Pieces(t, tc)
-		if proto == "h2" {
-			pieces = h2Pieces(t, tc)
-		}
-		// A request with the stand-in puts the real value on record.
-		pieces(http.MethodPost, "/login", "pw=tok_standin", nil)
-		leaked := 0
-		for n := 1; n < len(real); n++ {
-			miss := byte('z')
-			if real[n-1] == miss {
-				miss = 'y'
-			}
-			hit := pieces(http.MethodGet, "/search?q="+real[:n], "", seen)
-			other := pieces(http.MethodGet, "/search?q="+real[:n-1]+string(miss), "", seen)
-			if !slices.Equal(hit, other) {
-				leaked++
-				t.Logf("%d bytes of the value: pieces %v, %v for a wrong last byte", n, hit, other)
-			}
-		}
-		if leaked > 0 {
-			t.Fatalf("the framing told a matching guess from a wrong one at %d of %d bytes", leaked, len(real)-1)
-		}
-	})
+	}
+	return leaked, len(real) - 1
 }
 
 // h1Pieces returns a function that sends a request over c and returns the

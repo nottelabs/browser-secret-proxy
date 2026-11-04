@@ -36,6 +36,7 @@ type record struct {
 	mu         sync.Mutex
 	principals map[principalKey]*principalValues
 	now        func() time.Time
+	window     mask.Window // of every Masker built
 	// The expiry sweep: a timer armed for the earliest expiry on record, no
 	// sooner than sweepEvery after the previous sweep, and stopped by close.
 	sweepEvery time.Duration
@@ -248,7 +249,7 @@ func (r *record) masker(p resolve.Principal) *mask.Masker {
 		for real, e := range pv.values {
 			pairs = append(pairs, mask.Pair{Real: real, StandIn: e.standIn})
 		}
-		pv.masker = mask.New(pairs)
+		pv.masker = mask.New(pairs).WithWindow(r.window)
 		pv.stale = false
 	}
 	return pv.masker
