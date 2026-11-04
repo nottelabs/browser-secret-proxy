@@ -25,7 +25,7 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/certs"
 	"github.com/nottelabs/browser-secret-proxy/internal/clienthello"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/browser-secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 )
 
 const (
@@ -160,16 +160,20 @@ func startProxy(t *testing.T, dialer mapDialer, destinationCAs *x509.CertPool, m
 	if err != nil {
 		t.Fatal(err)
 	}
-	swapper, err := swap.New(map[string]string{
+	resolver, err := resolve.NewStatic(map[string]string{
 		"4242424242424242": "4111111111111111",
 		"tok_standin":      "sk_live_real_secret_value",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	detector, err := resolve.NewDetector(resolver, resolve.Patterns{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	logs := &syncBuffer{}
 	cfg := Config{
-		Authority: authority, Hosts: hosts, Swapper: swapper, Dialer: dialer, RootCAs: destinationCAs,
+		Authority: authority, Hosts: hosts, Resolver: resolver, Detector: detector, Dialer: dialer, RootCAs: destinationCAs,
 		HandshakeTimeout: 10 * time.Second,
 		Logger:           slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
