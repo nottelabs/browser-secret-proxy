@@ -24,8 +24,10 @@ First release, planned as 0.1.0.
 - `-version` prints the build's version.
 - Values are scoped: each one is swapped only into requests for the hosts it
   allows and before it expires, and only for the principal (proxy
-  credential) it was looked up for. A request that breaks a scope, or whose
-  lookup fails, is answered `502` and not sent.
+  credential) it was looked up for. Hosts are checked against the
+  `CONNECT` destination, and a request naming another host is refused. A
+  request that breaks a scope, or whose lookup fails, is answered `502` and
+  not sent.
 - Response masking, on by default (`-mask-responses`): real values looked up
   for a principal are replaced by their stand-ins in response headers,
   bodies and trailers on allowlisted hosts, over HTTP/1.1 and HTTP/2, in

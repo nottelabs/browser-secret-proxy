@@ -325,7 +325,7 @@ func TestPassthroughWaitsForTheWindowMaskingUsed(t *testing.T) {
 	if resp := c.readHead(3); resp[":status"] != "200" {
 		t.Fatalf("head %v", resp)
 	}
-	if _, err := session.Swapper(context.Background(), "allowed.test", tokenSIn); err != nil {
+	if _, err := session.Swapper(context.Background(), tokenSIn); err != nil {
 		t.Fatal(err)
 	}
 	masked := get(h, 5)                                                       // client stream IDs only grow

@@ -41,14 +41,14 @@ func TestMaskersFollowPrincipals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	alice := sc.Session(resolve.Principal{ID: "alice", Password: "a"})
-	aliceAgain := sc.Session(resolve.Principal{ID: "alice", Password: "a"})
-	aliceOtherSecret := sc.Session(resolve.Principal{ID: "alice", Password: "other"})
-	bob := sc.Session(resolve.Principal{ID: "bob"})
+	alice := sc.Session(resolve.Principal{ID: "alice", Password: "a"}, "api.example.com")
+	aliceAgain := sc.Session(resolve.Principal{ID: "alice", Password: "a"}, "api.example.com")
+	aliceOtherSecret := sc.Session(resolve.Principal{ID: "alice", Password: "other"}, "api.example.com")
+	bob := sc.Session(resolve.Principal{ID: "bob"}, "other.example")
 	if alice.Masker() != nil {
 		t.Fatal("nothing resolved yet, nothing to mask")
 	}
-	if _, err := alice.Swapper(context.Background(), "api.example.com", "tok_alice"); err != nil {
+	if _, err := alice.Swapper(context.Background(), "tok_alice"); err != nil {
 		t.Fatal(err)
 	}
 	if got := aliceAgain.Masker().String("x alice_real_1"); got != "x tok_alice" {
@@ -58,7 +58,7 @@ func TestMaskersFollowPrincipals(t *testing.T) {
 		t.Fatal("alice's values reached another principal")
 	}
 	// A value refused for its host is still on record: it is alice's.
-	if _, err := bob.Swapper(context.Background(), "other.example", "tok_bob"); err == nil {
+	if _, err := bob.Swapper(context.Background(), "tok_bob"); err == nil {
 		t.Fatal("expected a refusal")
 	}
 	if got := bob.Masker().String("bob_real_22"); got != "tok_bob" {
@@ -70,8 +70,8 @@ func TestMaskersFollowPrincipals(t *testing.T) {
 	}
 	// Masking off: nothing is kept.
 	off, _ := New(Config{Resolver: r, Detector: detector, Hosts: hosts})
-	s := off.Session(resolve.Principal{ID: "alice"})
-	_, _ = s.Swapper(context.Background(), "api.example.com", "tok_alice")
+	s := off.Session(resolve.Principal{ID: "alice"}, "api.example.com")
+	_, _ = s.Swapper(context.Background(), "tok_alice")
 	if s.Masker() != nil || s.Masking() {
 		t.Fatal("masking is off")
 	}

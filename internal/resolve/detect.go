@@ -73,9 +73,15 @@ func NewDetector(r Resolver, p Patterns) (*Detector, error) {
 // Find returns the distinct stand-ins in texts, in canonical (unescaped)
 // form, sorted. It returns nil when there are none.
 func (d *Detector) Find(p Principal, texts ...string) []string {
+	return d.FindIn(d.known, p, texts...)
+}
+
+// FindIn is Find with known in place of the resolver's own known stand-ins:
+// a Snapshot's, so detection reads the version resolution will.
+func (d *Detector) FindIn(known KnownStandIns, p Principal, texts ...string) []string {
 	found := map[string]bool{}
-	if d.known != nil {
-		for _, standIn := range d.known.StandIns(p) {
+	if known != nil {
+		for _, standIn := range known.StandIns(p) {
 			if standIn != "" && containsAny(texts, swap.Forms(standIn)) {
 				found[standIn] = true
 			}

@@ -14,7 +14,10 @@ import (
 
 // scoped gives the relay one stand-in, tok_a, whose value may go only to
 // pay.test, and one, tok_old, that has expired.
-func scoped(t *testing.T) func(*Options) {
+func scoped(t *testing.T) func(*Options) { return scopedTo(t, scopetest.Host) }
+
+// scopedTo is scoped on a connection opened to host.
+func scopedTo(t *testing.T, host string) func(*Options) {
 	return func(o *Options) {
 		r := scopetest.Resolver{Known: []string{"tok_a", "tok_old"}, Fn: func(resolve.Request) (resolve.Result, error) {
 			return resolve.Result{Values: map[string]resolve.Value{
@@ -22,7 +25,7 @@ func scoped(t *testing.T) func(*Options) {
 				"tok_old": {Real: "real_old", ExpiresAt: time.Now().Add(-time.Minute)},
 			}}, nil
 		}}
-		o.Session = scopetest.Session(t, o.Hosts, r, resolve.Principal{ID: "alice"})
+		o.Session = scopetest.SessionTo(t, o.Hosts, r, resolve.Principal{ID: "alice"}, host)
 	}
 }
 
@@ -84,7 +87,7 @@ func TestInScopeValueIsSwapped(t *testing.T) {
 			t.Fatal(err)
 		}
 		o.Hosts = hosts
-		scoped(t)(o)
+		scopedTo(t, "pay.test")(o)
 	})
 	fields := request("GET")
 	fields[1].Value = "pay.test"

@@ -21,9 +21,18 @@ func Static(t testing.TB, hosts *hostmatch.List, values map[string]string) *scop
 	return Session(t, hosts, resolver, resolve.Principal{})
 }
 
-// Session returns a session for principal over resolver, whose stand-ins
-// it must know in advance (resolve.KnownStandIns).
+// Host is the CONNECT host of the sessions Static and Session return.
+const Host = "allowed.test"
+
+// Session returns a session for principal, on a connection to Host, over
+// resolver, whose stand-ins it must know in advance (resolve.KnownStandIns).
 func Session(t testing.TB, hosts *hostmatch.List, resolver resolve.Resolver, principal resolve.Principal) *scope.Session {
+	t.Helper()
+	return SessionTo(t, hosts, resolver, principal, Host)
+}
+
+// SessionTo is Session on a connection to host.
+func SessionTo(t testing.TB, hosts *hostmatch.List, resolver resolve.Resolver, principal resolve.Principal, host string) *scope.Session {
 	t.Helper()
 	detector, err := resolve.NewDetector(resolver, resolve.Patterns{})
 	if err != nil {
@@ -33,7 +42,7 @@ func Session(t testing.TB, hosts *hostmatch.List, resolver resolve.Resolver, pri
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s.Session(principal)
+	return s.Session(principal, host)
 }
 
 // Resolver is a resolver whose stand-ins are Known in advance and whose
@@ -84,9 +93,9 @@ func Masked(t testing.TB, hosts *hostmatch.List, resolver resolve.Resolver, prin
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := s.Session(principal)
+	session := s.Session(principal, host)
 	if len(known) > 0 {
-		if _, err := session.Swapper(context.Background(), host, known...); err != nil {
+		if _, err := session.Swapper(context.Background(), known...); err != nil {
 			t.Fatal(err)
 		}
 	}

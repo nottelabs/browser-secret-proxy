@@ -18,14 +18,17 @@ import (
 func scopedOptions(t *testing.T) Options {
 	t.Helper()
 	o := options(t)
-	r := scopetest.Resolver{Known: []string{"tok_a", "tok_old"}, Fn: func(req resolve.Request) (resolve.Result, error) {
+	o.Session = scopetest.Session(t, o.Hosts, scopedResolver(), resolve.Principal{ID: "alice"})
+	return o
+}
+
+func scopedResolver() scopetest.Resolver {
+	return scopetest.Resolver{Known: []string{"tok_a", "tok_old"}, Fn: func(req resolve.Request) (resolve.Result, error) {
 		return resolve.Result{Values: map[string]resolve.Value{
 			"tok_a":   {Real: "real_a", Hosts: []string{"pay.test"}},
 			"tok_old": {Real: "real_old", ExpiresAt: time.Now().Add(-time.Minute)},
 		}}, nil
 	}}
-	o.Session = scopetest.Session(t, o.Hosts, r, resolve.Principal{ID: "alice"})
-	return o
 }
 
 // A request whose value may not go to its host, or has expired, is
@@ -89,6 +92,7 @@ func TestInScopeValueIsSwapped(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.Hosts = hosts
+	o.Session = scopetest.SessionTo(t, hosts, scopedResolver(), resolve.Principal{ID: "alice"}, "pay.test")
 	client, _, _, serverReader, _ := pipesWith(t, o)
 	send(t, client, "GET /?card=tok_a HTTP/1.1\r\nHost: pay.test\r\n\r\n")
 	if head := readHead(t, serverReader); !strings.HasPrefix(head, "GET /?card=real_a ") {

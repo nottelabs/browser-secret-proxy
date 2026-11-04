@@ -58,6 +58,9 @@ type Config struct {
 	RootCAs *x509.CertPool
 	// MaxBody caps a buffered request body (default 32 MiB).
 	MaxBody int
+	// ResolveTimeout bounds one resolver lookup (default
+	// scope.DefaultTimeout).
+	ResolveTimeout time.Duration
 	// MaskResponses replaces real values resolved for a connection's
 	// principal with their stand-ins in responses on allowlisted hosts.
 	MaskResponses    bool
@@ -91,7 +94,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 30 * time.Second
 	}
-	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Mask: cfg.MaskResponses, Logger: cfg.Logger})
+	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Mask: cfg.MaskResponses, Logger: cfg.Logger})
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +222,7 @@ func (s *Server) handle(conn net.Conn) {
 		tunnel(&readerConn{Conn: conn, r: br}, upConn)
 		return
 	}
-	s.intercept(ctx, log, conn, br, upConn, host, s.scope.Session(principal))
+	s.intercept(ctx, log, conn, br, upConn, host, s.scope.Session(principal, host))
 }
 
 // authenticate checks a CONNECT's Proxy-Authorization and returns the

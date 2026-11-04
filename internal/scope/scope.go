@@ -1,11 +1,18 @@
 // Package scope decides which real values a request may carry.
 //
-// For each request on an allowlisted host, a Session finds the stand-ins the
-// request holds, asks the resolver for their real values once, with the
-// connection's principal, and builds a swap.Swapper that holds only those
-// values. A value is used only when it may go to the request's host and has
-// not expired; otherwise the whole request is refused, before anything is
-// sent upstream. Nothing is cached here: every request is resolved again, so
+// A Session is the scope of one intercepted connection: the principal its
+// CONNECT authenticated as and the host it CONNECTed to, which is where every
+// request on it goes, whatever its Host or :authority says. A request whose
+// authority names another host is refused. For each request, the Session
+// finds the stand-ins it holds (also in their query-, path- and
+// JSON-escaped forms), keeps the ones a swap would actually replace (a longer
+// stand-in wins over one it contains), asks the resolver for their real
+// values once, with the connection's principal, and builds a swap.Swapper
+// that holds only those values. A value is used only when it may go to the
+// CONNECT host and has not expired; otherwise the whole request is refused,
+// before anything is sent upstream. A resolver that is a resolve.Snapshotter
+// gives one consistent version for detection and resolution, and can refuse
+// the principal outright (an expired credential). Nothing is cached here: every request is resolved again, so
 // a value resolved for one principal is never used for another, and a
 // resolver's own expiry and revocation apply to the next request.
 //
@@ -71,15 +78,27 @@ func New(cfg Config) (*Scope, error) {
 }
 
 // Session is the scope of one connection: the principal its CONNECT
-// authenticated as.
-func (s *Scope) Session(p resolve.Principal) *Session {
-	return &Session{scope: s, principal: p}
+// authenticated as, and the host it CONNECTed to.
+func (s *Scope) Session(p resolve.Principal, host string) *Session {
+	return &Session{scope: s, principal: p, host: host}
 }
 
 // Session resolves the requests of one connection.
 type Session struct {
 	scope     *Scope
 	principal resolve.Principal
+	host      string // the CONNECT destination
+}
+
+// CheckAuthority refuses a request whose authority (Host or :authority) is
+// not the host the connection was opened to: such a request would still
+// reach the CONNECT host, so values scoped to the host it names must not go
+// with it.
+func (s *Session) CheckAuthority(authority string) error {
+	if !hostmatch.SameHost(authority, s.host) {
+		return refused("the request's authority is not the host the connection was opened to")
+	}
+	return nil
 }
 
 // Masker returns the Masker for every value resolved for this session's
@@ -117,12 +136,12 @@ func refused(format string, args ...any) error {
 	return &RefusedError{Reason: fmt.Sprintf(format, args...)}
 }
 
-// Swapper returns a Swapper for one request to host whose swappable text is
-// texts: the query part of the target, the header values that are not
-// framing headers, and the body. It returns nil when the request holds no
+// Swapper returns a Swapper for one request whose swappable text is texts:
+// the query part of the target, the header values that are not framing
+// headers, and the body. It returns nil when the request holds no
 // stand-in, and a *RefusedError when it must not be sent.
-func (s *Session) Swapper(ctx context.Context, host string, texts ...string) (*swap.Swapper, error) {
-	values, err := s.Values(ctx, host, texts...)
+func (s *Session) Swapper(ctx context.Context, texts ...string) (*swap.Swapper, error) {
+	values, err := s.Values(ctx, texts...)
 	if err != nil || values == nil {
 		return nil, err
 	}
@@ -137,21 +156,41 @@ func (s *Session) Swapper(ctx context.Context, host string, texts ...string) (*s
 	return sw, nil
 }
 
-// Values resolves the stand-ins texts hold and checks that each value may go
-// to host now. It returns nil when there are no stand-ins.
-func (s *Session) Values(ctx context.Context, host string, texts ...string) (map[string]resolve.Value, error) {
+// Values resolves the stand-ins a swap of texts would replace and checks
+// that each value may go to the connection's host now. It returns nil when
+// there are none.
+func (s *Session) Values(ctx context.Context, texts ...string) (map[string]resolve.Value, error) {
 	cfg := s.scope.cfg
-	standIns := cfg.Detector.Find(s.principal, texts...)
+	resolver := cfg.Resolver
+	var known resolve.KnownStandIns
+	if snapshotter, ok := cfg.Resolver.(resolve.Snapshotter); ok {
+		snapshot, err := snapshotter.Snapshot(s.principal)
+		if err != nil {
+			cfg.Logger.Warn("resolver refused the principal", "principal", s.principal.ID, "host", s.host, "error", errorCategory(err))
+			if errors.Is(err, resolve.ErrUnauthenticated) {
+				return nil, refused("the proxy credential is no longer valid")
+			}
+			return nil, refused("the resolver failed")
+		}
+		resolver, known = snapshot, snapshot
+	}
+	var candidates []string
+	if known != nil {
+		candidates = cfg.Detector.FindIn(known, s.principal, withDecoded(texts)...)
+	} else {
+		candidates = cfg.Detector.Find(s.principal, withDecoded(texts)...)
+	}
+	standIns := used(candidates, texts)
 	if len(standIns) == 0 {
 		return nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
-	result, err := cfg.Resolver.Resolve(ctx, resolve.Request{StandIns: standIns, Host: host, Principal: s.principal})
+	result, err := resolver.Resolve(ctx, resolve.Request{StandIns: standIns, Host: s.host, Principal: s.principal})
 	if err != nil {
-		// The resolver's error may quote what it was sent; log it, never
-		// return it to the client.
-		cfg.Logger.Warn("resolver failed", "principal", s.principal.ID, "host", host, "stand_ins", len(standIns), "error", err)
+		// The resolver's error may quote what it was sent, or a real value:
+		// only its category is logged, and nothing reaches the client.
+		cfg.Logger.Warn("resolver failed", "principal", s.principal.ID, "host", s.host, "stand_ins", len(standIns), "error", errorCategory(err))
 		return nil, refused("the resolver failed")
 	}
 	if cfg.Mask {
@@ -171,9 +210,9 @@ func (s *Session) Values(ctx context.Context, host string, texts ...string) (map
 		case !v.ExpiresAt.IsZero() && !now.Before(v.ExpiresAt):
 			return nil, refused("a value has expired")
 		}
-		allowed, err := s.allows(v, host)
+		allowed, err := s.allows(v, s.host)
 		if err != nil {
-			cfg.Logger.Warn("resolver returned an invalid host list", "principal", s.principal.ID, "error", err)
+			cfg.Logger.Warn("resolver returned an invalid host list", "principal", s.principal.ID)
 			return nil, refused("the resolver returned an invalid host list")
 		}
 		if !allowed {
@@ -182,6 +221,19 @@ func (s *Session) Values(ctx context.Context, host string, texts ...string) (map
 		values[standIn] = v
 	}
 	return values, nil
+}
+
+// errorCategory names the kind of a resolver error without its text.
+func errorCategory(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, resolve.ErrUnauthenticated):
+		return "credential refused"
+	}
+	return "error"
 }
 
 // allows reports whether v may be sent to host: one of its own hosts, or,
