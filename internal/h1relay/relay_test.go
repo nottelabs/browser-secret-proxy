@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nottelabs/secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 func options(t *testing.T) Options {

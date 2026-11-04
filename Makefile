@@ -5,7 +5,7 @@
 # has the same single setting, project_name in .goreleaser.yaml.
 NAME    ?= browser-secret-proxy
 BINARY  := $(NAME)
-PKG     := ./cmd/secret-proxy
+PKG     := ./cmd/browser-secret-proxy
 BIN_DIR := bin
 IMAGE   ?= $(NAME):dev
 

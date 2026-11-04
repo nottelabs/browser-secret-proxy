@@ -42,4 +42,4 @@ formatters:
       simplify: true
     goimports:
       local-prefixes:
-        - github.com/nottelabs/secret-proxy
+        - github.com/nottelabs/browser-secret-proxy

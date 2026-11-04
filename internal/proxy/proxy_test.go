@@ -20,8 +20,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/nottelabs/secret-proxy/internal/clienthello"
-	"github.com/nottelabs/secret-proxy/internal/h2relay"
+	"github.com/nottelabs/browser-secret-proxy/internal/clienthello"
+	"github.com/nottelabs/browser-secret-proxy/internal/h2relay"
 )
 
 func respondOK(c *tls.Conn) {

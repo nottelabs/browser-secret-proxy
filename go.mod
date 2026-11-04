@@ -1,4 +1,4 @@
-module github.com/nottelabs/secret-proxy
+module github.com/nottelabs/browser-secret-proxy
 
 go 1.26.0
 

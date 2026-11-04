@@ -13,7 +13,7 @@ before:
 
 builds:
   - id: proxy
-    main: ./cmd/secret-proxy
+    main: ./cmd/browser-secret-proxy
     binary: "{{ .ProjectName }}"
     env:
       - CGO_ENABLED=0
