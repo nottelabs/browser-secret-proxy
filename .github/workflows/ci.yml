@@ -37,6 +37,28 @@ jobs:
       - run: make vet
       - run: make race
 
+  # The source image (Dockerfile) is built with its own Go version, which
+  # Dependabot moves; run the tests on that exact version as well.
+  test-docker-go:
+    name: race tests, Dockerfile Go
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the Go version of the Dockerfile
+        id: go
+        run: |
+          version="$(sed -n 's/^FROM .*golang:\([0-9][0-9.]*\)-.*/\1/p' Dockerfile)"
+          if [ -z "$version" ]; then echo "::error::no golang build stage in Dockerfile"; exit 1; fi
+          echo "Dockerfile builds with Go $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+          cache-dependency-path: go.sum
+      - run: make race
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-24.04

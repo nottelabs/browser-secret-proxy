@@ -2,7 +2,8 @@
 #   docker build -t browser-secret-proxy .
 #   docker run --rm -p 8080:8080 -v ... browser-secret-proxy -ca-cert ... -ca-key ... -hosts ... -swaps ...
 #
-# Base images are pinned by digest; Dependabot updates them.
+# Base images are pinned by digest; Dependabot updates them. CI reads the Go
+# version from the build stage below and runs the tests on it (ci.yml).
 
 FROM --platform=$BUILDPLATFORM golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS build
 WORKDIR /src

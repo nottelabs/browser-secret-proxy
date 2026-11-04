@@ -36,7 +36,8 @@ were swapped.
 
 ## Quick start
 
-You need Go 1.26 or later to build from source, or Docker.
+You need Go 1.26 or later to build from source, or Docker. CI runs the
+tests on the latest Go 1.26 and on the Go version the Dockerfile builds with.
 
 ### 1. Create a CA
 
@@ -762,15 +763,26 @@ Each release publishes binaries for linux and darwin (amd64, arm64), a
 keyless signing, an SPDX SBOM per archive, and a signed multi-arch image,
 `ghcr.io/nottelabs/browser-secret-proxy`.
 
+No release is published yet; the first is planned as 0.1.0.
+
+Only `.github/workflows/release.yml`, run for the release's tag, signs a
+release. Check for that exact identity: a pattern that matches any workflow
+of the repository also accepts a signature made by another workflow or on a
+branch. Git tags have a leading `v` (`v0.1.0`), image tags do not (`0.1.0`).
+
 ```sh
+VERSION=0.1.0
+IDENTITY="https://github.com/nottelabs/browser-secret-proxy/.github/workflows/release.yml@refs/tags/v$VERSION"
+
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/nottelabs/browser-secret-proxy/' \
+  --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-sha256sum --ignore-missing -c checksums.txt
+sha256sum --ignore-missing -c checksums.txt      # Linux
+shasum -a 256 --ignore-missing -c checksums.txt  # macOS
 
-cosign verify ghcr.io/nottelabs/browser-secret-proxy:<version> \
-  --certificate-identity-regexp '^https://github.com/nottelabs/browser-secret-proxy/' \
+cosign verify "ghcr.io/nottelabs/browser-secret-proxy:$VERSION" \
+  --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
