@@ -47,6 +47,9 @@ In scope:
   in a form other than the request it was placed in;
 - a real value, the CA key or proxy credentials appearing in logs or error
   messages;
+- with response masking on (the default), a real value reaching the client
+  in a response, in a form the README's
+  [Response masking](README.md#response-masking) section says is masked;
 - bypassing proxy authentication;
 - decrypting traffic to a host that is not allowlisted;
 - issuing a certificate for a host that is not allowlisted, or a certificate
@@ -60,8 +63,9 @@ Out of scope:
 
 - anything that requires the CA key, the swaps file or shell access on the
   host running the proxy;
-- real values returned by a destination in its responses (the proxy does not
-  mask responses; see the README);
+- real values in responses that masking does not cover: with
+  `-mask-responses=false`, or in the cases listed under
+  [What masking misses](README.md#what-masking-misses);
 - exposing the proxy without authentication or without TLS in front of it,
   against the README's guidance;
 - denial of service through traffic volume, and load testing;
