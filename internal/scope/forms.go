@@ -121,56 +121,24 @@ func jsonUnescape(s string) string {
 	return b.String()
 }
 
-// used returns the candidates a swap of texts would replace, in the order a
-// swap.Swapper applies them: at each position the longest stand-in wins, in
-// any of its forms (swap.Forms), and replaced text is not searched again. A
-// candidate found only inside a longer one is not used, so its value is
-// neither looked up nor checked.
-func used(candidates, texts []string) []string {
+// used returns the candidates a swap of parts would replace, each part by
+// the rules of its place (swap.Matches): a candidate found only inside a
+// longer one, or only in a form its place does not replace, is not used, so
+// its value is neither looked up nor checked, and the request's Swapper,
+// built from the used ones, replaces exactly what was checked.
+func used(candidates []string, parts []swap.Part) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
-	keys := append([]string(nil), candidates...)
-	sort.Slice(keys, func(i, j int) bool {
-		if len(keys[i]) != len(keys[j]) {
-			return len(keys[i]) > len(keys[j])
-		}
-		return keys[i] < keys[j]
-	})
-	type form struct {
-		text string
-		key  int
-	}
-	var byFirst [256][]form // in priority order
-	for k, key := range keys {
-		for _, f := range swap.Forms(key) {
-			if f != "" {
-				byFirst[f[0]] = append(byFirst[f[0]], form{f, k})
-			}
+	seen := map[string]bool{}
+	for _, p := range parts {
+		for _, m := range swap.Matches(p, candidates) {
+			seen[m] = true
 		}
 	}
-	hit := make([]bool, len(keys))
-	for _, t := range texts {
-		for i := 0; i < len(t); {
-			advanced := false
-			for _, f := range byFirst[t[i]] {
-				if strings.HasPrefix(t[i:], f.text) {
-					hit[f.key] = true
-					i += len(f.text)
-					advanced = true
-					break
-				}
-			}
-			if !advanced {
-				i++
-			}
-		}
-	}
-	var out []string
-	for k, key := range keys {
-		if hit[k] {
-			out = append(out, key)
-		}
+	out := make([]string, 0, len(seen))
+	for m := range seen {
+		out = append(out, m)
 	}
 	sort.Strings(out)
 	return out
