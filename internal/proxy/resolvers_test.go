@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
@@ -20,6 +22,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 )
@@ -263,26 +268,68 @@ func TestHTTPResolverUnreachableFailsClosed(t *testing.T) {
 	}
 }
 
-func TestSealedResolverEndToEnd(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	resolver, err := resolve.NewSealed(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seal := func(p resolve.SealedPayload) string {
-		t.Helper()
-		token, err := resolve.Seal(&key.PublicKey, p)
+// sealedAudience is the proxy identity of the sealed end-to-end tests.
+const sealedAudience = "proxy-e2e"
+
+// sealedFixture is a sealed resolver whose tokens are encrypted to key and
+// signed by any of issuers.
+type sealedFixture struct {
+	t        *testing.T
+	key      *ecdsa.PrivateKey
+	issuers  []ed25519.PrivateKey
+	resolver *resolve.Sealed
+}
+
+func newSealedFixture(t *testing.T, issuers int) *sealedFixture {
+	t.Helper()
+	f := &sealedFixture{t: t}
+	f.key, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	var public []crypto.PublicKey
+	for range issuers {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return token
+		f.issuers = append(f.issuers, priv)
+		public = append(public, pub)
 	}
+	var err error
+	f.resolver, err = resolve.NewSealed(resolve.SealedConfig{Keys: []crypto.PrivateKey{f.key}, IssuerKeys: public, Audience: sealedAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// seal signs p with issuer and encrypts it to proxyKey, for this proxy's
+// audience unless p names one.
+func (f *sealedFixture) seal(proxyKey *ecdsa.PublicKey, issuer crypto.Signer, p resolve.SealedPayload) string {
+	f.t.Helper()
+	if p.Aud == nil {
+		p.Aud = jwt.Audience{sealedAudience}
+	}
+	token, err := resolve.Seal(proxyKey, issuer, p)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return token
+}
+
+func TestSealedResolverEndToEnd(t *testing.T) {
+	f := newSealedFixture(t, 2) // two issuer keys: a rotation in progress
+	resolver := f.resolver
+	seal := func(p resolve.SealedPayload) string { return f.seal(&f.key.PublicKey, f.issuers[0], p) }
 	hour := time.Now().Add(time.Hour).Unix()
 	token := seal(resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a", "4242424242424242": "4111111111111111"}, Exp: hour, Sub: "session-1"})
+	rotated := f.seal(&f.key.PublicKey, f.issuers[1], resolve.SealedPayload{Values: map[string]string{"tok_b": "real_b"}, Exp: hour})
 	elsewhere := seal(resolve.SealedPayload{Values: map[string]string{"tok_a": "real_elsewhere"}, Hosts: []string{"pay.example"}, Exp: hour})
 	expired := seal(resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Exp: time.Now().Add(-time.Second).Unix()})
 	otherKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	foreign, _ := resolve.Seal(&otherKey.PublicKey, resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Exp: hour})
+	foreign := f.seal(&otherKey.PublicKey, f.issuers[0], resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Exp: hour})
+	_, stranger, _ := ed25519.GenerateKey(rand.Reader)
+	wrongIssuer := f.seal(&f.key.PublicKey, stranger, resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Exp: hour})
+	wrongAudience := seal(resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Aud: jwt.Audience{"proxy-other"}, Exp: hour})
+	legacy := legacyToken(t, &f.key.PublicKey, `{"values":{"tok_a":"real_a"},"aud":"proxy-e2e","exp":9999999999}`)
 
 	for _, proto := range protocols {
 		t.Run(proto, func(t *testing.T) {
@@ -297,8 +344,9 @@ func TestSealedResolverEndToEnd(t *testing.T) {
 			expectStatus(t, "token card", post(t, client, `{"card":"4242424242424242"}`), http.StatusOK)
 			expectStatus(t, "plain request", get(t, client, "tok_other"), http.StatusOK) // not in the token: not a stand-in
 			expectStatus(t, "token for another host", get(t, proxiedClient(t, p, "any", elsewhere, proto), "tok_a"), http.StatusBadGateway)
+			expectStatus(t, "token from the new issuer key", get(t, proxiedClient(t, p, "any", rotated, proto), "tok_b"), http.StatusOK)
 
-			want := "/?q=real_a \n/post {\"card\":\"4111111111111111\"}\n/?q=tok_other "
+			want := "/?q=real_a \n/post {\"card\":\"4111111111111111\"}\n/?q=tok_other \n/?q=real_b "
 			if seen := got.all(); seen != want {
 				t.Errorf("destination received:\n%s\nwant:\n%s", seen, want)
 			}
@@ -310,7 +358,10 @@ func TestSealedResolverEndToEnd(t *testing.T) {
 	p := startProxy(t, mapDialer{otherHost + ":443": dest.addr}, dest.ca, func(c *Config) { setResolver(t, c, resolver, resolve.Patterns{}) })
 	tampered := []byte(token)
 	tampered[len(tampered)-5] ^= 1
-	for name, password := range map[string]string{"expired": expired, "foreign key": foreign, "tampered": string(tampered), "plain": "change-me"} {
+	for name, password := range map[string]string{
+		"expired": expired, "foreign key": foreign, "tampered": string(tampered), "plain": "change-me",
+		"wrong issuer": wrongIssuer, "wrong audience": wrongAudience, "legacy encrypt-only": legacy,
+	} {
 		authorization := "Basic " + base64.StdEncoding.EncodeToString([]byte("any:"+password))
 		_, resp := connect(t, p.addr, otherHost+":443", authorization)
 		_ = resp.Body.Close()
@@ -328,16 +379,13 @@ func TestSealedResolverEndToEnd(t *testing.T) {
 // every later request, stand-in or not, and nothing more reaches the
 // destination.
 func TestSealedTokenExpiringMidConnectionFailsClosed(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	resolver, err := resolve.NewSealed(key)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := newSealedFixture(t, 1)
+	resolver := f.resolver
 	for _, proto := range protocols {
 		t.Run(proto, func(t *testing.T) {
 			t.Parallel()
 			exp := time.Now().Add(2 * time.Second).Truncate(time.Second).Add(time.Second)
-			token, err := resolve.Seal(&key.PublicKey, resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Exp: exp.Unix()})
+			token, err := resolve.Seal(&f.key.PublicKey, f.issuers[0], resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a"}, Aud: jwt.Audience{sealedAudience}, Exp: exp.Unix()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -358,4 +406,23 @@ func TestSealedTokenExpiringMidConnectionFailsClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// legacyToken is the encrypt-only format sealed tokens had before they were
+// signed: claims encrypted to key, no JWS and no cty.
+func legacyToken(t *testing.T, key *ecdsa.PublicKey, claims string) string {
+	t.Helper()
+	enc, err := jose.NewEncrypter(jose.A256GCM, jose.Recipient{Algorithm: jose.ECDH_ES_A256KW, Key: key}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := enc.Encrypt([]byte(claims))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := obj.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
 }

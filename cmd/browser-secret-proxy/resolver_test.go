@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
@@ -102,7 +103,14 @@ func TestEachModeBuilds(t *testing.T) {
 		t.Fatalf("detected %q", got)
 	}
 
-	setup, err = parseResolverFlags(t, "-resolver", "sealed", "-sealed-key", sealedKey).build("", quiet)
+	issuerPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuerDER, _ := x509.MarshalPKIXPublicKey(issuerPub)
+	issuerKey := writeTemp(t, "issuer.pem", pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: issuerDER}))
+	setup, err = parseResolverFlags(t, "-resolver", "sealed", "-sealed-key", sealedKey, "-sealed-issuer-key", issuerKey,
+		"-sealed-issuer-key", issuerKey, "-sealed-audience", "proxy-eu-1").build("", quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +134,10 @@ func TestResolverFlagErrors(t *testing.T) {
 		{"sealed key with http", "", []string{"-resolver", "http", "-sealed-key", "k"}, "-sealed-key cannot be used"},
 		{"http without mTLS", "", []string{"-resolver", "http", "-resolver-url", "https://x.test", "-standin-prefixes", "tok_"}, "client certificate"},
 		{"http without patterns", "u", []string{"-resolver", "http", "-resolver-url", "https://x.test", "-resolver-cert", cert, "-resolver-key", key}, "set a stand-in pattern"},
-		{"sealed without key", "", []string{"-resolver", "sealed"}, "needs -sealed-key"},
+		{"sealed without key", "", []string{"-resolver", "sealed"}, "needs -sealed-key, -sealed-issuer-key and -sealed-audience"},
+		{"sealed without issuer", "", []string{"-resolver", "sealed", "-sealed-key", key, "-sealed-audience", "p"}, "needs -sealed-key, -sealed-issuer-key"},
+		{"sealed without audience", "", []string{"-resolver", "sealed", "-sealed-key", key, "-sealed-issuer-key", cert}, "-sealed-audience"},
+		{"issuer key with file", "", []string{"-swaps", swaps, "-sealed-issuer-key", cert}, "-sealed-issuer-key cannot be used"},
 		{"sealed with fixed credentials", "proxy-user", []string{"-resolver", "sealed", "-sealed-key", key}, "not used with -resolver sealed"},
 		{"bad pattern", "", []string{"-swaps", swaps, "-standin-pattern", "("}, "stand-in pattern"},
 	}

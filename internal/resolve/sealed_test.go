@@ -2,12 +2,15 @@ package resolve
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"path/filepath"
@@ -17,6 +20,7 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 )
 
 func ecKey(t *testing.T) *ecdsa.PrivateKey {
@@ -28,9 +32,25 @@ func ecKey(t *testing.T) *ecdsa.PrivateKey {
 	return key
 }
 
+// testIssuer signs the tokens of these tests, for the proxy testAudience.
+var testIssuer = func() ed25519.PrivateKey {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return key
+}()
+
+const testAudience = "proxy-test"
+
+// testSealed is a Sealed resolver for key that trusts testIssuer.
+func testSealed(key *ecdsa.PrivateKey) (*Sealed, error) {
+	return NewSealed(SealedConfig{Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{testIssuer.Public()}, Audience: testAudience})
+}
+
 func seal(t *testing.T, key *ecdsa.PrivateKey, p SealedPayload) string {
 	t.Helper()
-	token, err := Seal(&key.PublicKey, p)
+	token, err := Seal(&key.PublicKey, testIssuer, p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +61,7 @@ func payload(exp time.Time) SealedPayload {
 	return SealedPayload{
 		Values: map[string]string{"tok_a": "real-secret-a", "4242424242424242": "real-secret-card"},
 		Hosts:  []string{"api.test"},
+		Aud:    jwt.Audience{testAudience},
 		Exp:    exp.Unix(),
 		Sub:    "session-1",
 	}
@@ -48,7 +69,7 @@ func payload(exp time.Time) SealedPayload {
 
 func TestSealedAuthenticatesAndResolves(t *testing.T) {
 	key := ecKey(t)
-	s, err := NewSealed(key)
+	s, err := testSealed(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +112,7 @@ func TestSealedAuthenticatesAndResolves(t *testing.T) {
 
 func TestSealedPrincipalFallsBackToTheUsername(t *testing.T) {
 	key := ecKey(t)
-	s, _ := NewSealed(key)
+	s, _ := testSealed(key)
 	p := payload(time.Now().Add(time.Hour))
 	p.Sub = ""
 	principal, err := s.Authenticate("proxy-user", seal(t, key, p))
@@ -102,7 +123,7 @@ func TestSealedPrincipalFallsBackToTheUsername(t *testing.T) {
 
 func TestSealedRefusesBadTokens(t *testing.T) {
 	key := ecKey(t)
-	s, _ := NewSealed(key)
+	s, _ := testSealed(key)
 	good := seal(t, key, payload(time.Now().Add(time.Hour)))
 
 	tamper := func(token string, part int) string {
@@ -166,7 +187,7 @@ func TestSealedRefusesBadTokens(t *testing.T) {
 
 func TestSealedTokenExpiresAfterConnect(t *testing.T) {
 	key := ecKey(t)
-	s, _ := NewSealed(key)
+	s, _ := testSealed(key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	token := seal(t, key, payload(now.Add(time.Minute)))
@@ -193,7 +214,10 @@ func TestLoadSealedKeys(t *testing.T) {
 		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: sec1}))+
 		string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})))
 
-	s, err := LoadSealed(both)
+	issuerDER, _ := x509.MarshalPKIXPublicKey(testIssuer.Public())
+	issuerFile := filepath.Join(dir, "issuer.pem")
+	writePEM(t, issuerFile, "PUBLIC KEY", issuerDER)
+	s, err := LoadSealed(both, []string{issuerFile}, testAudience)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,16 +231,24 @@ func TestLoadSealedKeys(t *testing.T) {
 	rsaDER, _ := x509.MarshalPKCS8PrivateKey(rsaKey)
 	rsaFile := filepath.Join(dir, "rsa.pem")
 	writePEM(t, rsaFile, "PRIVATE KEY", rsaDER)
-	if _, err := LoadSealed(rsaFile); err == nil {
+	if _, err := LoadSealed(rsaFile, []string{issuerFile}, testAudience); err == nil {
 		t.Error("an RSA key was accepted")
 	}
 	empty := filepath.Join(dir, "empty.pem")
 	writeFile(t, empty, "no pem here")
-	if _, err := LoadSealed(empty); err == nil {
+	if _, err := LoadSealed(empty, []string{issuerFile}, testAudience); err == nil {
 		t.Error("a file without a key was accepted")
 	}
-	if _, err := LoadSealed(filepath.Join(dir, "missing.pem")); err == nil {
+	if _, err := LoadSealed(filepath.Join(dir, "missing.pem"), []string{issuerFile}, testAudience); err == nil {
 		t.Error("a missing file was accepted")
+	}
+	for name, issuers := range map[string][]string{"no issuer file": nil, "issuer file without a key": {empty}, "issuer file is a private key": {both}, "missing issuer file": {filepath.Join(dir, "nope.pem")}} {
+		if _, err := LoadSealed(both, issuers, testAudience); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := LoadSealed(both, []string{issuerFile}, ""); err == nil {
+		t.Error("an empty audience was accepted")
 	}
 }
 
@@ -224,15 +256,15 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 	key := ecKey(t)
 	p := payload(time.Now().Add(time.Hour))
 	p.Values = map[string]string{"tok_a": strings.Repeat("x", maxSealedToken)}
-	if _, err := Seal(&key.PublicKey, p); err == nil {
+	if _, err := Seal(&key.PublicKey, testIssuer, p); err == nil {
 		t.Fatal("an oversized token was sealed")
 	}
 	p.Values = map[string]string{"tok_a": strings.Repeat("x", maxSealedToken/2)}
-	token, err := Seal(&key.PublicKey, p)
+	token, err := Seal(&key.PublicKey, testIssuer, p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, _ := NewSealed(key)
+	s, _ := testSealed(key)
 	if _, err := s.Authenticate("u", token); err != nil {
 		t.Fatalf("a token Seal accepted was refused: %v", err)
 	}
@@ -240,7 +272,7 @@ func TestSealRefusesTokensTheProxyWouldRefuse(t *testing.T) {
 
 func TestSealedCacheIsBoundedByExpiryTTLAndSize(t *testing.T) {
 	key := ecKey(t)
-	s, _ := NewSealed(key)
+	s, _ := testSealed(key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	cached := func() int {
@@ -299,7 +331,7 @@ func TestSealedCacheIsBoundedByExpiryTTLAndSize(t *testing.T) {
 
 func TestSealedViewFailsClosedOnExpiry(t *testing.T) {
 	key := ecKey(t)
-	s, _ := NewSealed(key)
+	s, _ := testSealed(key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
@@ -331,7 +363,7 @@ var (
 
 func TestSealedSnapshotIsTheView(t *testing.T) {
 	key := ecKey(t)
-	s, _ := NewSealed(key)
+	s, _ := testSealed(key)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	p, err := s.Authenticate("u", seal(t, key, payload(now.Add(time.Minute))))
@@ -346,5 +378,157 @@ func TestSealedSnapshotIsTheView(t *testing.T) {
 	snap, err = s.Snapshot(p)
 	if !errors.Is(err, ErrUnauthenticated) || snap != nil {
 		t.Fatalf("an expired token gave snapshot %v, err %v", snap, err)
+	}
+}
+
+// encryptAsJWT encrypts inner to key as the outer JWE of a sealed token
+// (cty JWT), whatever inner is.
+func encryptAsJWT(t *testing.T, key *ecdsa.PrivateKey, inner []byte, cty bool) string {
+	t.Helper()
+	opts := &jose.EncrypterOptions{}
+	if cty {
+		opts = opts.WithContentType("JWT")
+	}
+	enc, err := jose.NewEncrypter(jose.A256GCM, jose.Recipient{Algorithm: jose.ECDH_ES_A256KW, Key: &key.PublicKey}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := enc.Encrypt(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := obj.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
+// signJWS signs p with issuer as a compact JWS.
+func signJWS(t *testing.T, alg jose.SignatureAlgorithm, issuer any, p SealedPayload) string {
+	t.Helper()
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: alg, Key: issuer}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, _ := json.Marshal(p)
+	obj, err := signer.Sign(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws, err := obj.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return jws
+}
+
+func TestSealedRequiresASignatureAndTheAudience(t *testing.T) {
+	key := ecKey(t)
+	s, err := testSealed(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	hour := now.Add(time.Hour)
+	claims, _ := json.Marshal(payload(hour))
+	_, otherIssuer, _ := ed25519.GenerateKey(rand.Reader)
+
+	jws := signJWS(t, jose.EdDSA, testIssuer, payload(hour))
+	parts := strings.Split(jws, ".")
+	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+	sig[0] ^= 1
+	tamperedSignature := parts[0] + "." + parts[1] + "." + base64.RawURLEncoding.EncodeToString(sig)
+	otherPayload := payload(hour)
+	otherPayload.Values = map[string]string{"tok_a": "real-secret-swapped"}
+	otherClaims, _ := json.Marshal(otherPayload)
+	swappedClaims := parts[0] + "." + base64.RawURLEncoding.EncodeToString(otherClaims) + "." + parts[2]
+
+	with := func(change func(*SealedPayload)) string {
+		p := payload(hour)
+		change(&p)
+		return seal(t, key, p)
+	}
+	refused := map[string]string{
+		"legacy encrypt-only":       encryptAsJWT(t, key, claims, false),
+		"unsigned JWE with cty JWT": encryptAsJWT(t, key, claims, true),
+		"signed, no cty":            encryptAsJWT(t, key, []byte(jws), false),
+		"wrong issuer key":          encryptAsJWT(t, key, []byte(signJWS(t, jose.EdDSA, otherIssuer, payload(hour))), true),
+		"tampered signature":        encryptAsJWT(t, key, []byte(tamperedSignature), true),
+		"claims swapped":            encryptAsJWT(t, key, []byte(swappedClaims), true),
+		"wrong aud":                 with(func(p *SealedPayload) { p.Aud = jwt.Audience{"proxy-other"} }),
+		"no aud":                    with(func(p *SealedPayload) { p.Aud = nil }),
+		"expired":                   with(func(p *SealedPayload) { p.Exp = now.Add(-time.Second).Unix() }),
+		"nbf in the future":         with(func(p *SealedPayload) { p.Nbf = now.Add(5 * time.Minute).Unix() }),
+		"iat in the future":         with(func(p *SealedPayload) { p.Iat = now.Add(5 * time.Minute).Unix() }),
+	}
+	for name, token := range refused {
+		if _, err := s.Authenticate("u", token); !errors.Is(err, ErrUnauthenticated) {
+			t.Errorf("%s: err = %v, want ErrUnauthenticated", name, err)
+		} else if strings.Contains(err.Error(), "real-secret") {
+			t.Errorf("%s: the error quotes the token: %v", name, err)
+		}
+	}
+
+	accepted := map[string]string{
+		"aud list with this proxy": with(func(p *SealedPayload) { p.Aud = jwt.Audience{"proxy-other", testAudience} }),
+		"nbf within the skew":      with(func(p *SealedPayload) { p.Nbf = now.Add(sealedClockSkew / 2).Unix() }),
+		"iat now":                  with(func(p *SealedPayload) { p.Iat = now.Unix() }),
+		"nbf and iat in the past":  with(func(p *SealedPayload) { p.Nbf, p.Iat = now.Add(-time.Minute).Unix(), now.Add(-time.Minute).Unix() }),
+	}
+	for name, token := range accepted {
+		if _, err := s.Authenticate("u", token); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// Old and new issuer keys work side by side during a rotation, EdDSA and
+// ES256 alike; a key that is not configured does not.
+func TestSealedIssuerKeyRotation(t *testing.T) {
+	key := ecKey(t)
+	_, oldIssuer, _ := ed25519.GenerateKey(rand.Reader)
+	newIssuer := ecKey(t) // P-256: ES256
+	_, retired, _ := ed25519.GenerateKey(rand.Reader)
+	s, err := NewSealed(SealedConfig{
+		Keys:       []crypto.PrivateKey{key},
+		IssuerKeys: []crypto.PublicKey{oldIssuer.Public(), &newIssuer.PublicKey},
+		Audience:   testAudience,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, issuer := range map[string]crypto.Signer{"old EdDSA key": oldIssuer, "new ES256 key": newIssuer} {
+		token, err := Seal(&key.PublicKey, issuer, payload(time.Now().Add(time.Hour)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Authenticate("u", token); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	token, _ := Seal(&key.PublicKey, retired, payload(time.Now().Add(time.Hour)))
+	if _, err := s.Authenticate("u", token); !errors.Is(err, ErrUnauthenticated) {
+		t.Errorf("a retired issuer key was accepted: %v", err)
+	}
+}
+
+func TestSealedConfigIsChecked(t *testing.T) {
+	key := ecKey(t)
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	p384, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	for name, cfg := range map[string]SealedConfig{
+		"no key":       {IssuerKeys: []crypto.PublicKey{testIssuer.Public()}, Audience: testAudience},
+		"no issuer":    {Keys: []crypto.PrivateKey{key}, Audience: testAudience},
+		"no audience":  {Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{testIssuer.Public()}},
+		"RSA issuer":   {Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{&rsaKey.PublicKey}, Audience: testAudience},
+		"P-384 issuer": {Keys: []crypto.PrivateKey{key}, IssuerKeys: []crypto.PublicKey{&p384.PublicKey}, Audience: testAudience},
+	} {
+		if _, err := NewSealed(cfg); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := Seal(&key.PublicKey, rsaKey, payload(time.Now().Add(time.Hour))); err == nil {
+		t.Error("Seal signed with an RSA key")
 	}
 }
