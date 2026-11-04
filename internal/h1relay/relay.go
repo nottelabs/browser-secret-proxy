@@ -269,7 +269,7 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		}
 		var swapper *swap.Swapper
 		if doSwap {
-			swapper, err = opts.Session.Swapper(ctx, swappableText(parts[1], headers, body)...)
+			swapper, err = opts.Session.Swapper(ctx, swappableText(parts[1], headers, contentType, body)...)
 			if err != nil {
 				return refuse(client, progress, sent, host, opts, err)
 			}
@@ -365,20 +365,21 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 	}
 }
 
-// swappableText is the text of a request that stand-ins are swapped in: the
-// query part of its target, its non-framing header values and its body.
-func swappableText(target string, headers []header, body []byte) []string {
-	texts := make([]string, 0, len(headers)+2)
+// swappableText is the text of a request that stand-ins are swapped in,
+// each part with the place that decides how it is swapped: the query part of
+// its target, its non-framing header values and its body.
+func swappableText(target string, headers []header, contentType string, body []byte) []swap.Part {
+	parts := make([]swap.Part, 0, len(headers)+2)
 	if _, query, ok := strings.Cut(target, "?"); ok {
 		query, _, _ = strings.Cut(query, "#")
-		texts = append(texts, query)
+		parts = append(parts, swap.Part{Place: swap.Query, Text: query})
 	}
 	for _, h := range headers {
 		if !framingHeaders[h.name] {
-			texts = append(texts, h.value)
+			parts = append(parts, swap.Part{Place: swap.Literal, Text: h.value})
 		}
 	}
-	return append(texts, string(body))
+	return append(parts, swap.Part{Place: swap.BodyPlace(contentType), Text: string(body)})
 }
 
 // refuse answers a request that must not be sent with 502, once every

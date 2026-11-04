@@ -376,3 +376,48 @@ func TestOverlappingStandInsCheckOnlyWhatIsSwapped(t *testing.T) {
 		}
 	})
 }
+
+// Matches are chosen per text by that text's own replacement rules: in a
+// header only the literal stand-in is replaced, so an escaped form of a
+// longer stand-in there ("tok_a%20b" or "tok_a+b" for "tok_a b") does not hide the
+// shorter one it contains, which is still swapped and checked.
+func TestHeaderMatchesFollowHeaderRules(t *testing.T) {
+	protos(t, func(t *testing.T, proto string) {
+		r := scopetest.Resolver{Known: []string{"tok_a", "tok_a b"}, Fn: func(req resolve.Request) (resolve.Result, error) {
+			return resolve.Result{Values: map[string]resolve.Value{
+				"tok_a":   {Real: "real_a_value"},
+				"tok_a b": {Real: "real_ab_value"},
+			}}, nil
+		}}
+		received := &echoed{}
+		dest := startDestination(t, allowedHost, []string{proto}, serveWith(received, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, r.Header.Get("X-Token"))
+		})))
+		p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, func(c *Config) {
+			d, err := resolve.NewDetector(r, resolve.Patterns{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Resolver, c.Detector = r, d
+		})
+		client := clientTo(t, p, proto, allowedHost)
+		// The path- and query-escaped forms of "tok_a b".
+		for _, header := range []string{"tok_a%20b", "tok_a+b"} {
+			req, err := http.NewRequest(http.MethodGet, "https://"+allowedHost+"/h", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Token", header)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			want := strings.Replace(header, "tok_a", "real_a_value", 1)
+			if resp.StatusCode != http.StatusOK || string(body) != want {
+				t.Fatalf("header %q: destination got %q (%d), want %q", header, body, resp.StatusCode, want)
+			}
+		}
+	})
+}
