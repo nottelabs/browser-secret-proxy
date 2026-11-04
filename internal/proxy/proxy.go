@@ -5,7 +5,8 @@
 // it to the destination with uTLS, checks that the replay is an exact copy,
 // and only then completes the client's handshake with a certificate issued
 // for the host, offering the application protocol the destination chose.
-// Requests are then relayed with stand-ins swapped for real values.
+// Requests are then relayed with stand-ins swapped for real values, looked
+// up for the principal the CONNECT authenticated as.
 package proxy
 
 import (
@@ -33,7 +34,8 @@ import (
 	"github.com/nottelabs/browser-secret-proxy/internal/h1relay"
 	"github.com/nottelabs/browser-secret-proxy/internal/h2relay"
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
-	"github.com/nottelabs/browser-secret-proxy/internal/swap"
+	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
+	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/upstream"
 )
 
@@ -41,16 +43,24 @@ import (
 type Config struct {
 	Authority *certs.Authority
 	Hosts     *hostmatch.List
-	Swapper   *swap.Swapper
+	// Resolver looks up the real value of each stand-in a request carries,
+	// and Detector finds those stand-ins.
+	Resolver resolve.Resolver
+	Detector *resolve.Detector
 	// Dialer reaches destinations, directly or through a parent proxy.
 	Dialer upstream.Dialer
 	// Username and Password, when Username is set, are required as
-	// Proxy-Authorization Basic credentials on every CONNECT.
+	// Proxy-Authorization Basic credentials on every CONNECT, unless the
+	// Resolver is a resolve.Authenticator, which then checks every CONNECT's
+	// credentials itself.
 	Username, Password string
 	// RootCAs verifies destination certificates; nil uses the system roots.
 	RootCAs *x509.CertPool
 	// MaxBody caps a buffered request body (default 32 MiB).
-	MaxBody          int
+	MaxBody int
+	// ResolveTimeout bounds one resolver lookup (default
+	// scope.DefaultTimeout).
+	ResolveTimeout   time.Duration
 	HandshakeTimeout time.Duration
 	Logger           *slog.Logger
 }
@@ -61,8 +71,9 @@ const shutdownWait = 10 * time.Second
 
 // Server is a forward proxy.
 type Server struct {
-	cfg Config
-	wg  sync.WaitGroup
+	cfg   Config
+	scope *scope.Scope
+	wg    sync.WaitGroup
 
 	mu      sync.Mutex
 	conns   map[net.Conn]struct{} // client and destination connections in use
@@ -71,8 +82,8 @@ type Server struct {
 
 // New validates the configuration and returns a Server.
 func New(cfg Config) (*Server, error) {
-	if cfg.Authority == nil || cfg.Hosts == nil || cfg.Swapper == nil || cfg.Dialer == nil {
-		return nil, errors.New("proxy: authority, hosts, swapper and dialer are required")
+	if cfg.Authority == nil || cfg.Hosts == nil || cfg.Resolver == nil || cfg.Detector == nil || cfg.Dialer == nil {
+		return nil, errors.New("proxy: authority, hosts, resolver, detector and dialer are required")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -80,7 +91,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 30 * time.Second
 	}
-	return &Server{cfg: cfg, conns: map[net.Conn]struct{}{}}, nil
+	sc, err := scope.New(scope.Config{Resolver: cfg.Resolver, Detector: cfg.Detector, Hosts: cfg.Hosts, Timeout: cfg.ResolveTimeout, Logger: cfg.Logger})
+	if err != nil {
+		return nil, err
+	}
+	return &Server{cfg: cfg, scope: sc, conns: map[net.Conn]struct{}{}}, nil
 }
 
 // Serve accepts connections until the listener is closed, then closes every
@@ -168,7 +183,8 @@ func (s *Server) handle(conn net.Conn) {
 		writeStatus(conn, http.StatusMethodNotAllowed, "only CONNECT is supported\n")
 		return
 	}
-	if !s.authorized(req.Header.Get("Proxy-Authorization")) {
+	principal, ok := s.authenticate(req.Header.Get("Proxy-Authorization"))
+	if !ok {
 		_, _ = io.WriteString(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"secret-proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 		return
 	}
@@ -203,23 +219,53 @@ func (s *Server) handle(conn net.Conn) {
 		tunnel(&readerConn{Conn: conn, r: br}, upConn)
 		return
 	}
-	s.intercept(ctx, log, conn, br, upConn, host)
+	s.intercept(ctx, log, conn, br, upConn, host, s.scope.Session(principal, host))
 }
 
-func (s *Server) authorized(header string) bool {
-	if s.cfg.Username == "" {
-		return true
+// authenticate checks a CONNECT's Proxy-Authorization and returns the
+// principal its requests are resolved for. A resolve.Authenticator decides
+// for itself; otherwise the configured username and password are required
+// when set, and the principal is that username (empty when authentication
+// is off).
+func (s *Server) authenticate(header string) (resolve.Principal, bool) {
+	username, password, hasCredentials := basicCredentials(header)
+	if auth, ok := s.cfg.Resolver.(resolve.Authenticator); ok {
+		if !hasCredentials {
+			return resolve.Principal{}, false
+		}
+		principal, err := auth.Authenticate(username, password)
+		if err != nil {
+			s.cfg.Logger.Debug("proxy credential refused", "error", err)
+			return resolve.Principal{}, false
+		}
+		return principal, true
 	}
+	if s.cfg.Username == "" {
+		return resolve.Principal{}, true
+	}
+	if !hasCredentials {
+		return resolve.Principal{}, false
+	}
+	got := []byte(username + ":" + password)
+	want := []byte(s.cfg.Username + ":" + s.cfg.Password)
+	if subtle.ConstantTimeCompare(got, want) != 1 {
+		return resolve.Principal{}, false
+	}
+	return resolve.Principal{ID: username, Password: password}, true
+}
+
+// basicCredentials decodes a Basic Proxy-Authorization header.
+func basicCredentials(header string) (username, password string, ok bool) {
 	encoded, ok := strings.CutPrefix(header, "Basic ")
 	if !ok {
-		return false
+		return "", "", false
 	}
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
 	if err != nil {
-		return false
+		return "", "", false
 	}
-	want := []byte(s.cfg.Username + ":" + s.cfg.Password)
-	return subtle.ConstantTimeCompare(decoded, want) == 1
+	username, password, ok = strings.Cut(string(decoded), ":")
+	return username, password, ok
 }
 
 // verbatimExtensions are ClientHello extensions uTLS does not model that are
@@ -268,7 +314,7 @@ func (e *ReplayError) Error() string {
 	return "cannot replay the client's ClientHello exactly: " + e.Reason
 }
 
-func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn, br *bufio.Reader, upConn net.Conn, host string) {
+func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn, br *bufio.Reader, upConn net.Conn, host string, session *scope.Session) {
 	consumed, recordVersion, message, err := clienthello.Read(br)
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -326,12 +372,12 @@ func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn,
 	}
 	_ = conn.SetDeadline(time.Time{})
 	_ = upConn.SetDeadline(time.Time{})
-	log.Info("intercepting", "protocol", protocolName(protocol))
+	log.Info("intercepting", "protocol", protocolName(protocol), "principal", session.Principal().ID)
 
 	if protocol == "h2" {
-		err = h2relay.Serve(tlsConn, uconn, h2relay.Options{Hosts: s.cfg.Hosts, Swapper: s.cfg.Swapper, MaxBody: s.cfg.MaxBody, Logger: log})
+		err = h2relay.Serve(tlsConn, uconn, h2relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, Logger: log})
 	} else {
-		err = h1relay.Serve(tlsConn, uconn, h1relay.Options{Hosts: s.cfg.Hosts, Swapper: s.cfg.Swapper, MaxBody: s.cfg.MaxBody, Logger: log})
+		err = h1relay.Serve(tlsConn, uconn, h1relay.Options{Hosts: s.cfg.Hosts, Session: session, MaxBody: s.cfg.MaxBody, Logger: log})
 	}
 	if err != nil {
 		log.Warn("connection ended with an error", "error", err)

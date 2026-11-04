@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/scope/scopetest"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
@@ -20,11 +21,7 @@ func options(t *testing.T) Options {
 	if err != nil {
 		t.Fatal(err)
 	}
-	swapper, err := swap.New(map[string]string{"tok_standin": "real"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return Options{Hosts: hosts, Swapper: swapper}
+	return Options{Hosts: hosts, Session: scopetest.Static(t, hosts, map[string]string{"tok_standin": "real"})}
 }
 
 // serve runs a relay between pipes, sends request from a client goroutine and
@@ -275,11 +272,7 @@ func TestLocalContinueWaitsForEarlierResponses(t *testing.T) {
 func expandingOptions(t *testing.T, real string) Options {
 	t.Helper()
 	o := options(t)
-	s, err := swap.New(map[string]string{"t1": real})
-	if err != nil {
-		t.Fatal(err)
-	}
-	o.Swapper, o.MaxBody = s, 1000
+	o.Session, o.MaxBody = scopetest.Static(t, o.Hosts, map[string]string{"t1": real}), 1000
 	return o
 }
 
@@ -319,11 +312,7 @@ func TestSwapLimitsEndTheConnection(t *testing.T) {
 // leaves it alone, so the body and the next request keep their boundaries.
 func TestFramingHeadersAreNotSwapped(t *testing.T) {
 	o := options(t)
-	numeric, err := swap.New(map[string]string{"123": "456"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	o.Swapper = numeric
+	o.Session = scopetest.Static(t, o.Hosts, map[string]string{"123": "456"})
 	client, _, _, serverReader, _ := pipesWith(t, o)
 	body := strings.Repeat("x", 123)
 	go func() {

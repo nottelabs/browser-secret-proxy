@@ -308,3 +308,14 @@ func Seal(key crypto.PublicKey, payload SealedPayload) (string, error) {
 	}
 	return token, nil
 }
+
+// Snapshot opens the principal's token once, so a request is detected and
+// resolved from the same token. Once the token has expired it fails with
+// ErrUnauthenticated, and the request is refused.
+func (s *Sealed) Snapshot(p Principal) (Snapshot, error) {
+	v, err := s.view(p)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}

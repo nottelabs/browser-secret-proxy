@@ -1,13 +1,15 @@
 // Package h1relay relays an HTTP/1.1 connection between a client and an
 // upstream server. Requests are forwarded with the client's own request line,
 // header order, header name casing and spacing; only stand-ins change, plus
-// content-length when a swap changes the body size. Responses are copied
-// byte for byte.
+// content-length when a swap changes the body size. A request whose
+// stand-ins cannot be swapped (see package scope) is answered 502 and not
+// sent. Responses are copied byte for byte.
 package h1relay
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,13 +20,15 @@ import (
 	"sync"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/scope"
 	"github.com/nottelabs/browser-secret-proxy/internal/swap"
 )
 
 // Options configures a relay.
 type Options struct {
-	Hosts   *hostmatch.List
-	Swapper *swap.Swapper
+	Hosts *hostmatch.List
+	// Session resolves the stand-ins of each request on an allowlisted host.
+	Session *scope.Session
 	MaxBody int
 	Logger  *slog.Logger
 }
@@ -49,6 +53,8 @@ func Serve(client, server net.Conn, opts Options) error {
 	if opts.MaxBody <= 0 {
 		opts.MaxBody = 32 << 20
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	toClient := &lockedWriter{w: client}
 	queue := make(chan *exchange, maxPipelined)
 	responsesDone := make(chan struct{})
@@ -60,14 +66,15 @@ func Serve(client, server net.Conn, opts Options) error {
 		done <- responses(bufio.NewReader(server), toClient, queue, progress)
 	}()
 	go func() {
-		done <- requests(bufio.NewReader(client), server, toClient, queue, responsesDone, progress, opts)
+		done <- requests(ctx, bufio.NewReader(client), server, toClient, queue, responsesDone, progress, opts)
 	}()
 	err := <-done
+	cancel()
 	_ = client.Close()
 	_ = server.Close()
 	<-done //nolint:errcheck // waits for the other side; err above is the cause
-	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return nil
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, errRefused) {
+		return nil // a refusal was logged when it was answered
 	}
 	return err
 }
@@ -152,7 +159,11 @@ type header struct {
 	value string // trimmed
 }
 
-func requests(br *bufio.Reader, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
+// errRefused ends a connection after a request was answered 502 instead of
+// being sent.
+var errRefused = errors.New("request refused")
+
+func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io.Writer, queue chan<- *exchange, responsesDone <-chan struct{}, progress *progress, opts Options) error {
 	sent := 0 // requests forwarded so far
 	for {
 		requestLine, err := readLine(br, maxHeadBytes)
@@ -210,6 +221,11 @@ func requests(br *bufio.Reader, server io.Writer, client io.Writer, queue chan<-
 				expectContinue = strings.EqualFold(h.value, "100-continue")
 			}
 		}
+		// Every request goes to the CONNECT host: one naming another host is
+		// refused, so no value scoped to that host goes with it.
+		if err := opts.Session.CheckAuthority(host); err != nil {
+			return refuse(client, progress, sent, host, opts, err)
+		}
 		doSwap := opts.Hosts.Match(host)
 		hasBody := chunked || contentLength > 0
 		if hasBody && !chunked && contentLength > opts.MaxBody {
@@ -251,8 +267,15 @@ func requests(br *bufio.Reader, server io.Writer, client io.Writer, queue chan<-
 		for _, h := range headers {
 			headRoom -= len(h.raw)
 		}
+		var swapper *swap.Swapper
 		if doSwap {
-			t, changed, err := opts.Swapper.Target(parts[1], len(parts[1])+headRoom)
+			swapper, err = opts.Session.Swapper(ctx, swappableText(parts[1], headers, contentType, body)...)
+			if err != nil {
+				return refuse(client, progress, sent, host, opts, err)
+			}
+		}
+		if swapper != nil {
+			t, changed, err := swapper.Target(parts[1], len(parts[1])+headRoom)
 			if err != nil {
 				return fmt.Errorf("swapping stand-ins in the request target: %w", err)
 			}
@@ -261,7 +284,7 @@ func requests(br *bufio.Reader, server io.Writer, client io.Writer, queue chan<-
 				parts[1] = t
 				swapped++
 			}
-			b, changed, err := opts.Swapper.Body(contentType, body, opts.MaxBody)
+			b, changed, err := swapper.Body(contentType, body, opts.MaxBody)
 			if err != nil {
 				return fmt.Errorf("swapping stand-ins in the request body: %w", err)
 			}
@@ -274,10 +297,10 @@ func requests(br *bufio.Reader, server io.Writer, client io.Writer, queue chan<-
 		out.WriteString(strings.Join(parts, " ") + "\r\n")
 		for _, h := range headers {
 			line := h.raw
-			if doSwap && !framingHeaders[h.name] {
+			if swapper != nil && !framingHeaders[h.name] {
 				colon := strings.IndexByte(line, ':')
 				value := line[colon+1:]
-				s, changed, err := opts.Swapper.Header(value, len(value)+headRoom)
+				s, changed, err := swapper.Header(value, len(value)+headRoom)
 				if err != nil {
 					return fmt.Errorf("swapping stand-ins in header %s: %w", h.name, err)
 				}
@@ -340,6 +363,37 @@ func requests(br *bufio.Reader, server io.Writer, client io.Writer, queue chan<-
 			}
 		}
 	}
+}
+
+// swappableText is the text of a request that stand-ins are swapped in,
+// each part with the place that decides how it is swapped: the query part of
+// its target, its non-framing header values and its body.
+func swappableText(target string, headers []header, contentType string, body []byte) []swap.Part {
+	parts := make([]swap.Part, 0, len(headers)+2)
+	if _, query, ok := strings.Cut(target, "?"); ok {
+		query, _, _ = strings.Cut(query, "#")
+		parts = append(parts, swap.Part{Place: swap.Query, Text: query})
+	}
+	for _, h := range headers {
+		if !framingHeaders[h.name] {
+			parts = append(parts, swap.Part{Place: swap.Literal, Text: h.value})
+		}
+	}
+	return append(parts, swap.Part{Place: swap.BodyPlace(contentType), Text: string(body)})
+}
+
+// refuse answers a request that must not be sent with 502, once every
+// earlier response is complete so the answer cannot land inside one, and
+// ends the connection: the client may have pipelined more requests behind
+// it.
+func refuse(client io.Writer, progress *progress, sent int, host string, opts Options, cause error) error {
+	opts.Logger.Warn("refusing a request", "host", host, "principal", opts.Session.Principal().ID, "reason", cause.Error())
+	if !progress.wait(sent) {
+		return io.EOF
+	}
+	body := "secret-proxy: " + cause.Error() + "\n"
+	_, _ = fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+	return errRefused
 }
 
 // responses copies the server's responses to the client byte for byte,

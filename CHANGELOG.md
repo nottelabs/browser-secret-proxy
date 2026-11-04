@@ -22,3 +22,25 @@ First release, planned as 0.1.0.
 - Static binaries for linux and darwin (amd64, arm64) and a multi-arch
   container image, with checksums, SBOMs and cosign signatures.
 - `-version` prints the build's version.
+- Values are scoped: each one is swapped only into requests for the hosts it
+  allows and before it expires, and only for the principal (proxy
+  credential) it was looked up for. Hosts are checked against the
+  `CONNECT` destination, and a request naming another host is refused. A
+  request that breaks a scope, or whose lookup fails, is answered `502` and
+  not sent.
+- Pluggable sources of real values (`-resolver file|http|sealed`):
+  - `file`: the `-swaps` JSON file (`-swaps` alone still selects it),
+    reloaded when it changes (`-swaps-reload`). A file that does not load
+    keeps the previous values.
+  - `http`: a detokenize service you run, called over mutual TLS once per
+    request, with a timeout (`-resolver-timeout`) and an in-memory cache per
+    principal, host and stand-in. A reference service is in
+    `examples/http-resolver`.
+  - `sealed`: the proxy password is a JWE (ECDH-ES+A256KW, A256GCM) sealed
+    to the proxy's key that carries the values, so no lookup service or
+    external storage is needed. Decrypted tokens stay in memory until their
+    `exp`, at most 5 minutes. Invalid or expired tokens get `407`, and a
+    connection whose token expires gets `502`. `examples/seal` creates
+    tokens.
+- Stand-in detection by pattern (`-standin-pattern`, `-standin-prefixes`),
+  with an optional Luhn check for card-like stand-ins (`-standin-luhn`).
