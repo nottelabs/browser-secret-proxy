@@ -367,7 +367,7 @@ func (d *stallingDialer) stalled() time.Duration {
 
 // When the first checked address does not answer at all, the next one is
 // dialed after fallbackDelay, not after the stalled dial's share of the
-// handshake timeout (15s by default), and the stalled dial is cancelled once
+// handshake timeout (15s by default), and the stalled dial is canceled once
 // the next one connects.
 func TestStalledDestinationAddressDoesNotHoldTheNext(t *testing.T) {
 	dest := startDestination(t, otherHost, []string{"http/1.1"}, respondOK)
@@ -398,7 +398,7 @@ func TestStalledDestinationAddressDoesNotHoldTheNext(t *testing.T) {
 	select {
 	case <-dialer.done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the stalled dial was not cancelled")
+		t.Fatal("the stalled dial was not canceled")
 	}
 	if waited := dialer.stalled(); waited < fallbackDelay || waited > fallbackDelay+5*time.Second {
 		t.Fatalf("the stalled address held its dial for %v", waited)

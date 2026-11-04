@@ -127,7 +127,7 @@ type dialResult struct {
 // connection made. The next address is dialed once the previous dials have
 // failed, or have run for fallbackDelay without an answer, so an address
 // that drops connection attempts delays a connection by fallbackDelay, not
-// by its timeout. Dials still running when one succeeds are cancelled, and
+// by its timeout. Dials still running when one succeeds are canceled, and
 // a connection they make anyway is closed. When every dial fails, the error
 // is the first address's.
 func (s *Server) dialAddrs(ctx context.Context, addrs []netip.Addr, port string) (net.Conn, error) {
