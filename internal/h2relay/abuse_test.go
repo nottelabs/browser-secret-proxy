@@ -3,7 +3,6 @@ package h2relay
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -328,15 +327,15 @@ func TestWindowOverflowDropsCountAsResets(t *testing.T) {
 }
 
 // A stream the relay drops for the client's own frames cancels its lookup
-// as a reset does, so it counts as one: trailers or streamed data past the
-// buffer budget, or a frame after the client ended the stream. Before, a
-// client that kept the budget nearly full could open an extended CONNECT
-// with a stand-in, then send trailers past what was left, and start a
-// lookup per stream at its frame rate.
+// as a reset does, so it counts as one: trailers or data past the buffer
+// budget, or a frame after the client ended the stream. A client that keeps
+// the budget nearly full must not bypass the reset limit with uploads it
+// makes the relay refuse. CONNECT is refused before a stream is opened, so
+// these requests use ordinary POST uploads.
 func TestRelayDropsCountAsResets(t *testing.T) {
 	fill := bigHeaders(100 << 10)
-	connect := otherRequest("")
-	connect[3].Value = "/?k=tok_a"
+	upload := request("POST")
+	upload[3].Value = "/?k=tok_a"
 	for name, after := range map[string]func(h *harness, id uint32) []Frame{
 		"trailers": func(h *harness, id uint32) []Frame {
 			trailers := []hpack.HeaderField{{Name: "x-t", Value: strings.Repeat("b", 2000)}}
@@ -353,7 +352,7 @@ func TestRelayDropsCountAsResets(t *testing.T) {
 			c := &countingResolver{}
 			h := newHarness(t, func(o *Options) {
 				o.MaxStreams = 4
-				o.MaxBuffered = int(fieldsSize(fill)+fieldsSize(connect)) + 1000
+				o.MaxBuffered = int(fieldsSize(fill)+fieldsSize(upload)) + 1000
 				o.Session = scopetest.Session(t, o.Hosts, c, resolve.Principal{ID: "alice"})
 			})
 			limit := 2 * h.r.opts.MaxStreams
@@ -374,7 +373,7 @@ func TestRelayDropsCountAsResets(t *testing.T) {
 			_ = h.client.SetWriteDeadline(time.Now().Add(waitFor))
 			for i := range 4 * limit {
 				id := uint32(3 + 2*i)
-				frames := append([]Frame{{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: id, Payload: h.clientBlock(connect...)}}, after(h, id)...)
+				frames := append([]Frame{{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: id, Payload: h.clientBlock(upload...)}}, after(h, id)...)
 				if _, err := h.client.Write(encodeFrames(frames)); err != nil {
 					break
 				}
@@ -524,9 +523,9 @@ func TestSwappedHeaderListsShareTheBudget(t *testing.T) {
 }
 
 // The same for the headers and trailers of a buffered request, swapped
-// with its body, and for an extended CONNECT's trailers, swapped on their
-// own: a swap that passes the budget ends the request, and nothing of it
-// stays held.
+// with its body: a swap that passes the budget ends the request before it
+// goes upstream, and nothing of it stays held. CONNECT tunnels are refused,
+// so trailers on an intercepted connection are tested on ordinary uploads.
 func TestSwapsPastTheBudgetEndTheRequest(t *testing.T) {
 	standIns := hpack.HeaderField{Name: "x-t", Value: strings.Repeat("t1", 100)}
 	t.Run("buffered", func(t *testing.T) {
@@ -539,16 +538,15 @@ func TestSwapsPastTheBudgetEndTheRequest(t *testing.T) {
 		h.settle("refusing the request")
 		h.quiet(h.toServer, 50*time.Millisecond, isType(FrameHeaders))
 	})
-	t.Run("connect trailers", func(t *testing.T) {
+	t.Run("buffered trailers", func(t *testing.T) {
 		h := newHarness(t, func(o *Options) { o.MaxBuffered = 10000; expandingSession(t, o) })
-		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(otherRequest("")...)})
-		h.expect(h.toServer, "server", isType(FrameHeaders))
-		h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(standIns)})
-		h.expect(h.toClient, "client", func(f Frame) bool {
-			return f.Type == FrameRSTStream && f.Stream == 1 && binary.BigEndian.Uint32(f.Payload) == errCodeCalm
-		})
-		h.expect(h.toServer, "server", isType(FrameRSTStream))
+		h.clientSend(
+			Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
+			Frame{Type: FrameData, Stream: 1, Payload: []byte("body")},
+			Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(standIns)},
+		)
+		h.expect(h.toClient, "client", isRefusal(1))
 		h.quiet(h.toServer, 50*time.Millisecond, isType(FrameHeaders))
-		h.released("resetting the request")
+		h.released("refusing the request with expanded trailers")
 	})
 }

@@ -4,7 +4,10 @@
 // and PING frames in the order the client sent them, the same pseudo-header
 // and header order, and the same priority on each request.
 //
-// The response direction is forwarded byte for byte, flow control included.
+// The response direction is forwarded byte for byte, flow control included,
+// except for the server's settings (see clientSettings) and connection
+// control (see control.go): the relay answers the server's PINGs, drops
+// GOAWAY debug data, and drops frames of extension or unknown types.
 // In the request direction the relay decodes each header block, swaps
 // stand-ins on allowlisted authorities and encodes it again for the upstream.
 // A request whose stand-ins cannot be swapped (see package scope) is answered
@@ -212,6 +215,17 @@ type relay struct {
 	enc         *hpack.Encoder
 	encBuf      bytes.Buffer
 	dec         *hpack.Decoder // used by the client reader only
+	// PING (control.go). clientStarted (guarded by serverMu) is set once the
+	// client's first SETTINGS went upstream. pingAcks (guarded by ackMu,
+	// taken after serverMu when both are held) holds the relay's answers to
+	// server PINGs until ackLoop, or the client's first SETTINGS, sends
+	// them; ackReady wakes ackLoop. pings is the data of the client's PINGs
+	// the server has not acknowledged, oldest first (guarded by mu).
+	clientStarted bool
+	ackMu         sync.Mutex
+	pingAcks      []Frame
+	ackReady      chan struct{}
+	pings         [][8]byte
 
 	mu           sync.Mutex
 	cond         *sync.Cond
@@ -388,6 +402,7 @@ func newRelay(client, server net.Conn, opts Options) *relay {
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.asyncErrs = make(chan error, 1)
 	r.timeouts = make(chan error, 1)
+	r.ackReady = make(chan struct{}, 1)
 	r.dec.SetMaxStringLength(opts.MaxHeaderBytes)
 	r.enc = hpack.NewEncoder(&r.encBuf)
 	r.cond = sync.NewCond(&r.mu)
@@ -421,7 +436,7 @@ var errHeaderBlockTimeout = errors.New("server did not finish a header block in 
 var errHeldFrames = errors.New("too many frames waiting for the server's SETTINGS")
 
 func (r *relay) run() error {
-	errs := make(chan error, 3)
+	errs := make(chan error, 4)
 	timeout := make(chan error, 1)
 	timer := time.AfterFunc(r.opts.PrefaceTimeout, func() {
 		// No clientMu here: a writer stuck on a client that stopped reading
@@ -431,10 +446,10 @@ func (r *relay) run() error {
 		}
 	})
 	defer timer.Stop()
-	pending := 3
+	pending := 4
 	if r.masking {
-		errs = make(chan error, 4)
-		pending = 4
+		errs = make(chan error, 5)
+		pending = 5
 		go func() { errs <- r.serverLoopMasked() }()
 		go func() { errs <- r.clientSendLoop() }()
 	} else {
@@ -442,6 +457,7 @@ func (r *relay) run() error {
 	}
 	go func() { errs <- r.clientLoop() }()
 	go func() { errs <- r.sendLoop() }()
+	go func() { errs <- r.ackLoop() }()
 	var first error
 	select {
 	case first = <-errs:
@@ -706,9 +722,9 @@ func (r *relay) clientLoop() error {
 			err = r.onPriorityUpdate(f)
 		case FramePushPromise:
 			return errors.New("client sent PUSH_PROMISE")
-		default:
-			// SETTINGS (and their ACKs), PING, GOAWAY and unknown frame
-			// types go upstream exactly as the client sent them.
+		case FrameSettings, FrameGoAway:
+			// SETTINGS (and their ACKs) and GOAWAY go upstream exactly as
+			// the client sent them.
 			if f.Type == FrameSettings && f.Flags&FlagAck != 0 {
 				r.clientFrames.ack()
 				if err := r.applyClientAck(); err != nil {
@@ -723,7 +739,16 @@ func (r *relay) clientLoop() error {
 				}
 				r.serverFrames.sent(f.Payload)
 			}
-			err = r.writeServer(f)
+			if f.Type == FrameSettings {
+				err = r.forwardClientSettings(f)
+			} else {
+				err = r.writeServer(f)
+			}
+		case FramePing:
+			// PINGs go upstream as the client sent them; its ACKs do not.
+			err = r.onClientPing(f)
+		default:
+			err = r.onUnknown(f)
 		}
 		if err != nil {
 			return err
@@ -1021,6 +1046,25 @@ func (r *relay) onPriorityUpdate(f Frame) error {
 	return r.writeServer(f)
 }
 
+// onUnknown forwards a client frame of an unknown or extension type. One on
+// stream 0 goes upstream as the client sent it. One on a stream goes under
+// that stream's server ID, as the client's ID may be another stream's
+// upstream; with no stream upstream for it (still buffering, closed or
+// idle), it is dropped, as RFC 9113 5.5 lets an endpoint do.
+func (r *relay) onUnknown(f Frame) error {
+	if f.Stream != 0 {
+		r.mu.Lock()
+		s := r.streams[f.Stream]
+		if s == nil || s.serverID == 0 {
+			r.mu.Unlock()
+			return nil
+		}
+		f.Stream = s.serverID
+		r.mu.Unlock()
+	}
+	return r.writeServer(f)
+}
+
 func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, block []byte) error {
 	// Every block is decoded, even for refused or closed streams, to keep the
 	// HPACK table in step with the client's encoder.
@@ -1067,7 +1111,7 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		// (finish), with a single lookup for its headers, body and trailers.
 		// Any other request on an allowlisted authority is prepared here;
 		// one that needs a lookup waits for it off this loop (lookup.go).
-		buffered := !endStream && s.swap && method != "CONNECT"
+		buffered := !endStream && s.swap
 		var lookup *scope.Lookup
 		if s.swap && !buffered {
 			if lookup, err = r.opts.Session.Prepare(fieldText(fields)...); err != nil {
@@ -1126,10 +1170,10 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 		return nil
 	}
 
-	// Trailers. A buffered request's are swapped with its body in finish;
-	// a streamed request (extended CONNECT) on an allowlisted authority gets
-	// a lookup of its own. A header block after the client ended the stream
-	// is a stream error.
+	// Trailers. A buffered request's are swapped with its body in finish.
+	// Every request with a body on an allowlisted authority is buffered,
+	// but a streamed one there would get a lookup of its own. A header block
+	// after the client ended the stream is a stream error.
 	r.mu.Lock()
 	buffering, ended := s.buffering, s.clientEnded
 	r.mu.Unlock()
@@ -1214,30 +1258,59 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 }
 
 // requestHead returns a request's :method and the authorities it names
-// (:authority, host), refusing a malformed request (RFC 9113 8.2.1, 8.3.1)
+// (:authority, host), refusing a malformed request (RFC 9113 8.2.1, 8.3)
 // that a server could read differently from the relay: a field name with an
 // uppercase character, which the relay would not take for the framing field
-// it is ("Content-Length" would keep its length after a body swap), or more
+// it is ("Content-Length" would keep its length after a body swap); more
 // than one :authority or host, of which a server may use another than the
-// one checked, or a field value a server could split or read differently
-// (malformedValue). Session.CheckAuthority refuses a host that disagrees with
-// :authority.
+// one checked; or a pseudo-header that is repeated, unknown, or after a
+// regular field, which a server may read otherwise or not at all (with two
+// :method fields, the relay would take a POST for a CONNECT, whose response
+// it does not mask), or a malformed field value. Session.CheckAuthority
+// refuses a host that disagrees with :authority.
+//
+// It also refuses every CONNECT, an extended CONNECT (RFC 8441) for a
+// WebSocket included, any request with a :protocol, and more than one
+// :method, of which a server may use another than the relay. A CONNECT asks
+// for a tunnel, which masking cannot follow, and nothing in a 2xx to it
+// shows whether a tunnel or a catch-all handler answered: either way the
+// values swapped into the request would come back unmasked. The client
+// never learns that the server supports extended CONNECT (clientSettings),
+// so a browser opens its WebSockets over HTTP/1.1, where only a 101 opens
+// one.
 func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
-	authorityFields, hostFields, uppercase := 0, 0, ""
+	methodFields, authorityFields, hostFields, protocolFields, uppercase := 0, 0, 0, 0, ""
+	pseudo, badPseudo, regular := map[string]bool{}, "", false
 	malformed, hasMalformed := malformedValue(fields)
 	for _, f := range fields {
 		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
 			uppercase = f.Name
 		}
+		if !strings.HasPrefix(f.Name, ":") {
+			regular = true
+		} else if badPseudo == "" {
+			switch {
+			case !requestPseudo[f.Name]:
+				badPseudo = fmt.Sprintf("unknown pseudo-header %q", f.Name)
+			case pseudo[f.Name]:
+				badPseudo = "more than one " + f.Name + " field"
+			case regular:
+				badPseudo = f.Name + " after a regular field"
+			}
+			pseudo[f.Name] = true
+		}
 		switch f.Name {
 		case ":method":
 			method = f.Value
+			methodFields++
 		case ":authority":
 			authorities = append(authorities, f.Value)
 			authorityFields++
 		case "host":
 			authorities = append(authorities, f.Value)
 			hostFields++
+		case ":protocol":
+			protocolFields++
 		}
 	}
 	switch {
@@ -1245,11 +1318,21 @@ func requestHead(fields []hpack.HeaderField) (method string, authorities []strin
 		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
 	case authorityFields > 1 || hostFields > 1:
 		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
+	case badPseudo != "":
+		err = fmt.Errorf("%w: %s", scope.ErrRefused, badPseudo)
+	case methodFields > 1:
+		err = fmt.Errorf("%w: more than one :method field", scope.ErrRefused)
+	case strings.EqualFold(method, "CONNECT") || protocolFields > 0:
+		err = fmt.Errorf("%w: a CONNECT or :protocol, which would open a tunnel", scope.ErrRefused)
 	case hasMalformed:
 		err = fmt.Errorf("%w: field %q has a malformed value", scope.ErrRefused, malformed)
 	}
 	return method, authorities, err
 }
+
+// requestPseudo are the pseudo-headers a request may have (RFC 9113 8.3.1,
+// and :protocol for extended CONNECT, RFC 8441).
+var requestPseudo = map[string]bool{":method": true, ":scheme": true, ":authority": true, ":path": true, ":protocol": true}
 
 // malformedValue returns the name of the first field whose value RFC 9113
 // 8.2.1 forbids: one holding a NUL, CR or LF, which a server or a later
@@ -1980,8 +2063,10 @@ func (r *relay) serverLoop() error {
 			return errors.New("server sent PUSH_PROMISE, which this proxy does not support")
 		case FrameGoAway:
 			err = r.onServerGoAway(f)
+		case FramePing:
+			err = r.onServerPing(f)
 		default:
-			err = r.writeClient(f)
+			// An extension or unknown frame type (control.go): dropped.
 		}
 		if err != nil {
 			return err
@@ -2079,10 +2164,12 @@ func (r *relay) serverEnded(s *stream, reset bool) {
 	r.forgetIfDoneLocked(s)
 }
 
-// onServerGoAway passes the server's GOAWAY on. Requests the server will not
-// process (still buffering here, or above its last stream ID) are refused
-// with REFUSED_STREAM so the client can retry them elsewhere, and the
-// relay sends no new request upstream afterwards.
+// onServerGoAway passes the server's GOAWAY on, with its last stream ID
+// translated and without its debug data, which only describes the server's
+// side and can echo a real value. Requests the server will not process
+// (still buffering here, or above its last stream ID) are refused with
+// REFUSED_STREAM so the client can retry them elsewhere, and the relay
+// sends no new request upstream afterwards.
 func (r *relay) onServerGoAway(f Frame) error {
 	if len(f.Payload) < 8 {
 		return errors.New("server sent a bad GOAWAY")
@@ -2107,7 +2194,7 @@ func (r *relay) onServerGoAway(f Frame) error {
 	if len(refused) > 0 {
 		r.opts.Logger.Warn("server is going away, refusing requests it will not process", "streams", len(refused))
 	}
-	f.Payload = append(binary.BigEndian.AppendUint32(nil, translated), f.Payload[4:]...)
+	f.Payload = append(binary.BigEndian.AppendUint32(nil, translated), f.Payload[4:8]...)
 	return r.writeClient(append(refused, f)...)
 }
 
@@ -2207,16 +2294,28 @@ func (r *relay) applyClientAck() error {
 }
 
 // clientSettings is the server's SETTINGS payload as the client receives it:
-// unchanged except that SETTINGS_HEADER_TABLE_SIZE is lowered to what the
-// relay's request decoder accepts (decoderTableSize). That value only bounds
-// the client's own HPACK encoder, whose output the relay decodes and encodes
-// again, so the server sees no difference.
+// unchanged except for two settings. SETTINGS_HEADER_TABLE_SIZE is lowered
+// to what the relay's request decoder accepts. That value only bounds the
+// client's own HPACK encoder, whose output the relay decodes and encodes
+// again, so the server sees no difference. SETTINGS_ENABLE_CONNECT_PROTOCOL
+// is dropped: the relay refuses every CONNECT (requestHead), and a client
+// may only send an extended CONNECT after it got that setting with value 1
+// (RFC 8441 section 3), so a browser opens its WebSockets over HTTP/1.1
+// instead of sending one to be refused.
 func clientSettings(payload []byte) []byte {
-	out := append([]byte{}, payload...)
-	for i := 0; i+6 <= len(out); i += 6 {
-		if binary.BigEndian.Uint16(out[i:]) == SettingHeaderTableSize && binary.BigEndian.Uint32(out[i+2:]) > decoderTableSize {
-			binary.BigEndian.PutUint32(out[i+2:], decoderTableSize)
+	out := make([]byte, 0, len(payload))
+	for i := 0; i+6 <= len(payload); i += 6 {
+		setting := payload[i : i+6]
+		switch binary.BigEndian.Uint16(setting) {
+		case SettingEnableConnectProtocol:
+			continue
+		case SettingHeaderTableSize:
+			if binary.BigEndian.Uint32(setting[2:]) > decoderTableSize {
+				out = binary.BigEndian.AppendUint32(append(out, setting[:2]...), decoderTableSize)
+				continue
+			}
 		}
+		out = append(out, setting...)
 	}
 	return out
 }

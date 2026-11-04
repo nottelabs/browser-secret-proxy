@@ -72,6 +72,9 @@ type respState struct {
 	bodiless        bool // masked, and its head says it has no content
 	done            bool // the stream ended toward the client
 	pipe            *maskPipe
+	// masker is the one chosen at the final head, for the body and the
+	// trailers: nil if nothing was on record then.
+	masker *mask.Masker
 }
 
 // respItem is one thing waiting to go to the client on a stream, in order.
@@ -348,8 +351,10 @@ func (r *relay) serverLoopMasked() error {
 			return errors.New("server sent PUSH_PROMISE, which this proxy does not support")
 		case FrameGoAway:
 			err = r.onServerGoAway(f)
+		case FramePing:
+			err = r.onServerPing(f)
 		default:
-			err = r.writeClient(f)
+			// An extension or unknown frame type (control.go): dropped.
 		}
 		if err != nil {
 			return err
@@ -422,12 +427,21 @@ func (r *relay) onServerHeadersMasked(serverID uint32, ends bool, block []byte) 
 			status = f.Value
 		}
 	}
-	masker := r.opts.Session.Masker()
+	// Which values are masked is decided at the final head: the trailers
+	// are masked with its masker, as the body is, even if a value left the
+	// record since. A block before it, or after a head that had nothing on
+	// record, gets the current one, which can only add masking.
+	masker := rs.masker
+	if masker == nil {
+		masker = r.opts.Session.Masker()
+	}
 	interim := strings.HasPrefix(status, "1") && len(status) == 3
 	var startMask *respPlan
 	switch {
 	case !rs.final && !interim:
-		rs.final = true
+		r.mu.Lock()
+		rs.final, rs.masker = true, masker
+		r.mu.Unlock()
 		if masker != nil {
 			var plan respPlan
 			fields, plan, err = maskResponseHead(fields, status, rs.method, ends, masker)
@@ -443,11 +457,9 @@ func (r *relay) onServerHeadersMasked(serverID uint32, ends bool, block []byte) 
 			r.mu.Unlock()
 		}
 	case masker != nil:
-		masked, ok := maskFields(fields, masker)
-		if !ok {
-			return r.refuseResponse(s, rs, ends, fmt.Errorf("%w: a stand-in cannot go into a header", errUnmaskable))
+		if fields, err = maskFields(fields, masker); err != nil {
+			return r.refuseResponse(s, rs, ends, err)
 		}
-		fields = masked
 	}
 	if rs.pipe != nil && ends {
 		// Trailers of a masked response: sent once its body is out.
@@ -595,15 +607,12 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 			contentType = f.Value
 		}
 	}
-	// An accepted CONNECT (2xx: a WebSocket over extended CONNECT) carries a
-	// tunnel, not a body: its frames pass through untouched, like an
-	// HTTP/1.1 upgrade. A refused one has an ordinary body, masked like any
-	// other.
-	tunnel := method == "CONNECT" && len(status) == 3 && status[0] == '2'
-	// A 2xx to CONNECT, 204 included, is a tunnel: its DATA is the tunnel's.
-	bodiless := !tunnel && (method == "HEAD" || status == "204" || status == "304")
+	// No response is a tunnel whose DATA passes through unmasked: requestHead
+	// refuses every CONNECT, and if one reached the server anyway, a 2xx to
+	// it would be masked as a body here, not passed on raw.
+	bodiless := method == "HEAD" || status == "204" || status == "304"
 	plan := respPlan{
-		body:     !ends && !tunnel && !bodiless,
+		body:     !ends && !bodiless,
 		bodiless: bodiless,
 		context:  mask.ContextOf(contentType),
 	}
@@ -628,29 +637,35 @@ func maskResponseHead(fields []hpack.HeaderField, status, method string, ends bo
 		}
 		out = append(out, f)
 	}
-	masked, ok := maskFields(out, m)
-	if !ok {
-		return nil, plan, fmt.Errorf("%w: a stand-in cannot go into a header", errUnmaskable)
+	masked, err := maskFields(out, m)
+	if err != nil {
+		return nil, plan, err
 	}
 	return masked, plan, nil
 }
 
 // maskFields masks the values of every field but pseudo-headers and
-// content-length. It reports false when a stand-in would put a line break
-// or NUL into a value.
-func maskFields(fields []hpack.HeaderField, m *mask.Masker) ([]hpack.HeaderField, bool) {
+// content-length. It returns errUnmaskable when a stand-in would put a line
+// break or NUL into a value, or for a real value in content-length, which
+// frames the message and is kept as it is, as HTTP/1.1 does.
+func maskFields(fields []hpack.HeaderField, m *mask.Masker) ([]hpack.HeaderField, error) {
 	for i := range fields {
 		f := &fields[i]
-		if strings.HasPrefix(f.Name, ":") || f.Name == "content-length" {
+		if strings.HasPrefix(f.Name, ":") {
 			continue
 		}
 		masked := m.String(mask.HeaderContext(f.Name), f.Value)
-		if masked != f.Value && strings.ContainsAny(masked, "\r\n\x00") {
-			return nil, false
+		switch {
+		case masked == f.Value:
+			continue
+		case f.Name == "content-length":
+			return nil, fmt.Errorf("%w: a real value in content-length", errUnmaskable)
+		case strings.ContainsAny(masked, "\r\n\x00"):
+			return nil, fmt.Errorf("%w: a stand-in cannot go into a header", errUnmaskable)
 		}
 		f.Value = masked
 	}
-	return fields, true
+	return fields, nil
 }
 
 // onServerDataMasked takes a response DATA frame: into the pipeline of a
@@ -675,6 +690,12 @@ func (r *relay) onServerDataMasked(f Frame) error {
 			r.serverEnded(s, false)
 		}
 		return nil
+	}
+	if !rs.final {
+		// DATA before the final head (none yet, or only a 1xx): malformed
+		// (RFC 9113 8.1), and there is no masking pipeline for it yet.
+		r.mu.Unlock()
+		return r.resetMalformed(s, rs, len(f.Payload), end)
 	}
 	if rs.bodiless {
 		data, err := unpad(f.Flags, f.Payload)
@@ -751,15 +772,16 @@ func (r *relay) onServerDataMasked(f Frame) error {
 	return nil
 }
 
-// resetMalformed ends a masked stream whose response has content in DATA
-// though its head says it has none (a HEAD, 204 or 304): malformed (RFC 9113
-// 8.1.1), and never masked, so its content is not passed on. Both sides get
-// RST_STREAM; the server is credited the n bytes the relay dropped. The
-// client stops sending once reset, so the request ends here too, even when
-// the server already ended the stream: one still uploading (a CONNECT) would
-// otherwise keep its stream slot, and the server's stream is reset as well.
+// resetMalformed ends a stream whose response has DATA before its final head
+// (RFC 9113 8.1), or content in DATA though its head says it has none (a
+// HEAD, 204 or 304, RFC 9113 8.1.1): malformed, and never masked, so its
+// content is not passed on. Both sides get RST_STREAM; the server is
+// credited the n bytes the relay dropped. The client stops sending once
+// reset, so the request ends here too, even when the server already ended
+// the stream: one still uploading would otherwise keep its stream slot, and
+// the server's stream is reset as well.
 func (r *relay) resetMalformed(s *stream, rs *respState, n int, serverDone bool) error {
-	r.opts.Logger.Warn("resetting a response with content it cannot have", "stream", s.clientID)
+	r.opts.Logger.Warn("resetting a malformed response", "stream", s.clientID)
 	r.mu.Lock()
 	r.endRespLocked(rs)
 	uploading := !s.sentEnd
@@ -770,8 +792,10 @@ func (r *relay) resetMalformed(s *stream, rs *respState, n int, serverDone bool)
 		r.forgetResetLocked(s)
 	}
 	r.mu.Unlock()
-	if err := r.writeServer(windowUpdate(0, n)); err != nil {
-		return err
+	if n > 0 {
+		if err := r.writeServer(windowUpdate(0, n)); err != nil {
+			return err
+		}
 	}
 	if err := r.writeClient(Frame{Type: FrameRSTStream, Stream: s.clientID, Payload: binary.BigEndian.AppendUint32(nil, errCodeInternal)}); err != nil {
 		return err
