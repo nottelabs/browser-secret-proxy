@@ -77,6 +77,52 @@ func TestMaskersFollowPrincipals(t *testing.T) {
 	}
 }
 
+// A value is kept until its own expiry when that comes before Retention,
+// and is forgotten with its principal's credential.
+func TestRecordFollowsExpiry(t *testing.T) {
+	now := time.Unix(1000, 0)
+	rec := newRecord(func() time.Time { return now })
+	p := resolve.Principal{ID: "p"}
+	rec.add(p, map[string]resolve.Value{
+		"s_soon":    {Real: "real_soon_1", ExpiresAt: now.Add(time.Minute)},
+		"s_later":   {Real: "real_later_1", ExpiresAt: now.Add(time.Hour)},
+		"s_none":    {Real: "real_none_1"},
+		"s_expired": {Real: "real_expired_1", ExpiresAt: now.Add(-time.Second)},
+	})
+	if got := rec.masker(p).String("real_soon_1 real_later_1 real_none_1 real_expired_1"); got != "s_soon s_later s_none real_expired_1" {
+		t.Fatalf("got %q", got)
+	}
+	now = now.Add(time.Minute)
+	if got := rec.masker(p).String("real_soon_1 real_later_1"); got != "real_soon_1 s_later" {
+		t.Fatalf("after its expiry: %q", got)
+	}
+	now = now.Add(Retention)
+	if rec.masker(p) != nil {
+		t.Fatal("values are kept past Retention")
+	}
+	if Retention > 15*time.Minute {
+		t.Fatalf("Retention %v keeps real values in memory too long", Retention)
+	}
+	rec.add(p, map[string]resolve.Value{"s": {Real: "real_value_1"}})
+	rec.forget(p)
+	if rec.masker(p) != nil || len(rec.principals) != 0 {
+		t.Fatal("a forgotten principal's values are still kept")
+	}
+}
+
+// Principals whose values all expired are dropped when another principal is
+// added, without waiting for a lookup of their own.
+func TestExpiredPrincipalsAreDropped(t *testing.T) {
+	now := time.Unix(1000, 0)
+	rec := newRecord(func() time.Time { return now })
+	rec.add(resolve.Principal{ID: "a"}, map[string]resolve.Value{"s": {Real: "real_value_a"}})
+	now = now.Add(Retention)
+	rec.add(resolve.Principal{ID: "b"}, map[string]resolve.Value{"s": {Real: "real_value_b"}})
+	if _, ok := rec.principals[keyOf(resolve.Principal{ID: "a"})]; ok || len(rec.principals) != 1 {
+		t.Fatalf("%d principals kept", len(rec.principals))
+	}
+}
+
 func TestRecordIsBounded(t *testing.T) {
 	now := time.Unix(0, 0)
 	rec := newRecord(func() time.Time { now = now.Add(time.Millisecond); return now })

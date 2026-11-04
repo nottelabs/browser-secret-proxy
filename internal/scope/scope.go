@@ -17,9 +17,10 @@
 // resolver's own expiry and revocation apply to the next request.
 //
 // When masking is on, every value resolved for a principal is also kept on
-// record (bounded, see Retention), and Session.Masker returns a mask.Masker
-// that turns those values back into their stand-ins in responses, on every
-// connection of that principal.
+// record, until its expiry or for Retention after its last lookup,
+// whichever is first, and never once the principal's credential is reported
+// invalid. Session.Masker returns a mask.Masker that turns those values back
+// into their stand-ins in responses, on every connection of that principal.
 package scope
 
 import (
@@ -168,6 +169,9 @@ func (s *Session) Values(ctx context.Context, texts ...string) (map[string]resol
 		if err != nil {
 			cfg.Logger.Warn("resolver refused the principal", "principal", s.principal.ID, "host", s.host, "error", errorCategory(err))
 			if errors.Is(err, resolve.ErrUnauthenticated) {
+				if cfg.Mask {
+					s.scope.record.forget(s.principal)
+				}
 				return nil, refused("the proxy credential is no longer valid")
 			}
 			return nil, refused("the resolver failed")

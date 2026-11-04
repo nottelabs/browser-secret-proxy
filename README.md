@@ -257,8 +257,10 @@ page, a token in an error message or a redirect URL. With masking on (the
 default), the proxy replaces every real value it looked up for a principal
 with its stand-in in responses on allowlisted hosts, before they reach the
 browser, its logs and recordings. That covers all of the principal's
-connections, and values looked up up to 24 hours ago (at most 1,024 per
-principal).
+connections. To keep real values in memory no longer than needed, a value
+is masked for 15 minutes after its last lookup, or until it expires if that
+is sooner, and no longer once the principal's credential is reported
+invalid (at most 1,024 values per principal).
 
 What is masked:
 
@@ -306,9 +308,10 @@ How a masked response changes:
   (`4111<span>1111...`).
 - Values shorter than 8 bytes (a CVC, a PIN): masking them would corrupt
   unrelated text.
-- Values the proxy has not looked up for this principal in the last 24
-  hours: a card the destination already had on file is masked only after
-  the principal sent its stand-in. Values looked up for another principal
+- Values the proxy has not looked up for this principal in the last 15
+  minutes, or past their expiry: a receipt shown later, or a card the
+  destination already had on file before the principal sent its stand-in,
+  is not masked. Values looked up for another principal
   are not masked on this one's connections.
 - WebSocket and other upgraded connections, and responses on hosts that are
   not allowlisted (they are never decrypted).
