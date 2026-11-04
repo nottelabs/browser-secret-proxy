@@ -836,21 +836,21 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 // fieldText is the text of a header list that stand-ins are swapped in: the
 // query part of :path and the values of fields that are neither
 // pseudo-headers nor framing headers.
-func fieldText(fields []hpack.HeaderField) []string {
-	texts := make([]string, 0, len(fields))
+func fieldText(fields []hpack.HeaderField) []swap.Part {
+	parts := make([]swap.Part, 0, len(fields))
 	for _, f := range fields {
 		switch {
 		case f.Name == ":path":
 			if _, query, ok := strings.Cut(f.Value, "?"); ok {
 				query, _, _ = strings.Cut(query, "#")
-				texts = append(texts, query)
+				parts = append(parts, swap.Part{Place: swap.Query, Text: query})
 			}
 		case strings.HasPrefix(f.Name, ":"), framingHeaders[f.Name]:
 		default:
-			texts = append(texts, f.Value)
+			parts = append(parts, swap.Part{Place: swap.Literal, Text: f.Value})
 		}
 	}
-	return texts
+	return parts
 }
 
 // badGateway answers a request that must not be sent with a 502 of the
@@ -1150,7 +1150,15 @@ func (r *relay) finish(s *stream) error {
 	limit := min(int64(r.opts.MaxBody), int64(r.opts.MaxBuffered)-(r.held-int64(len(original))))
 	r.mu.Unlock()
 
-	swapper, err := r.opts.Session.Swapper(r.ctx, append(append(fieldText(headers), fieldText(trailers)...), string(original))...)
+	contentType := ""
+	for _, h := range headers {
+		if h.Name == "content-type" {
+			contentType = h.Value
+		}
+	}
+	parts := append(fieldText(headers), fieldText(trailers)...)
+	parts = append(parts, swap.Part{Place: swap.BodyPlace(contentType), Text: string(original)})
+	swapper, err := r.opts.Session.Swapper(r.ctx, parts...)
 	if err != nil {
 		r.mu.Lock()
 		current := r.streams[s.clientID] == s
@@ -1169,12 +1177,6 @@ func (r *relay) finish(s *stream) error {
 			if err := r.swapFields(swapper, list, s.authority); err != nil {
 				r.opts.Logger.Error("refusing a request whose swapped headers cannot be sent", "stream", s.clientID, "error", err)
 				return r.abort(s, errCodeRefusedStream)
-			}
-		}
-		contentType := ""
-		for _, h := range headers {
-			if h.Name == "content-type" {
-				contentType = h.Value
 			}
 		}
 		body, changed, err = swapper.Body(contentType, original, int(max(limit, 0)))

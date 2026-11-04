@@ -111,12 +111,13 @@ func refused(format string, args ...any) error {
 	return &RefusedError{Reason: fmt.Sprintf(format, args...)}
 }
 
-// Swapper returns a Swapper for one request whose swappable text is texts:
-// the query part of the target, the header values that are not framing
-// headers, and the body. It returns nil when the request holds no
-// stand-in, and a *RefusedError when it must not be sent.
-func (s *Session) Swapper(ctx context.Context, texts ...string) (*swap.Swapper, error) {
-	values, err := s.Values(ctx, texts...)
+// Swapper returns a Swapper for one request whose swappable text is parts:
+// the query part of the target (swap.Query), the header values that are not
+// framing headers (swap.Literal), and the body (swap.BodyPlace of its
+// Content-Type). It returns nil when the request holds no stand-in, and a
+// *RefusedError when it must not be sent.
+func (s *Session) Swapper(ctx context.Context, parts ...swap.Part) (*swap.Swapper, error) {
+	values, err := s.Values(ctx, parts...)
 	if err != nil || values == nil {
 		return nil, err
 	}
@@ -131,10 +132,10 @@ func (s *Session) Swapper(ctx context.Context, texts ...string) (*swap.Swapper, 
 	return sw, nil
 }
 
-// Values resolves the stand-ins a swap of texts would replace and checks
+// Values resolves the stand-ins a swap of parts would replace and checks
 // that each value may go to the connection's host now. It returns nil when
 // there are none.
-func (s *Session) Values(ctx context.Context, texts ...string) (map[string]resolve.Value, error) {
+func (s *Session) Values(ctx context.Context, parts ...swap.Part) (map[string]resolve.Value, error) {
 	cfg := s.scope.cfg
 	resolver := cfg.Resolver
 	var known resolve.KnownStandIns
@@ -149,13 +150,17 @@ func (s *Session) Values(ctx context.Context, texts ...string) (map[string]resol
 		}
 		resolver, known = snapshot, snapshot
 	}
+	texts := make([]string, len(parts))
+	for i, p := range parts {
+		texts[i] = p.Text
+	}
 	var candidates []string
 	if known != nil {
 		candidates = cfg.Detector.FindIn(known, s.principal, withDecoded(texts)...)
 	} else {
 		candidates = cfg.Detector.Find(s.principal, withDecoded(texts)...)
 	}
-	standIns := used(candidates, texts)
+	standIns := used(candidates, parts)
 	if len(standIns) == 0 {
 		return nil, nil
 	}
