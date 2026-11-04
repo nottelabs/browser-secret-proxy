@@ -212,6 +212,8 @@ func TestUnclearResponseHeadsAreAnswered502(t *testing.T) {
 		"a Content-Length followed by a NBSP":  "HTTP/1.1 200 OK\r\nContent-Length: 2\u00a0\r\n",
 		"a folded line in an interim response": "HTTP/1.1 100 Continue\r\nX-A: a\r\n b\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n",
 		"a CR before the empty line":           "HTTP/1.1 200 OK\r\nX-A: a\r\nContent-Length: 2\r\n\r",
+		"a bare CR in the status line":         "HTTP/1.1 200 OK\rTransfer-Encoding: chunked\r\nContent-Length: 2\r\nX-A: a\r\n",
+		"a NUL in the status line":             "HTTP/1.1 200 OK\x00\r\nX-A: a\r\nContent-Length: 2\r\n",
 	} {
 		for _, masked := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s, masked %t", name, masked), func(t *testing.T) {

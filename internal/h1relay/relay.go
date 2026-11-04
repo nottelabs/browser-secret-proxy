@@ -680,10 +680,11 @@ var errUnclearResponse = errors.New("unclear response head")
 
 // readResponseHead reads a status line and headers, returning their raw
 // bytes, the status code, the content length (-1 when absent) and whether
-// the body is chunked. It returns errUnclearResponse for a header line that
-// checkFieldLine refuses, or a Content-Length that is not a decimal number:
-// only SP and HTAB may surround it, and the coding name chunked is matched
-// in ASCII only, as a client matches them.
+// the body is chunked. It returns errUnclearResponse for a status line with
+// a bare CR or NUL, a header line that checkFieldLine refuses, or a
+// Content-Length that is not a decimal number: only SP and HTAB may surround
+// it, and the coding name chunked is matched in ASCII only, as a client
+// matches them.
 func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, chunked bool, err error) {
 	length = -1
 	for {
@@ -695,6 +696,11 @@ func readResponseHead(br *bufio.Reader) (head []byte, status int, length int64, 
 		// One line ending only: a line of "\r\r\n" does not end the head.
 		text := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
 		if status == 0 {
+			// A client ends the status line at a bare CR and reads what
+			// follows as header lines the relay would not see.
+			if strings.ContainsAny(text, "\r\x00") {
+				return nil, 0, 0, false, fmt.Errorf("%w: a bare CR or NUL in the status line", errUnclearResponse)
+			}
 			fields := strings.Fields(text)
 			if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") {
 				return nil, 0, 0, false, fmt.Errorf("malformed status line")

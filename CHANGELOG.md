@@ -20,11 +20,11 @@ First release, planned as 0.1.0.
   `Host: allowed.test\v` passed the host check as `allowed.test`. Only
   spaces and tabs are trimmed around a request header value. A response
   head with a folded line, a header name that is not a token
-  (`Name : value`), a line without a colon, a bare CR or NUL, or a
-  `Content-Length` that is not a decimal number is answered `502` with
-  masking on or off, and a response trailer line like that cuts the
-  response off. A response is read as `chunked` only when its last coding
-  is `chunked` in ASCII.
+  (`Name : value`), a line without a colon, a bare CR or NUL in the status
+  line or a header line, or a `Content-Length` that is not a decimal
+  number is answered `502` with masking on or off, and a response trailer
+  line like that cuts the response off. A response is read as `chunked`
+  only when its last coding is `chunked` in ASCII.
 - HTTP/1.1 requests whose body a server could frame differently, or whose
   head it could split into other lines, are answered `502` and not sent:
   `Transfer-Encoding` with `Content-Length`, a `Transfer-Encoding` other

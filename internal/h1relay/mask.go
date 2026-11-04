@@ -41,8 +41,9 @@ var responseFraming = map[string]bool{
 // every header value except framing headers are masked; a decodable Content-Encoding is dropped, since
 // the body is decoded to be masked; a body whose length may change loses its
 // Content-Length and is sent chunked. Headers are rewritten line by line,
-// never by substitution in the raw head, which readResponseHead checked line
-// by line. It returns errUnmaskable for a response that cannot be masked: an
+// never by substitution in the raw head. head must come from
+// readResponseHead, which checked it line by line: maskHead neither trims
+// header names nor looks for a missing colon. It returns errUnmaskable for a response that cannot be masked: an
 // unknown or stacked content-coding (in one list or several headers); a
 // transfer-coding other than chunked; a partial response (206); or a real
 // value in a framing header or in the status line outside its reason
