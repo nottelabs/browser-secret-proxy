@@ -542,6 +542,15 @@ host.
   differs from `Host`; an authority with userinfo (`user@host`), a path,
   query, fragment or whitespace, or a port that is not a number. Over
   HTTP/2, a header name with uppercase letters is refused the same way.
+  Over HTTP/1.1, so is a request whose body a server could frame
+  differently, or whose head it could split into other lines (RFC 9112):
+  `Transfer-Encoding` with `Content-Length`, a `Transfer-Encoding` other
+  than a single `chunked` or on a request that is not HTTP/1.1, more than
+  one `Content-Length` or one that is not a decimal number (only spaces and
+  tabs may surround either value), a folded (obs-fold) header line, a
+  header name that is not a token (`Name : value`), and a bare CR or NUL
+  in the request line or a header line. A chunked trailer
+  line like that closes the connection before anything is sent.
 - **Expired values are not used.** A value whose expiry has passed is not
   swapped.
 - **Fail closed.** When a request carries a stand-in that the resolver does
