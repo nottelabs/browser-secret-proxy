@@ -27,8 +27,13 @@ type Request struct {
 
 // Principal is the authenticated proxy credential a request came through.
 type Principal struct {
-	ID       string // stable id of the authenticated proxy credential (e.g. username or token subject)
+	ID       string // names the authenticated proxy credential (e.g. username or token subject)
 	Password string // raw credential secret, for modes that need it (never logged)
+	// SecretOnly says the Password alone identifies the principal and the
+	// ID only names it in logs, as in the sealed mode, where the ID may be
+	// the username the client picks. What is kept per principal (the values
+	// on record for masking) is then keyed by the Password alone.
+	SecretOnly bool
 }
 
 // String names the principal without its secret, so it can be logged.

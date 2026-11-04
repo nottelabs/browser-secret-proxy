@@ -46,13 +46,20 @@ type record struct {
 }
 
 // principalKey identifies a principal by its ID and a hash of its secret, so
-// two credentials with one ID never share values.
+// two credentials with one ID never share values. A SecretOnly principal is
+// identified by the hash alone: its ID may be the client's choice (a sealed
+// token's username), and one credential must not split into several
+// principals, whose values would not be masked on each other's connections
+// and could push every other principal off the record.
 type principalKey struct {
 	id     string
 	secret [sha256.Size]byte
 }
 
 func keyOf(p resolve.Principal) principalKey {
+	if p.SecretOnly {
+		return principalKey{secret: sha256.Sum256([]byte(p.Password))}
+	}
 	return principalKey{id: p.ID, secret: sha256.Sum256([]byte(p.Password))}
 }
 

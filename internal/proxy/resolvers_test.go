@@ -375,6 +375,31 @@ func TestSealedResolverEndToEnd(t *testing.T) {
 	}
 }
 
+// A sealed token spelled any way but its canonical form (here with CR and LF
+// inside a segment, which base64url decoding skips) is a different password
+// for the same token, and CONNECT refuses it.
+func TestSealedTokenRespelledIsRefusedOnConnect(t *testing.T) {
+	f := newSealedFixture(t, 1)
+	token := f.seal(&f.key.PublicKey, f.issuers[0], resolve.SealedPayload{Values: map[string]string{"tok_a": "real_a_secret"}, Exp: time.Now().Add(time.Hour).Unix(), Sub: "s1"})
+	parts := strings.Split(token, ".")
+	parts[3] = parts[3][:10] + "\n\n\r\n" + parts[3][10:]
+	respelled := strings.Join(parts, ".")
+
+	dest := startDestination(t, otherHost, []string{"http/1.1"}, respondOK)
+	p := startProxy(t, mapDialer{otherHost + ":443": dest.addr}, dest.ca, func(c *Config) { setResolver(t, c, f.resolver, resolve.Patterns{}) })
+	for name, c := range map[string]struct {
+		password string
+		want     int
+	}{
+		"canonical": {token, http.StatusOK},
+		"respelled": {respelled, http.StatusProxyAuthRequired},
+	} {
+		_, resp := connect(t, p.addr, otherHost+":443", "Basic "+base64.StdEncoding.EncodeToString([]byte("u:"+c.password)))
+		_ = resp.Body.Close()
+		expectStatus(t, name, resp.StatusCode, c.want)
+	}
+}
+
 // A connection whose sealed token expires while it is open gets 502 for
 // every later request, stand-in or not, and nothing more reaches the
 // destination.

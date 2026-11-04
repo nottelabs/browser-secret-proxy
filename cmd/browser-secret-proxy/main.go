@@ -72,6 +72,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if values.close != nil {
+		defer values.close()
+	}
 	var parentURL *url.URL
 	if *parent != "" {
 		if parentURL, err = url.Parse(*parent); err != nil {

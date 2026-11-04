@@ -64,3 +64,8 @@ First release, planned as 0.1.0.
   on its own, at most 16 at a time per connection, and is canceled when its
   request is reset or refused. The `file` and `sealed` modes, which answer
   from memory, resolve in line and keep the browser's request order.
+- In `sealed` mode, a token is accepted only in its canonical compact form,
+  so one token cannot be presented as several passwords, and the token alone
+  is the principal: the username names it in logs but no longer splits its
+  values for masking. Decrypted tokens leave memory at their time even when
+  no request comes.
