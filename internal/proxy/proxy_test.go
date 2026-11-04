@@ -22,6 +22,8 @@ import (
 
 	"github.com/nottelabs/browser-secret-proxy/internal/clienthello"
 	"github.com/nottelabs/browser-secret-proxy/internal/h2relay"
+	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
+	"github.com/nottelabs/browser-secret-proxy/internal/resolve"
 )
 
 func respondOK(c *tls.Conn) {
@@ -523,6 +525,31 @@ func TestProxyAuthentication(t *testing.T) {
 		if resp.StatusCode != want {
 			t.Errorf("authorization %q: %s, want %d", authorization, resp.Status, want)
 		}
+	}
+}
+
+// A password without a username would leave authentication off, so the
+// proxy refuses to start.
+func TestPasswordWithoutUsernameIsRefused(t *testing.T) {
+	authority, _ := testCA(t, "proxy CA")
+	hosts, err := hostmatch.New([]string{allowedHost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := resolve.NewStatic(map[string]string{"tok_standin": "sk_live_real_secret_value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	detector, err := resolve.NewDetector(resolver, resolve.Patterns{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(Config{
+		Authority: authority, Hosts: hosts, Resolver: resolver, Detector: detector, Dialer: mapDialer{},
+		Password: "pass word", // pragma: allowlist secret
+	})
+	if err == nil {
+		t.Fatal("a password without a username was accepted")
 	}
 }
 

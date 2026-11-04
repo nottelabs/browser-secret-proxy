@@ -88,6 +88,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Authority == nil || cfg.Hosts == nil || cfg.Resolver == nil || cfg.Detector == nil || cfg.Dialer == nil {
 		return nil, errors.New("proxy: authority, hosts, resolver, detector and dialer are required")
 	}
+	// Authentication is on only when Username is set, so a Password alone
+	// would leave the proxy open while looking configured.
+	if cfg.Password != "" && cfg.Username == "" {
+		return nil, errors.New("proxy: a password without a username leaves authentication off: set both")
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}

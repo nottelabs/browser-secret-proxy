@@ -248,7 +248,7 @@ real value in the echo.
 | `-standin-prefixes` | Comma-separated prefixes that start stand-ins, such as `tok_`. |
 | `-standin-luhn` | Ignore card-like pattern matches (12 to 19 digits) whose Luhn check digit is wrong. |
 | `-upstream-proxy`, `SECRET_PROXY_UPSTREAM` | Parent proxy for all outgoing connections: `http://`, `https://` or `socks5://`, with a port and with credentials in the URL. The flag wins over the variable. |
-| `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
+| `SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD` | Require these Basic credentials on every CONNECT. Authentication is off when `SECRET_PROXY_USERNAME` is empty; a `SECRET_PROXY_PASSWORD` without it is refused at start. Must not be set in `sealed` mode, where the sealed password authenticates each client. |
 | `-mask-responses` | Replace real values with their stand-ins in responses from allowlisted hosts (default `true`; `-mask-responses=false` turns it off). See [Response masking](#response-masking). |
 | `-v` | Debug logging. |
 | `-version` | Print the version and exit. |

@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/x509"
 	"encoding/json"
@@ -70,7 +71,11 @@ func run(args []string, stdout io.Writer) error {
 		return err
 	}
 	var payload resolve.SealedPayload
-	if err := json.Unmarshal(data, &payload); err != nil {
+	// A misspelled field would be dropped silently: "host" for "hosts" would
+	// seal values with no host restriction of their own.
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return fmt.Errorf("%s: want {\"values\": {...}, \"hosts\": [...], \"sub\": \"...\"}", flags.Arg(0))
 	}
 	if len(payload.Values) == 0 {
