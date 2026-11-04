@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -121,6 +123,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.recoverHandler(conn)
 			s.handle(conn)
 		}()
 	}
@@ -163,6 +166,40 @@ func (s *Server) shutdown() {
 	case <-time.After(shutdownWait):
 		s.cfg.Logger.Warn("stopped waiting for connection handlers", "after", shutdownWait)
 	}
+}
+
+// recoverHandler stops a panic in a connection handler from ending the
+// process: the handler's deferred calls have closed its connections, and the
+// others go on. The panic value is not logged, as it could hold anything a
+// request carried; the code location is.
+func (s *Server) recoverHandler(conn net.Conn) {
+	if r := recover(); r != nil {
+		_ = conn.Close()
+		s.cfg.Logger.Error("connection handler panicked; closed its connection",
+			"client", conn.RemoteAddr().String(), "panic_type", fmt.Sprintf("%T", r), "at", panicSite())
+	}
+}
+
+// panicSite names the innermost functions of a panicking goroutine, with
+// their file and line. Called from a deferred function, it skips the frames
+// of the deferred calls and of the runtime.
+func panicSite() string {
+	pcs := make([]uintptr, 32)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(1, pcs)])
+	var sites []string
+	panicking := false
+	for len(sites) < 4 {
+		frame, more := frames.Next()
+		if frame.Function == "runtime.gopanic" {
+			panicking = true
+		} else if panicking && !strings.HasPrefix(frame.Function, "runtime.") {
+			sites = append(sites, fmt.Sprintf("%s (%s:%d)", frame.Function, path.Base(frame.File), frame.Line))
+		}
+		if !more {
+			break
+		}
+	}
+	return strings.Join(sites, " < ")
 }
 
 func (s *Server) handle(conn net.Conn) {
@@ -337,11 +374,13 @@ func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn,
 	clientConn := &readerConn{Conn: conn, r: io.MultiReader(bytes.NewReader(consumed), br)}
 	original, err := clienthello.Parse(message)
 	if err != nil {
-		log.Error("cannot parse the client's ClientHello", "error", err)
+		// A TLS server answers a malformed ClientHello the same way.
+		log.Error("refusing connection: cannot parse the client's ClientHello", "error", err)
+		_, _ = conn.Write([]byte{recordTypeAlert, 3, 3, 0, 2, alertLevelFatal, alertDecodeError})
 		return
 	}
 
-	uconn, err := s.replay(ctx, upConn, host, recordVersion, message, original)
+	uconn, err := s.replay(ctx, log, upConn, host, recordVersion, message, original)
 	if err != nil {
 		var replayErr *ReplayError
 		if errors.As(err, &replayErr) {
@@ -393,9 +432,36 @@ func (s *Server) intercept(ctx context.Context, log *slog.Logger, conn net.Conn,
 	}
 }
 
+// TLS alert record fields, for a ClientHello the proxy cannot parse.
+const (
+	recordTypeAlert  = 21
+	alertLevelFatal  = 2
+	alertDecodeError = 50
+)
+
 // replay rebuilds the client's ClientHello with uTLS, checks the copy and
-// completes the handshake with the destination.
-func (s *Server) replay(ctx context.Context, upConn net.Conn, host string, recordVersion uint16, message []byte, original *clienthello.Hello) (*utls.UConn, error) {
+// completes the handshake with the destination. uTLS checks some of its
+// invariants with panics, which replay turns into a ReplayError.
+func (s *Server) replay(ctx context.Context, log *slog.Logger, upConn net.Conn, host string, recordVersion uint16, message []byte, original *clienthello.Hello) (uconn *utls.UConn, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("uTLS panicked on the client's ClientHello", "panic_type", fmt.Sprintf("%T", r), "at", panicSite())
+			uconn, err = nil, &ReplayError{Reason: "uTLS failed on it unexpectedly"}
+		}
+	}()
+	uconn, err = rebuild(upConn, host, recordVersion, message, original, s.cfg.RootCAs)
+	if err != nil {
+		return nil, err
+	}
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	return uconn, nil
+}
+
+// rebuild builds a uTLS client on upConn whose ClientHello is a checked copy
+// of the client's, without sending it. It may panic inside uTLS.
+func rebuild(upConn net.Conn, host string, recordVersion uint16, message []byte, original *clienthello.Hello, rootCAs *x509.CertPool) (*utls.UConn, error) {
 	sni := original.ServerName()
 	if sni != "" && !strings.EqualFold(strings.TrimSuffix(sni, "."), host) {
 		return nil, &ReplayError{Reason: fmt.Sprintf("SNI %q does not match the CONNECT host %q", sni, host)}
@@ -423,7 +489,7 @@ func (s *Server) replay(ctx context.Context, upConn net.Conn, host string, recor
 	if serverName == "" {
 		serverName = host
 	}
-	uconn := utls.UClient(upConn, &utls.Config{ServerName: serverName, RootCAs: s.cfg.RootCAs}, utls.HelloCustom)
+	uconn := utls.UClient(upConn, &utls.Config{ServerName: serverName, RootCAs: rootCAs}, utls.HelloCustom)
 	if err := uconn.ApplyPreset(spec); err != nil {
 		return nil, &ReplayError{Reason: "uTLS rejected the ClientHello: " + err.Error()}
 	}
@@ -436,9 +502,6 @@ func (s *Server) replay(ctx context.Context, upConn net.Conn, host string, recor
 	}
 	if err := clienthello.Compare(original, copied); err != nil {
 		return nil, &ReplayError{Reason: err.Error()}
-	}
-	if err := uconn.HandshakeContext(ctx); err != nil {
-		return nil, err
 	}
 	return uconn, nil
 }

@@ -15,6 +15,13 @@ First release, planned as 0.1.0.
   query strings and bodies.
 - Plain CONNECT tunnels, without decryption, for every other host.
 - HTTP/2 and HTTP/1.1 relays.
+- On allowlisted hosts, a ClientHello that repeats an extension type
+  (RFC 8446 forbids it) is refused with a `decode_error` alert, as is any
+  ClientHello the proxy cannot parse. Before, two `session_ticket`
+  extensions made uTLS panic and ended the whole process. A panic in a
+  connection's handler, or in uTLS while it rebuilds a ClientHello, now
+  closes only that connection; its log line names where it happened but not
+  the panic value.
 - Optional Basic authentication on CONNECT
   (`SECRET_PROXY_USERNAME`, `SECRET_PROXY_PASSWORD`). The proxy refuses to
   start with a password but no username, which would leave authentication

@@ -717,6 +717,9 @@ return.
 - TLS session resumption is not supported. A ClientHello that offers
   `pre_shared_key` or early data on an allowlisted host is refused, and every
   connection to an allowlisted host performs a full handshake.
+- On an allowlisted host, a ClientHello the proxy cannot parse is refused
+  with a TLS `decode_error` alert. That includes one that repeats an
+  extension type, which RFC 8446 forbids.
 - Request bodies on allowlisted hosts are buffered: 32 MiB per body and 64 MiB
   per HTTP/2 connection, with at most 256 open streams and 1 MiB per header
   block. An HTTP/2 stream over a limit is refused with `REFUSED_STREAM`, so the
