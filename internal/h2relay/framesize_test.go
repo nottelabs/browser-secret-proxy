@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-// unknownType is a frame type the relay forwards as is.
+// unknownType is a frame type the relay does not know: forwarded from the
+// client, dropped from the server.
 const unknownType = 0xfa
 
 func unknownFrame(n int) Frame {
@@ -111,15 +112,17 @@ func TestServerFrameSizeFollowsTheClientsSettings(t *testing.T) {
 	const big = 100000
 	h.clientSend(settingsFrame(Setting{ID: SettingMaxFrameSize, Value: 1 << 20}))
 	h.expect(h.toServer, "server", isType(FrameSettings))
+	// The relay drops frames of unknown types from the server: the SETTINGS
+	// ACK after each one shows the relay took it and went on.
 	h.serverSend(unknownFrame(big)) // before its ACK
-	h.expect(h.toClient, "client", isUnknown(big))
 	h.serverSend(Frame{Type: FrameSettings, Flags: FlagAck})
+	h.expect(h.toClient, "client", isType(FrameSettings))
 
 	h.clientSend(settingsFrame(Setting{ID: SettingMaxFrameSize, Value: defaultMaxFrame}))
 	h.expect(h.toServer, "server", isType(FrameSettings))
 	h.serverSend(unknownFrame(big)) // the decrease is not acknowledged yet
-	h.expect(h.toClient, "client", isUnknown(big))
 	h.serverSend(Frame{Type: FrameSettings, Flags: FlagAck})
+	h.expect(h.toClient, "client", isType(FrameSettings))
 	h.sendRaw(h.server, unknownFrame(big))
 	h.expect(h.toServer, "server", isGoAway(errCodeFrameSize))
 	if err := h.result(); !errors.Is(err, ErrFrameSize) {
