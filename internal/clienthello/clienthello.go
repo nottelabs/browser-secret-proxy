@@ -133,11 +133,18 @@ func Parse(message []byte) (*Hello, error) {
 	if !s.vec16((*[]byte)(&extensions)) || len(s) != 0 {
 		return nil, errors.New("malformed ClientHello extensions")
 	}
+	// RFC 8446 section 4.2 forbids two extensions of the same type, and uTLS
+	// panics on some repeats instead of returning an error.
+	seen := map[uint16]bool{}
 	for len(extensions) > 0 {
 		var e Extension
 		if !extensions.u16(&e.Type) || !extensions.vec16(&e.Data) {
 			return nil, errors.New("malformed ClientHello extension")
 		}
+		if seen[e.Type] {
+			return nil, fmt.Errorf("ClientHello repeats extension %d", e.Type)
+		}
+		seen[e.Type] = true
 		h.Extensions = append(h.Extensions, e)
 	}
 	return h, nil
