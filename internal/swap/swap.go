@@ -231,8 +231,11 @@ func bodyKind(contentType string) kind {
 // JSON is handled the same way, as far as its quotes go.
 func (s *Swapper) jsonText(in string, limit int) (string, bool, error) {
 	w := &limitedBuilder{limit: limit}
-	write := func(r *strings.Replacer, segment string) error {
-		_, err := r.WriteString(w, segment)
+	write := func(inString bool, segment string) error {
+		if inString {
+			return s.writeJSONString(w, segment)
+		}
+		_, err := s.literal.WriteString(w, segment)
 		return err
 	}
 	inString := false
@@ -242,11 +245,7 @@ func (s *Swapper) jsonText(in string, limit int) (string, bool, error) {
 		case inString && in[i] == '\\':
 			i++ // the escaped character cannot end the string
 		case in[i] == '"':
-			r := s.literal
-			if inString {
-				r = s.jsonString
-			}
-			if err := write(r, in[start:i]); err != nil {
+			if err := write(inString, in[start:i]); err != nil {
 				return "", false, err
 			}
 			if _, err := w.WriteString(`"`); err != nil {
@@ -257,14 +256,34 @@ func (s *Swapper) jsonText(in string, limit int) (string, bool, error) {
 		}
 	}
 	if start < len(in) {
-		r := s.literal
-		if inString {
-			r = s.jsonString
-		}
-		if err := write(r, in[start:]); err != nil {
+		if err := write(inString, in[start:]); err != nil {
 			return "", false, err
 		}
 	}
 	out := w.b.String()
 	return out, out != in, nil
+}
+
+// writeJSONString swaps stand-ins in the content of one JSON string. A
+// string with escapes is decoded first, so an escaped stand-in is found
+// too; if a stand-in was replaced, the whole string is written again with
+// standard escaping, which decodes to the same text with the real value.
+// Otherwise the string is copied as it was.
+func (s *Swapper) writeJSONString(w *limitedBuilder, segment string) error {
+	decoded, ok := decodeJSONString(segment)
+	if !ok {
+		_, err := s.jsonString.WriteString(w, segment)
+		return err
+	}
+	// The escaped output is never shorter than the decoded text, so the
+	// room left bounds the replacement too.
+	replaced := &limitedBuilder{limit: w.limit - w.b.Len()}
+	if _, err := s.literal.WriteString(replaced, decoded); err != nil {
+		return err
+	}
+	if replaced.b.String() == decoded {
+		_, err := w.WriteString(segment)
+		return err
+	}
+	return writeJSONEscaped(w, replaced.b.String())
 }
