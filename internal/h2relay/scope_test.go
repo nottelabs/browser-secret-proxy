@@ -108,3 +108,76 @@ func TestInScopeValueIsSwapped(t *testing.T) {
 		}
 	}
 }
+
+// A request whose fields a server could read as naming another host than
+// the CONNECT one, or whose framing it could read differently from the
+// relay, is malformed (RFC 9113 8.2.1, 8.3.1): it is answered 502, with or
+// without a stand-in, and nothing of it reaches the server. An uppercase
+// Content-Length would keep its length after a body swap.
+func TestMalformedRequestHeadsAreAnswered502(t *testing.T) {
+	withPath := func(path string, fields []hpack.HeaderField) []hpack.HeaderField {
+		fields[3].Value = path
+		return fields
+	}
+	cases := map[string]struct {
+		fields []hpack.HeaderField
+		body   string
+	}{
+		"host naming another host":              {fields: withPath("/?k=tok_standin", request("GET", hpack.HeaderField{Name: "host", Value: "evil.test"}))},
+		"host naming another host, no stand-in": {fields: request("GET", hpack.HeaderField{Name: "host", Value: "evil.test"})},
+		"host with another port":                {fields: request("GET", hpack.HeaderField{Name: "host", Value: "allowed.test:8443"})},
+		"userinfo in :authority": {fields: []hpack.HeaderField{
+			{Name: ":method", Value: "GET"}, {Name: ":authority", Value: "allowed.test:443@evil.test"},
+			{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/?k=tok_standin"},
+		}},
+		"a second :authority": {fields: []hpack.HeaderField{
+			{Name: ":method", Value: "GET"}, {Name: ":authority", Value: "evil.test"}, {Name: ":authority", Value: "allowed.test"},
+			{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/?k=tok_standin"},
+		}},
+		"a second host":        {fields: request("GET", hpack.HeaderField{Name: "host", Value: "allowed.test"}, hpack.HeaderField{Name: "host", Value: "allowed.test"})},
+		"uppercase field name": {fields: request("GET", hpack.HeaderField{Name: "X-Token", Value: "tok_standin"})},
+		"uppercase Content-Length": {
+			fields: request("POST",
+				hpack.HeaderField{Name: "content-type", Value: "application/x-www-form-urlencoded"},
+				hpack.HeaderField{Name: "Content-Length", Value: "13"}),
+			body: "k=tok_standin",
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			if c.body == "" {
+				h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(c.fields...)})
+			} else {
+				h.clientSend(
+					Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(c.fields...)},
+					Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(c.body)},
+				)
+			}
+			h.expect(h.toClient, "client", isBadGateway(1))
+			h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
+		})
+	}
+}
+
+// A host that agrees with :authority is not refused.
+func TestHostAgreeingWithAuthorityIsSwapped(t *testing.T) {
+	h := newHarness(t, nil)
+	fields := request("GET", hpack.HeaderField{Name: "host", Value: "Allowed.Test"})
+	fields[3].Value = "/?k=tok_standin"
+	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1, Payload: h.clientBlock(fields...)})
+	f := h.expect(h.toServer, "server", isType(FrameHeaders))
+	_, fragment, err := HeadersPayload(f.Flags, f.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := hpack.NewDecoder(4096, nil).DecodeFull(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range got {
+		if field.Name == ":path" && field.Value != "/?k=real_value" {
+			t.Fatalf(":path %q", field.Value)
+		}
+	}
+}

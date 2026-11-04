@@ -99,3 +99,57 @@ func TestInScopeValueIsSwapped(t *testing.T) {
 		t.Fatalf("server got %q", head)
 	}
 }
+
+// A request whose Host headers or absolute-form target a server could read
+// as naming another host than the CONNECT one is answered 502, with or
+// without a stand-in, and nothing of it reaches the server: a server may
+// use any Host header, and an absolute-form target instead of Host
+// (RFC 9112 3.2.2).
+func TestConflictingHostsAreAnswered502(t *testing.T) {
+	for name, request := range map[string]string{
+		"two Host headers":                     "GET /?k=tok_standin HTTP/1.1\r\nHost: allowed.test\r\nHost: evil.test\r\n\r\n",
+		"two Host headers, the last one right": "GET /?k=tok_standin HTTP/1.1\r\nHost: evil.test\r\nHost: allowed.test\r\n\r\n",
+		"two Host headers that agree":          "GET / HTTP/1.1\r\nHost: allowed.test\r\nHost: allowed.test\r\n\r\n",
+		"userinfo in Host":                     "GET /?k=tok_standin HTTP/1.1\r\nHost: allowed.test:443@evil.test\r\n\r\n",
+		"absolute-form naming another host":    "GET https://evil.test/?k=tok_standin HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"absolute-form with userinfo":          "GET https://allowed.test:443@evil.test/?k=tok_standin HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"absolute-form disagreeing with Host":  "GET https://allowed.test/ HTTP/1.1\r\nHost: allowed.test:8443\r\n\r\n",
+		"a target of no form":                  "GET evil.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+		"CONNECT to another host":              "CONNECT evil.test:443 HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, clientReader, _, serverReader, result := pipesWith(t, options(t))
+			go func() { _, _ = io.WriteString(client, request) }()
+			refused, err := http.ReadResponse(clientReader, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(refused.Body)
+			_ = refused.Body.Close()
+			if refused.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "request refused") {
+				t.Fatalf("refusal %d %q", refused.StatusCode, body)
+			}
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatalf("relay error %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("relay kept the connection open")
+			}
+			if b, err := serverReader.ReadByte(); err == nil {
+				t.Fatalf("server received data starting with %q", b)
+			}
+		})
+	}
+}
+
+// An absolute-form target that names the CONNECT host, as Host does, is
+// swapped.
+func TestAbsoluteFormOnTheConnectHostIsSwapped(t *testing.T) {
+	client, _, _, serverReader := pipes(t)
+	send(t, client, "GET https://allowed.test/?k=tok_standin HTTP/1.1\r\nHost: Allowed.Test\r\n\r\n")
+	if head := readHead(t, serverReader); !strings.HasPrefix(head, "GET https://allowed.test/?k=real ") {
+		t.Fatalf("server got %q", head)
+	}
+}

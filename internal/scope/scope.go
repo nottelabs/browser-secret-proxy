@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/nottelabs/browser-secret-proxy/internal/hostmatch"
@@ -95,13 +96,24 @@ type Session struct {
 	host      string // the CONNECT destination
 }
 
-// CheckAuthority refuses a request whose authority (Host or :authority) is
-// not the host the connection was opened to: such a request would still
-// reach the CONNECT host, so values scoped to the host it names must not go
-// with it.
-func (s *Session) CheckAuthority(authority string) error {
-	if !hostmatch.SameHost(authority, s.host) {
-		return refused("the request's authority is not the host the connection was opened to")
+// CheckAuthority refuses a request whose authority is not the host the
+// connection was opened to: such a request would still reach the CONNECT
+// host, so values scoped to the host it names must not go with it. A request
+// can name its authority in more than one place (Host and :authority, Host
+// and an absolute-form target): every one must be that host, and all must
+// be the same authority, as the server may route by any of them. A request
+// that names none is refused too.
+func (s *Session) CheckAuthority(authorities ...string) error {
+	if len(authorities) == 0 {
+		return refused("the request names no authority")
+	}
+	for _, authority := range authorities {
+		if !hostmatch.SameHost(authority, s.host) {
+			return refused("the request's authority is not the host the connection was opened to")
+		}
+		if !strings.EqualFold(authority, authorities[0]) {
+			return refused("the request names more than one authority")
+		}
 	}
 	return nil
 }

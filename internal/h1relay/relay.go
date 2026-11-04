@@ -211,12 +211,14 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 		}
 
 		host, contentType := "", ""
+		hosts := 0
 		chunked, upgrade, expectContinue := false, false, false
 		contentLength := -1
 		for _, h := range headers {
 			switch h.name {
 			case "host":
 				host = h.value
+				hosts++
 			case "content-type":
 				contentType = h.value
 			case "transfer-encoding":
@@ -234,8 +236,17 @@ func requests(ctx context.Context, br *bufio.Reader, server io.Writer, client io
 			}
 		}
 		// Every request goes to the CONNECT host: one naming another host is
-		// refused, so no value scoped to that host goes with it.
-		if err := opts.Session.CheckAuthority(host); err != nil {
+		// refused, so no value scoped to that host goes with it. A server
+		// may route by any Host header, or by an absolute-form target
+		// instead of Host (RFC 9112 3.2.2), so each must name that host.
+		if hosts > 1 {
+			return refuse(client, progress, sent, host, opts, fmt.Errorf("%w: more than one Host header", scope.ErrRefused))
+		}
+		authorities := []string{host}
+		if authority, ok := targetAuthority(parts[0], parts[1]); ok {
+			authorities = append(authorities, authority)
+		}
+		if err := opts.Session.CheckAuthority(authorities...); err != nil {
 			return refuse(client, progress, sent, host, opts, err)
 		}
 		doSwap := opts.Hosts.Match(host)
@@ -392,6 +403,28 @@ func swappableText(target string, headers []header, contentType string, body []b
 		}
 	}
 	return append(parts, swap.Part{Place: swap.BodyPlace(contentType), Text: string(body)})
+}
+
+// targetAuthority returns the authority a request target names, if any: the
+// target of a CONNECT (authority-form), or the authority of an absolute-form
+// target ("https://host/path"). An origin-form ("/path") or asterisk-form
+// ("*") target names none. Any other target names an empty authority, which
+// no connection is opened to.
+func targetAuthority(method, target string) (string, bool) {
+	switch {
+	case strings.HasPrefix(target, "/") || target == "*":
+		return "", false
+	case method == "CONNECT":
+		return target, true
+	}
+	_, rest, ok := strings.Cut(target, "://")
+	if !ok {
+		return "", true
+	}
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		rest = rest[:end]
+	}
+	return rest, true
 }
 
 // refuse answers a request that must not be sent with 502, once every

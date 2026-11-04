@@ -39,6 +39,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -865,22 +866,17 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 	}
 
 	if s == nil {
-		authority, method := "", ""
-		for _, f := range fields {
-			switch f.Name {
-			case ":authority":
-				authority = f.Value
-			case ":method":
-				method = f.Value
-			case "host":
-				if authority == "" {
-					authority = f.Value
-				}
-			}
+		method, authorities, err := requestHead(fields)
+		authority := ""
+		if len(authorities) > 0 {
+			authority = authorities[0]
 		}
 		// Every request goes to the CONNECT host: one naming another host is
 		// refused, so no value scoped to that host goes with it.
-		if err := r.opts.Session.CheckAuthority(authority); err != nil {
+		if err == nil {
+			err = r.opts.Session.CheckAuthority(authorities...)
+		}
+		if err != nil {
 			return r.badGateway(clientID, authority, endStream, err)
 		}
 		s = &stream{clientID: clientID, swap: r.opts.Hosts.Match(authority), authority: authority, method: method, clientEnded: endStream}
@@ -990,6 +986,40 @@ func (r *relay) onHeaders(clientID uint32, flags uint8, priority *Priority, bloc
 	r.enqueueLocked(s)
 	r.mu.Unlock()
 	return nil
+}
+
+// requestHead returns a request's :method and the authorities it names
+// (:authority, host), refusing a malformed request (RFC 9113 8.2.1, 8.3.1)
+// that a server could read differently from the relay: a field name with an
+// uppercase character, which the relay would not take for the framing field
+// it is ("Content-Length" would keep its length after a body swap), or more
+// than one :authority or host, of which a server may use another than the
+// one checked. Session.CheckAuthority refuses a host that disagrees with
+// :authority.
+func requestHead(fields []hpack.HeaderField) (method string, authorities []string, err error) {
+	authorityFields, hostFields, uppercase := 0, 0, ""
+	for _, f := range fields {
+		if uppercase == "" && strings.ContainsFunc(f.Name, unicode.IsUpper) {
+			uppercase = f.Name
+		}
+		switch f.Name {
+		case ":method":
+			method = f.Value
+		case ":authority":
+			authorities = append(authorities, f.Value)
+			authorityFields++
+		case "host":
+			authorities = append(authorities, f.Value)
+			hostFields++
+		}
+	}
+	switch {
+	case uppercase != "":
+		err = fmt.Errorf("%w: field name %q has uppercase characters", scope.ErrRefused, uppercase)
+	case authorityFields > 1 || hostFields > 1:
+		err = fmt.Errorf("%w: more than one :authority or host field", scope.ErrRefused)
+	}
+	return method, authorities, err
 }
 
 // fieldText is the text of a header list that stand-ins are swapped in: the

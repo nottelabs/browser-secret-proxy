@@ -28,6 +28,12 @@ First release, planned as 0.1.0.
   `CONNECT` destination, and a request naming another host is refused. A
   request that breaks a scope, or whose lookup fails, is answered `502` and
   not sent.
+- Requests that name their host ambiguously are answered `502` and not sent:
+  more than one `Host`, `:authority` or `host`, a `host` or absolute-form
+  target that differs from the request's other authority, an authority with
+  userinfo (`allowed.test:443@evil.test`) or a port that is not a number,
+  and HTTP/2 header names with uppercase letters (an uppercase
+  `Content-Length` was not updated when a swap changed the body's length).
 - Pluggable sources of real values (`-resolver file|http|sealed`):
   - `file`: the `-swaps` JSON file (`-swaps` alone still selects it),
     reloaded when it changes (`-swaps-reload`). A file that does not load

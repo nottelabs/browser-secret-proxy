@@ -24,6 +24,8 @@ func TestMatch(t *testing.T) {
 		"":                       false,
 		"[::1]:443":              false,
 		"x.pay.example.attacker": false,
+		"api.example.com:443@x":  false,
+		"x@api.example.com":      false,
 	}
 	for host, want := range cases {
 		if got := list.Match(host); got != want {
@@ -47,5 +49,45 @@ func TestNilListMatchesNothing(t *testing.T) {
 	var list *List
 	if list.Match("example.com") {
 		t.Error("nil list matched")
+	}
+}
+
+// SameHost ignores ports, case and a trailing dot, and refuses any authority
+// that is not a plain host and port: its host could be another one than the
+// text before the port ("allowed.test:443@evil.test" names evil.test).
+func TestSameHost(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"allowed.test", "allowed.test", true},
+		{"allowed.test:443", "allowed.test", true},
+		{"ALLOWED.Test.:8443", "allowed.test", true},
+		{"[::1]:443", "::1", true},
+		{"[::1]", "::1", true},
+		{"127.0.0.1:443", "127.0.0.1", true},
+		{"evil.test", "allowed.test", false},
+		{"", "", false},
+		{":443", "", false},
+		{"allowed.test:443@evil.test", "allowed.test", false},
+		{"allowed.test:443@evil.test", "evil.test", false},
+		{"user@allowed.test", "allowed.test", false},
+		{"allowed.test/", "allowed.test", false},
+		{"allowed.test?x", "allowed.test", false},
+		{"allowed.test#x", "allowed.test", false},
+		{"allowed.test :443", "allowed.test", false},
+		{" allowed.test", "allowed.test", false},
+		{"allowed.test\t", "allowed.test", false},
+		{"allowed.test:", "allowed.test", false},
+		{"allowed.test:https", "allowed.test", false},
+		{"allowed.test:443:443", "allowed.test", false},
+		{"[allowed.test]:443", "allowed.test", false},
+		{"[::1]x", "::1", false},
+		{"[::1", "::1", false},
+	}
+	for _, c := range cases {
+		if got := SameHost(c.a, c.b); got != c.want {
+			t.Errorf("SameHost(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
 	}
 }

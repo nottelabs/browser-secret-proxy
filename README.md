@@ -520,7 +520,13 @@ host.
   allowlist applies. It is checked against the host of the `CONNECT`, which
   is where the request really goes, never against the request's own `Host`
   or `:authority`: a request naming another host than its `CONNECT` is
-  answered `502`, with or without stand-ins.
+  answered `502`, with or without stand-ins. So is a request a server could
+  read as naming another host: one with more than one `Host` (HTTP/1.1), or
+  more than one `:authority` or `host` (HTTP/2); a `host` that differs from
+  `:authority`, or an absolute-form target (`GET https://host/`) that
+  differs from `Host`; an authority with userinfo (`user@host`), a path,
+  query, fragment or whitespace, or a port that is not a number. Over
+  HTTP/2, a header name with uppercase letters is refused the same way.
 - **Expired values are not used.** A value whose expiry has passed is not
   swapped.
 - **Fail closed.** When a request carries a stand-in that the resolver does
