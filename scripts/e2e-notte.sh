@@ -87,15 +87,15 @@ docker run -d --name "$container" -p "127.0.0.1:$LOCAL_PORT:8080" \
   "$IMAGE" -ca-cert /etc/bsp/ca.pem -ca-key /etc/bsp/ca.key \
   -swaps /etc/bsp/swaps.json -hosts "$SWAP_HOST" -mask-responses=false >/dev/null
 
-# Local check first, so a broken image fails before touching Notte.
+# Wait until the proxy answers. There is no local swap check: the proxy
+# refuses TLS clients whose ClientHello it cannot replay exactly, which
+# includes OpenSSL's curl, so only the browser below tests the swap.
+ready=""
 for _ in $(seq 1 20); do
-  curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$LOCAL_PORT" && break
+  if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$LOCAL_PORT"; then ready=1; break; fi
   sleep 0.5
 done
-local_echo="$(curl -sS --max-time 30 --cacert "$work/ca.pem" -x "http://127.0.0.1:$LOCAL_PORT" \
-  --proxy-user "$proxy_user:$proxy_pass" "https://$SWAP_HOST/get?card=$standin")"
-grep -q "$real" <<<"$local_echo" || fail "local request through the proxy did not swap the stand-in"
-log "local swap ok"
+[ -n "$ready" ] || fail "the proxy did not start"
 
 log "opening a tunnel through $BORE_SERVER"
 bore local "$LOCAL_PORT" --to "$BORE_SERVER" >"$work/bore.log" 2>&1 &
