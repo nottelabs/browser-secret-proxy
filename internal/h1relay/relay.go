@@ -446,28 +446,66 @@ func (h headTimer) stop() {
 // RecordConn is the connection a client's TLS records arrive on. Armed, its
 // next read that receives bytes sets its read deadline, which is how a
 // request head is timed from the first byte of its record.
+//
+// It follows the stream's record framing, so that whole records that give
+// the head no bytes, such as a KeyUpdate or an empty record, do not count:
+// when the TLS stack asks for more after them, the deadline is cleared and
+// set again by the next record. A record that is still arriving keeps it.
 type RecordConn struct {
 	net.Conn
 	mu      sync.Mutex
 	timeout time.Duration // nonzero while armed
 	set     bool          // the armed deadline was set
+
+	header  [5]byte // the current record's header, as far as it has come
+	headerN int
+	body    int // bytes of the current record's body still to come
 }
 
 // WatchRecords wraps conn for Options.Records; pass the result to
-// tls.Server.
+// tls.Server. It must see the client's TLS stream from its first byte.
 func WatchRecords(conn net.Conn) *RecordConn { return &RecordConn{Conn: conn} }
 
 func (c *RecordConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.set && c.headerN == 0 && c.body == 0 {
+		// The TLS stack reads again having taken every whole record that
+		// came since the deadline was set, and the head has no bytes yet:
+		// the client is waiting between requests, which is not counted.
+		_ = c.SetReadDeadline(time.Time{})
+		c.set = false
+	}
+	c.mu.Unlock()
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.mu.Lock()
-		if c.timeout > 0 {
+		if c.timeout > 0 && !c.set {
 			_ = c.SetReadDeadline(time.Now().Add(c.timeout))
-			c.timeout, c.set = 0, true
+			c.set = true
 		}
+		c.follow(p[:n])
 		c.mu.Unlock()
 	}
 	return n, err
+}
+
+// follow moves the record framing past b.
+func (c *RecordConn) follow(b []byte) {
+	for len(b) > 0 {
+		if c.body > 0 {
+			k := min(c.body, len(b))
+			c.body -= k
+			b = b[k:]
+			continue
+		}
+		k := copy(c.header[c.headerN:], b)
+		c.headerN += k
+		b = b[k:]
+		if c.headerN == len(c.header) {
+			c.body = int(c.header[3])<<8 | int(c.header[4])
+			c.headerN = 0
+		}
+	}
 }
 
 // arm sets the read deadline to timeout from the next bytes received.

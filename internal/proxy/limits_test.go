@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bufio"
 	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -229,6 +231,50 @@ func TestDrippedTLSRecordIsClosed(t *testing.T) {
 		_, _ = io.WriteString(tlsConn, "GET / HTTP/1.1\r\nHost: "+allowedHost+"\r\nX-Pad: "+strings.Repeat("p", 200)+"\r\n\r\n")
 	}()
 	expectClosed(t, tlsConn, 3*time.Second)
+}
+
+// A whole TLS record that carries no request bytes, such as a KeyUpdate or
+// an empty application record, does not start HeaderTimeout: the client may
+// then wait up to IdleTimeout before its next request.
+func TestTLSRecordWithoutRequestBytesKeepsAConnectionOpen(t *testing.T) {
+	for name, control := range map[string]func(*recordSealer, *testing.T){
+		"empty record": func(s *recordSealer, t *testing.T) { s.writeString(t, "") },
+		"KeyUpdate":    (*recordSealer).keyUpdate,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dest := startDestination(t, allowedHost, []string{"http/1.1"}, respondOK)
+			p := startProxy(t, mapDialer{allowedHost + ":443": dest.addr}, dest.ca, func(c *Config) {
+				c.HeaderTimeout = 300 * time.Millisecond
+				c.IdleTimeout = 5 * time.Second
+			})
+			conn, resp := connect(t, p.addr, allowedHost+":443", "")
+			_ = resp.Body.Close()
+			keys := &keyLog{}
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: allowedHost, RootCAs: p.ca, NextProtos: []string{"http/1.1"}, KeyLogWriter: keys})
+			if err := tlsConn.Handshake(); err != nil {
+				t.Fatal(err)
+			}
+			sealer := newRecordSealer(t, conn, tlsConn, keys)
+			responses := bufio.NewReader(tlsConn)
+			get := func() {
+				t.Helper()
+				sealer.writeString(t, "GET / HTTP/1.1\r\nHost: "+allowedHost+"\r\n\r\n")
+				resp, err := http.ReadResponse(responses, nil)
+				if err != nil {
+					t.Fatalf("no response: %v", err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK || string(body) != "ok" {
+					t.Fatalf("response %d %q", resp.StatusCode, body)
+				}
+			}
+			get()
+			control(sealer, t)
+			time.Sleep(3 * 300 * time.Millisecond)
+			get()
+		})
+	}
 }
 
 // Past MaxConns, a new connection is answered 503 and closed; once one
