@@ -72,6 +72,12 @@ First release, planned as 0.1.0.
   ask to upgrade, and an HTTP/2 field name with an upper-case letter are
   refused with `502`; content in HTTP/2 DATA on a `HEAD`, `204` or `304`
   response resets the stream.
+- Response masking holds back the same number of bytes at the end of a
+  body received so far, whether or not they could begin a real value. It
+  held back only possible beginnings, so a client that had a destination
+  echo its guesses could rebuild a value from the size and timing of the
+  HTTP/1.1 chunks or HTTP/2 DATA frames it got. A streamed body now runs
+  that many bytes behind until it ends.
 - Stand-ins in JSON request bodies are found and swapped when the client
   escaped their characters (`\u0026` for `&`, as Go's `encoding/json` does,
   or any `\uXXXX` escape).

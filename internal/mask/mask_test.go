@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -124,23 +125,74 @@ func TestWriterSplitsAnywhere(t *testing.T) {
 	}
 }
 
-// Text that cannot begin a real value is passed on at once, so a stream of
-// events is not delayed.
-func TestWriterHoldsBackOnlyPossibleBeginnings(t *testing.T) {
+// A Writer holds back the same number of bytes whatever they are, so text
+// that cannot begin a real value waits as long as text that could.
+func TestWriterHoldsBackAFixedWindow(t *testing.T) {
 	m := testMasker(t)
+	window := m.MaxLength() - 1
 	var out bytes.Buffer
 	w := m.NewWriter(&out, Text)
 	_, _ = w.Write([]byte("data: {\"x\":1}\n\n"))
-	if out.String() != "data: {\"x\":1}\n\n" || w.Pending() != 0 {
+	if out.Len() != 0 || w.Pending() != 15 {
 		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
 	}
-	_, _ = w.Write([]byte("id 41111"))
-	if out.String() != "data: {\"x\":1}\n\nid " || w.Pending() != 5 {
-		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	text := strings.Repeat("event ", 100)
+	for _, part := range []string{text, "id 41111", "2"} {
+		before := out.Len()
+		_, _ = w.Write([]byte(part))
+		if w.Pending() != window {
+			t.Fatalf("after %q: held %d, want %d", part, w.Pending(), window)
+		}
+		if before > 0 && out.Len()-before != len(part) {
+			t.Fatalf("after %q: passed on %d bytes, want %d", part, out.Len()-before, len(part))
+		}
 	}
-	_, _ = w.Write([]byte("2"))
-	if w.Pending() != 0 || !strings.HasSuffix(out.String(), "id 411112") {
-		t.Fatalf("passed on %q, held %d", out.String(), w.Pending())
+	_ = w.Close()
+	if want := "data: {\"x\":1}\n\n" + text + "id 411112"; out.String() != want {
+		t.Fatalf("got %q, want %q", out.String(), want)
+	}
+}
+
+// sizes records the size of each Write.
+type sizes []int
+
+func (s *sizes) Write(p []byte) (int, error) {
+	*s = append(*s, len(p))
+	return len(p), nil
+}
+
+// The size of each piece a Writer passes on does not depend on whether the
+// text it holds back begins a real value: a client that has a destination
+// reflect its guesses cannot tell from the framing how much of a value a
+// guess matched (critic-1).
+func TestWriterOutputDoesNotRevealPrefixes(t *testing.T) {
+	m := testMasker(t)
+	written := func(parts ...string) sizes {
+		var s sizes
+		w := m.NewWriter(&s, Text)
+		for _, p := range parts {
+			_, _ = w.Write([]byte(p))
+		}
+		_ = w.Close()
+		return s
+	}
+	for _, short := range []bool{true, false} {
+		pad := strings.Repeat(".", 300)
+		if short {
+			pad = "results for "
+		}
+		for _, list := range m.byFirst {
+			for _, f := range list {
+				for n := 1; n < len(f.from); n++ {
+					guess := string(f.from[:n])
+					miss := strings.Repeat("~", n)
+					hit, other := written(pad+guess, " end"), written(pad+miss, " end")
+					if !slices.Equal(hit, other) {
+						t.Fatalf("pad %d, %q: pieces %v, %v for a text of the same length", len(pad), guess, hit, other)
+					}
+				}
+			}
+		}
 	}
 }
 

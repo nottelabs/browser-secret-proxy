@@ -621,8 +621,11 @@ What is masked:
   and in `Location`, `Content-Location`, `Link`, `Refresh` and `Set-Cookie`,
   HTML-escaped in HTML and XML bodies, as is elsewhere;
 - values split across HTTP/1.1 chunks or HTTP/2 DATA frames. The proxy holds
-  back at most the length of the longest form, and only bytes that could
-  begin a value, so streamed responses keep flowing.
+  back a window of the last bytes of a body it has received: one byte fewer
+  than the longest form of a value on record, so about six bytes per
+  character of the longest value, since a character reference (`&#x73;`)
+  takes up to six (149 bytes for a 25-character token). See below for what
+  this does to streams.
 
 How a masked response changes:
 
@@ -662,6 +665,17 @@ How a masked response changes:
 - Over HTTP/2, content in DATA on a response that cannot have any (to a
   `HEAD`, or a `204` or `304`) is malformed (RFC 9113 8.1.1): the stream is
   reset and the content is not passed on.
+- A streamed body runs behind by the window, whatever the bytes are: each
+  byte is passed on once a window's worth of bytes after it has arrived, or
+  when the body ends. So the end of a server-sent event waits for more
+  events (a short keep-alive comment passes on only as many bytes as it
+  has), and an application that waits for the browser to act on an event
+  before it sends more stalls. A response that ends, such as a long poll,
+  is complete when it ends. Holding back only bytes that could begin a
+  value would keep streams flowing, but a client that has a destination
+  echo its guesses could then tell, from the size and timing of what it
+  gets, how much of a value each guess matched, and rebuild the value byte
+  by byte.
 - Masking does not buffer bodies: memory is bounded per stream. Over HTTP/2
   the proxy is the flow-control endpoint for a masked stream, and keeps every
   other stream within the browser's windows. The request direction, and so

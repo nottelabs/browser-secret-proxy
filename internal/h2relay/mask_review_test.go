@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"strings"
 	"testing"
 	"time"
 
@@ -283,7 +284,8 @@ func openMaskedResponse(t *testing.T, h *harness, method string, extra ...hpack.
 	}
 	h.clientSend(Frame{Type: FrameHeaders, Flags: flags, Stream: 1, Payload: h.clientBlock(request(method, extra...)...)})
 	id := h.expect(h.toServer, "server", isType(FrameHeaders)).Stream
-	h.serverSend(status(h, id, false, field(":status", "200")), data(id, "t="+realToken, false))
+	// Longer than what the masker holds back, so some of it is passed on.
+	h.serverSend(status(h, id, false, field(":status", "200")), data(id, "t="+realToken+strings.Repeat(" ", 512), false))
 	c := newClientView(h)
 	c.readHead(1)
 	deadline := time.Now().Add(waitFor)
