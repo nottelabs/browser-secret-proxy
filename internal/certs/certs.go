@@ -3,6 +3,7 @@
 package certs
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
@@ -24,6 +26,13 @@ import (
 const (
 	leafLifetime = 7 * 24 * time.Hour
 	renewBefore  = time.Hour
+
+	// ExpiryWarning is how long before the CA expires WatchExpiry starts
+	// warning: from then on leaf certificates are cut short to end with it.
+	ExpiryWarning = leafLifetime
+	// expiryCheckEvery is the longest WatchExpiry waits between two checks,
+	// so a CA in its warning window or expired is logged once a day.
+	expiryCheckEvery = 24 * time.Hour
 )
 
 // Authority signs leaf certificates with a CA certificate and key.
@@ -51,8 +60,15 @@ func LoadFiles(certPath, keyPath string) (*Authority, error) {
 	return New(certPEM, keyPEM)
 }
 
-// New builds an Authority from a PEM CA certificate and PEM private key.
+// New builds an Authority from a PEM CA certificate and PEM private key. It
+// refuses a CA that is not valid now: expired, or not valid yet. Every leaf
+// it signed would be refused by clients, so every intercepted connection
+// would fail.
 func New(certPEM, keyPEM []byte) (*Authority, error) {
+	return newAt(certPEM, keyPEM, time.Now())
+}
+
+func newAt(certPEM, keyPEM []byte, now time.Time) (*Authority, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
 		return nil, errors.New("CA certificate: no PEM CERTIFICATE block")
@@ -63,6 +79,12 @@ func New(certPEM, keyPEM []byte) (*Authority, error) {
 	}
 	if !ca.IsCA {
 		return nil, errors.New("CA certificate: basicConstraints CA is not set")
+	}
+	if now.After(ca.NotAfter) {
+		return nil, fmt.Errorf("CA certificate expired at %s: create a new CA (see Rotate the CA in docs/deployment.md)", ca.NotAfter.UTC().Format(time.RFC3339))
+	}
+	if now.Before(ca.NotBefore) {
+		return nil, fmt.Errorf("CA certificate is not valid before %s: check the clock of this host or the CA's validity", ca.NotBefore.UTC().Format(time.RFC3339))
 	}
 	key, err := parseKey(keyPEM)
 	if err != nil {
@@ -164,3 +186,46 @@ func (a *Authority) Certificate(host string) (*tls.Certificate, error) {
 
 // CA returns the CA certificate.
 func (a *Authority) CA() *x509.Certificate { return a.ca }
+
+// WatchExpiry logs when the CA is close to its expiry, as soon as it is
+// called and then until ctx ends: a warning once a day from ExpiryWarning
+// before the CA expires, and an error once a day after it has expired. It
+// checks again when the CA enters the warning window and when it expires,
+// so neither is logged late.
+func (a *Authority) WatchExpiry(ctx context.Context, logger *slog.Logger) {
+	for {
+		now := a.now()
+		a.logExpiry(logger, now)
+		timer := time.NewTimer(a.nextExpiryCheck(now))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// logExpiry logs the CA's expiry when it is ExpiryWarning away or less, or
+// past.
+func (a *Authority) logExpiry(logger *slog.Logger, now time.Time) {
+	notAfter := a.ca.NotAfter.UTC().Format(time.RFC3339)
+	switch remaining := a.ca.NotAfter.Sub(now); {
+	case now.After(a.ca.NotAfter):
+		logger.Error("the CA certificate has expired: clients refuse every intercepted connection until the proxy restarts with a new CA", "not_after", notAfter)
+	case remaining <= ExpiryWarning:
+		logger.Warn("the CA certificate expires soon: rotate it before then", "not_after", notAfter, "expires_in", remaining.Round(time.Minute).String())
+	}
+}
+
+// nextExpiryCheck is how long after now WatchExpiry checks again: a day,
+// or less when the CA enters its warning window or expires before that.
+func (a *Authority) nextExpiryCheck(now time.Time) time.Duration {
+	next := expiryCheckEvery
+	for _, at := range []time.Time{a.ca.NotAfter.Add(-ExpiryWarning), a.ca.NotAfter.Add(time.Second)} {
+		if d := at.Sub(now); d > 0 && d < next {
+			next = d
+		}
+	}
+	return max(next, time.Second)
+}

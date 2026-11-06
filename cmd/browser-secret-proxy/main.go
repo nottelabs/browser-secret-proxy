@@ -125,6 +125,8 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Warns from a week before the CA expires, and logs an error once it has.
+	go authority.WatchExpiry(ctx, logger)
 	if values.watch != nil {
 		go values.watch(ctx)
 	}

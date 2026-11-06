@@ -233,3 +233,8 @@ First release, planned as 0.1.0.
   IP-literal destinations are checked. `-allow-private-destinations` turns
   the check off. Tunnels without decryption are logged at info level, with
   their host, port and principal.
+- The proxy refuses to start with a CA that has expired or is not valid
+  yet, and says which date failed. Before, it started and every
+  intercepted connection failed. From 7 days before the CA expires it logs
+  a warning at start and once a day, and once the CA has expired while it
+  runs, an error once a day.
