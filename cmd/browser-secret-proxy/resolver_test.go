@@ -91,6 +91,10 @@ func TestEachModeBuilds(t *testing.T) {
 	if _, ok := setup.resolver.(*resolve.HTTP); !ok {
 		t.Fatal("not an http resolver")
 	}
+	if setup.close == nil {
+		t.Fatal("the http resolver is never closed, so its cache sweep never stops")
+	}
+	t.Cleanup(setup.close)
 	if setup.timeout != 2*time.Second {
 		t.Fatalf("the proxy's lookup deadline is %v, want -resolver-timeout's default 2s", setup.timeout)
 	}

@@ -69,13 +69,24 @@ type HTTPConfig struct {
 // status, a malformed answer or a timeout is an error, and a stand-in left
 // out of values is unresolved: either way the request is refused. Answers
 // are cached in memory per principal, host and stand-in: the service decides
-// for each host, so an answer for one host is never reused for another.
+// for each host, so an answer for one host is never reused for another. A
+// timer sweep drops each cached value, real value included, within
+// httpSweepEvery of its time, whether or not more requests come; Close
+// stops it.
 type HTTP struct {
 	cfg    HTTPConfig
 	client *http.Client
 
 	mu    sync.Mutex
 	cache map[cacheKey]cacheEntry
+	// The expiry sweep: a timer armed for the earliest time an entry must
+	// leave the cache, no sooner than sweepEvery after the previous sweep,
+	// and stopped by Close.
+	sweepEvery time.Duration
+	timer      *time.Timer
+	next       time.Time // when the timer fires; zero when it is not armed
+	lastSweep  time.Time
+	closed     bool
 }
 
 type cacheKey struct{ principal, host, standIn string }
@@ -85,8 +96,13 @@ type cacheEntry struct {
 	until time.Time
 }
 
-// maxResponse caps the service's answer.
-const maxResponse = 4 << 20
+const (
+	// maxResponse caps the service's answer.
+	maxResponse = 4 << 20
+	// httpSweepEvery is the shortest time between two sweeps of the cache:
+	// a value leaves memory at most this long after its time.
+	httpSweepEvery = 5 * time.Second
+)
 
 // NewHTTP checks the configuration and loads the certificates.
 func NewHTTP(cfg HTTPConfig) (*HTTP, error) {
@@ -151,8 +167,22 @@ func NewHTTP(cfg HTTPConfig) (*HTTP, error) {
 			// A redirect could send the stand-ins elsewhere: answer it as an error.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		cache: map[cacheKey]cacheEntry{},
+		cache:      map[cacheKey]cacheEntry{},
+		sweepEvery: httpSweepEvery,
 	}, nil
+}
+
+// Close stops the cache's expiry sweep and drops every cached value.
+// Lookups still work afterwards, but nothing is cached.
+func (h *HTTP) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	if h.timer != nil {
+		h.timer.Stop()
+	}
+	h.next = time.Time{}
+	h.cache = map[cacheKey]cacheEntry{}
 }
 
 type detokenizeRequest struct {
@@ -226,10 +256,11 @@ func (h *HTTP) Resolve(ctx context.Context, req Request) (Result, error) {
 	return out, nil
 }
 
-// store caches a value until the earlier of the cache TTL and its expiry.
+// store caches a value until the earlier of the cache TTL and its expiry,
+// and makes sure the sweep drops it then. A closed resolver caches nothing.
 // h.mu is held.
 func (h *HTTP) store(key cacheKey, v Value, now time.Time) {
-	if h.cfg.CacheTTL < 0 {
+	if h.cfg.CacheTTL < 0 || h.closed {
 		return
 	}
 	until := now.Add(h.cfg.CacheTTL)
@@ -240,11 +271,7 @@ func (h *HTTP) store(key cacheKey, v Value, now time.Time) {
 		return
 	}
 	if _, ok := h.cache[key]; !ok && len(h.cache) >= h.cfg.CacheSize {
-		for k, e := range h.cache {
-			if !now.Before(e.until) {
-				delete(h.cache, k)
-			}
-		}
+		h.pruneLocked(now)
 		for k := range h.cache {
 			if len(h.cache) < h.cfg.CacheSize {
 				break
@@ -253,6 +280,60 @@ func (h *HTTP) store(key cacheKey, v Value, now time.Time) {
 		}
 	}
 	h.cache[key] = cacheEntry{value: v, until: until}
+	h.armLocked(until)
+}
+
+// pruneLocked drops every entry past its time.
+func (h *HTTP) pruneLocked(now time.Time) {
+	for k, e := range h.cache {
+		if !now.Before(e.until) {
+			delete(h.cache, k)
+		}
+	}
+}
+
+// armLocked makes sure the sweep runs by until, or sweepEvery after the
+// previous sweep if that is later.
+func (h *HTTP) armLocked(until time.Time) {
+	if h.closed {
+		return
+	}
+	at := until
+	if earliest := h.lastSweep.Add(h.sweepEvery); at.Before(earliest) {
+		at = earliest
+	}
+	if !h.next.IsZero() && !at.Before(h.next) {
+		return // already armed for that time or sooner
+	}
+	h.next = at
+	d := max(at.Sub(h.cfg.now()), 0)
+	if h.timer == nil {
+		h.timer = time.AfterFunc(d, h.sweep)
+	} else {
+		h.timer.Reset(d)
+	}
+}
+
+// sweep drops the entries past their time, then arms the next sweep for the
+// earliest time left.
+func (h *HTTP) sweep() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	now := h.cfg.now()
+	h.next, h.lastSweep = time.Time{}, now
+	h.pruneLocked(now)
+	var earliest time.Time
+	for _, e := range h.cache {
+		if earliest.IsZero() || e.until.Before(earliest) {
+			earliest = e.until
+		}
+	}
+	if !earliest.IsZero() {
+		h.armLocked(earliest)
+	}
 }
 
 // call makes one detokenize request. Errors name the status or the failure,

@@ -246,3 +246,8 @@ First release.
   intercepted connection failed. From 7 days before the CA expires it logs
   a warning at start and once a day, and once the CA has expired while it
   runs, an error once a day.
+- The `http` resolver's cache drops each value, real value included, within
+  5 seconds of the earlier of its `expires_at` and `-resolver-cache-ttl`,
+  whether or not more requests come, as the `sealed` cache and the masking
+  record already did. Before, an expired value stayed in memory until its
+  stand-in was looked up again or the cache was full.

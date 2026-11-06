@@ -147,6 +147,7 @@ func newTestHTTP(t *testing.T, cfg HTTPConfig) *HTTP {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(h.Close)
 	return h
 }
 
@@ -570,5 +571,72 @@ func TestHTTPRequiresMutualTLS(t *testing.T) {
 	}
 	if d.calls.Load() != 0 {
 		t.Fatal("a request without mutual TLS reached the service")
+	}
+}
+
+// Cached values, real values included, leave memory at their time even when
+// no request comes: a sweep drops them, and leaves the ones whose time has
+// not come. Before, an expired value stayed until its stand-in was looked
+// up again or the cache filled up.
+func TestHTTPCacheIsSweptWhileIdle(t *testing.T) {
+	short := time.Now().Add(time.Hour)
+	d := startDetokenizer(t, answerFrom(map[string]map[string]any{
+		"tok_short": {"real": "r1", "expires_at": short},
+		"tok_long":  {"real": "r2", "expires_at": short.Add(time.Hour)},
+	}))
+	cfg := d.config()
+	cfg.CacheTTL = 3 * time.Hour
+	// The proxy's clock reads 100ms before tok_short expires, so its time
+	// comes without waiting an hour.
+	offset := time.Until(short) - 100*time.Millisecond
+	cfg.now = func() time.Time { return time.Now().Add(offset) }
+	h := newTestHTTP(t, cfg)
+	h.sweepEvery = 10 * time.Millisecond
+	if _, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_short", "tok_long"}, Host: "api.test"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.mu.Lock()
+		var kept []string
+		for k := range h.cache {
+			kept = append(kept, k.standIn)
+		}
+		h.mu.Unlock()
+		if len(kept) == 1 && kept[0] == "tok_long" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("with no request, %q still cached past tok_short's expiry (want only tok_long)", kept)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Close stops the sweep and drops every cached value; lookups still work
+// afterwards, without being cached.
+func TestHTTPCloseStopsTheSweep(t *testing.T) {
+	d := startDetokenizer(t, answerFrom(map[string]map[string]any{"tok_a": {"real": "r"}}))
+	h := newTestHTTP(t, d.config())
+	lookup := func() {
+		t.Helper()
+		if _, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_a"}, Host: "api.test"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lookup()
+	h.Close()
+	h.mu.Lock()
+	cached, armed := len(h.cache), !h.next.IsZero()
+	h.mu.Unlock()
+	if cached != 0 || armed {
+		t.Fatal("Close kept values or the sweep")
+	}
+	lookup()
+	h.mu.Lock()
+	cached, armed = len(h.cache), !h.next.IsZero()
+	h.mu.Unlock()
+	if cached != 0 || armed || d.calls.Load() != 2 {
+		t.Fatalf("a closed resolver cached a value or armed its sweep (%d calls)", d.calls.Load())
 	}
 }

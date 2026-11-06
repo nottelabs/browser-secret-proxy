@@ -480,8 +480,9 @@ Your service answers `200` with the values it releases:
   request is then refused, as it is for any other status, a malformed answer,
   a redirect or a timeout (`-resolver-timeout`, 2 seconds by default).
 - Values are cached in memory per principal, host and stand-in until the earlier
-  of `expires_at` and `-resolver-cache-ttl` (1 minute by default). Refusals
-  and errors are not cached. A request with more than 256 stand-ins is
+  of `expires_at` and `-resolver-cache-ttl` (1 minute by default), and leave
+  memory within 5 seconds of that time, whether or not more requests come.
+  Refusals and errors are not cached. A request with more than 256 stand-ins is
   refused without a call.
 - The connection uses mutual TLS: the service should accept only the proxy's
   client certificate.
