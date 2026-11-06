@@ -239,3 +239,26 @@ func lit(texts ...string) []swap.Part {
 	}
 	return parts
 }
+
+// A known stand-in that appears only inside a longer token is not a
+// stand-in of the request: nothing is looked up and nothing is swapped.
+func TestStandInsInsideTokensAreNotLookedUp(t *testing.T) {
+	calls := 0
+	r := scopetest.Resolver{Known: []string{"919"}, Fn: func(resolve.Request) (resolve.Result, error) {
+		calls++
+		return resolve.Result{Values: map[string]resolve.Value{"919": {Real: "123"}}}, nil
+	}}
+	s := session(t, r, resolve.Principal{})
+	body := swap.Part{Place: swap.Query, Text: "amount=19190&ref=a919"}
+	if sw, err := s.Swapper(context.Background(), body); sw != nil || err != nil || calls != 0 {
+		t.Fatalf("got %v, %v after %d lookups; want no swapper and no lookup", sw, err, calls)
+	}
+	body.Text = "cvc=919&amount=19190"
+	sw, err := s.Swapper(context.Background(), body)
+	if err != nil || sw == nil {
+		t.Fatalf("got %v, %v", sw, err)
+	}
+	if out, _, _ := sw.Body("application/x-www-form-urlencoded", []byte(body.Text), 100); string(out) != "cvc=123&amount=19190" {
+		t.Fatalf("swapped %q", out)
+	}
+}

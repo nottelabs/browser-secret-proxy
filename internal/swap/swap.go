@@ -3,7 +3,11 @@
 // Each place a stand-in can appear gets the real value in the form that
 // place needs: query strings and form bodies get it query-escaped, JSON
 // strings get it JSON-escaped, header values and other bodies get it as is
-// (a header refuses values with line breaks). Every swap has an output
+// (a header refuses values with line breaks). A stand-in is replaced only
+// where it stands as a whole token: when it begins or ends with a letter, a
+// digit, "_" or "-", the byte next to it must not be one (TokenByte), so a
+// short stand-in such as a CVC does not replace digits of a longer number.
+// Every swap has an output
 // limit, checked while writing, so a short stand-in repeated many times
 // cannot expand past it.
 package swap
@@ -30,14 +34,10 @@ var (
 
 // Swapper replaces every stand-in with its real value.
 type Swapper struct {
-	literal    *strings.Replacer // raw text: header values and bodies other than forms and JSON
-	query      *strings.Replacer // query strings and form bodies, real values query-escaped
-	jsonString *strings.Replacer // inside JSON strings, real values JSON-escaped
-	// unsafeHeader drops the stand-ins whose real values hold a line break
-	// or NUL and keeps the others, matching as literal does; nil when no
-	// real value holds one.
-	unsafeHeader *strings.Replacer
-	keys         []string
+	literal    *replacer // raw text: header values and bodies other than forms and JSON
+	query      *replacer // query strings and form bodies, real values query-escaped
+	jsonString *replacer // inside JSON strings, real values JSON-escaped
+	keys       []string
 }
 
 // Load reads a JSON object mapping each stand-in to its real value.
@@ -65,40 +65,32 @@ func New(values map[string]string) (*Swapper, error) {
 		}
 		keys = append(keys, k)
 	}
-	// strings.Replacer tries patterns in argument order at each position.
+	// The matcher tries forms in key order at each position.
 	sort.Slice(keys, func(i, j int) bool {
 		if len(keys[i]) != len(keys[j]) {
 			return len(keys[i]) > len(keys[j])
 		}
 		return keys[i] < keys[j]
 	})
-	var literal, query, jsonString, unsafeHeader []string
-	unsafe := false
-	for _, k := range keys {
-		literal = append(literal, k, values[k])
-		if strings.ContainsAny(values[k], headerBreaks) {
-			unsafe = true
-			unsafeHeader = append(unsafeHeader, k, "")
-		} else {
-			unsafeHeader = append(unsafeHeader, k, k)
-		}
+	n := len(keys)
+	literal, query, jsonString := make([]string, n), make([]string, n), make([]string, n)
+	unsafe := make([]bool, n)
+	for i, k := range keys {
+		literal[i] = values[k]
+		unsafe[i] = strings.ContainsAny(values[k], headerBreaks)
 		// In a query string or form body the real value must arrive as one
 		// query value ("a&b+c" becomes "a%26b%2Bc"), whichever form the
 		// stand-in took there.
-		query = appendForms(query, values[k], url.QueryEscape, k, url.QueryEscape(k), url.PathEscape(k))
+		query[i] = url.QueryEscape(values[k])
 		// In a JSON string it must decode to itself ("a\"b" for a"b).
-		jsonString = appendForms(jsonString, values[k], jsonEscape, k, jsonEscape(k))
+		jsonString[i] = jsonEscape(values[k])
 	}
-	sw := &Swapper{
-		literal:    strings.NewReplacer(literal...),
-		query:      strings.NewReplacer(query...),
-		jsonString: strings.NewReplacer(jsonString...),
+	return &Swapper{
+		literal:    &replacer{m: newMatcher(keys, false, literalForms), repl: literal, unsafe: unsafe},
+		query:      &replacer{m: newMatcher(keys, true, queryForms), repl: query, unsafe: unsafe},
+		jsonString: &replacer{m: newMatcher(keys, false, jsonForms), repl: jsonString, unsafe: unsafe},
 		keys:       keys,
-	}
-	if unsafe {
-		sw.unsafeHeader = strings.NewReplacer(unsafeHeader...)
-	}
-	return sw, nil
+	}, nil
 }
 
 // Forms returns the distinct forms in which a Swapper recognizes a
@@ -112,20 +104,6 @@ func Forms(standIn string) []string {
 		}
 	}
 	return forms
-}
-
-// appendForms adds a replacement of each distinct form of a stand-in by
-// escape(real).
-func appendForms(pairs []string, real string, escape func(string) string, forms ...string) []string {
-	replacement := escape(real)
-	seen := map[string]bool{}
-	for _, form := range forms {
-		if !seen[form] {
-			seen[form] = true
-			pairs = append(pairs, form, replacement)
-		}
-	}
-	return pairs
 }
 
 // jsonEscape returns s as JSON string content, without the quotes.
@@ -156,13 +134,21 @@ func (w *limitedBuilder) WriteString(p string) (int, error) {
 
 func (w *limitedBuilder) Write(p []byte) (int, error) { return w.WriteString(string(p)) }
 
-func replace(r *strings.Replacer, in string, limit int) (string, bool, error) {
+func replace(r *replacer, in string, limit int) (string, bool, error) {
+	out, _, changed, err := replaceUnsafe(r, in, limit)
+	return out, changed, err
+}
+
+// replaceUnsafe is replace that also reports whether a replaced stand-in's
+// real value must not go into a header.
+func replaceUnsafe(r *replacer, in string, limit int) (string, bool, bool, error) {
 	w := &limitedBuilder{limit: limit}
-	if _, err := r.WriteString(w, in); err != nil {
-		return "", false, err
+	unsafe, err := r.write(w, in)
+	if err != nil {
+		return "", false, false, err
 	}
 	out := w.b.String()
-	return out, out != in, nil
+	return out, unsafe, out != in, nil
 }
 
 // headerBreaks are the bytes a real value must not hold to go into a header.
@@ -172,13 +158,11 @@ const headerBreaks = "\r\n\x00"
 // The result is at most limit bytes. A swap that would insert a real value
 // holding a line break or NUL is refused, whatever the value already holds.
 func (s *Swapper) Header(value string, limit int) (string, bool, error) {
-	out, changed, err := replace(s.literal, value, limit)
+	out, unsafe, changed, err := replaceUnsafe(s.literal, value, limit)
 	if err != nil || !changed {
 		return value, false, err
 	}
-	// unsafeHeader matches the same stand-ins at the same places as literal
-	// and drops only the unsafe ones, so the value shrinks when one is there.
-	if s.unsafeHeader != nil && len(s.unsafeHeader.Replace(value)) != len(value) {
+	if unsafe {
 		return value, false, ErrUnsafeHeader
 	}
 	return out, true, nil
@@ -256,7 +240,7 @@ func (s *Swapper) jsonText(in string, limit int) (string, bool, error) {
 		if inString {
 			return s.writeJSONString(w, segment)
 		}
-		_, err := s.literal.WriteString(w, segment)
+		_, err := s.literal.write(w, segment)
 		return err
 	}
 	inString := false
@@ -293,13 +277,13 @@ func (s *Swapper) jsonText(in string, limit int) (string, bool, error) {
 func (s *Swapper) writeJSONString(w *limitedBuilder, segment string) error {
 	decoded, ok := decodeJSONString(segment)
 	if !ok {
-		_, err := s.jsonString.WriteString(w, segment)
+		_, err := s.jsonString.write(w, segment)
 		return err
 	}
 	// The escaped output is never shorter than the decoded text, so the
 	// room left bounds the replacement too.
 	replaced := &limitedBuilder{limit: w.limit - w.b.Len()}
-	if _, err := s.literal.WriteString(replaced, decoded); err != nil {
+	if _, err := s.literal.write(replaced, decoded); err != nil {
 		return err
 	}
 	if replaced.b.String() == decoded {

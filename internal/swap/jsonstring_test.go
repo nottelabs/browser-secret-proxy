@@ -141,7 +141,7 @@ func TestJSONBodyFindsEscapedStandIns(t *testing.T) {
 
 func TestEscapedJSONSwapIsLimited(t *testing.T) {
 	s, _ := New(map[string]string{"t1": strings.Repeat("R", 100)})
-	in := `{"a":"` + strings.Repeat(`t\u0031`, 50) + `"}`
+	in := `{"a":"` + strings.Repeat(`t\u0031,`, 50) + `"}`
 	if _, _, err := s.Body("application/json", []byte(in), 1000); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("err = %v, want ErrTooLarge", err)
 	}

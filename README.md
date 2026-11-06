@@ -377,7 +377,14 @@ waits at most 10 seconds for them to finish.
 
 ### Where values are replaced
 
-Swaps happen only when the request's authority is on the allowlist. Each real
+Swaps happen only when the request's authority is on the allowlist. A
+stand-in is replaced only where it stands as a whole token: when it begins
+or ends with a letter, digit, `_` or `-`, the character next to it there
+must not be one of those. So stand-in `919` is replaced in `cvc=919` but
+not in `amount=19190`, `ref=a919` or `919_x`. In a query string or form
+body, an escaped neighbor counts as the character it encodes (`%20919` is
+`919` after a space). A stand-in that begins or ends with another
+character (`{{pin}}`) needs no boundary on that side. Each real
 value is inserted in the form its place needs:
 
 - query strings and form bodies: query-escaped, whether the stand-in was raw
@@ -1059,6 +1066,14 @@ return.
   HTTP/2, an HTTP/2 WebSocket, an upgrade to `h2c`) get `502`.
 - Text formats other than JSON and forms (XML, multipart) get real values as
   is; a value that needs escaping in such a body is not escaped.
+- A stand-in is replaced only as a whole token (see
+  [Where values are replaced](#where-values-are-replaced)). A stand-in
+  written next to a letter, digit, `_` or `-`, such as `tok_a` in
+  `tok_atok_b` or `919` in `19190`, is not replaced and reaches the
+  destination as is. There is no minimum length, so a 3-digit CVC stand-in
+  works, but a field that holds exactly the stand-in is replaced wherever
+  it appears in requests to the host: pick stand-ins that are not a value
+  of their own in other traffic.
 - Request bodies with a `Content-Encoding` (`gzip`, `br`, ...) are not
   decoded, so stand-ins inside them are not found: the destination gets the
   stand-ins.

@@ -251,3 +251,12 @@ First release.
   whether or not more requests come, as the `sealed` cache and the masking
   record already did. Before, an expired value stayed in memory until its
   stand-in was looked up again or the cache was full.
+- Behavior change: a stand-in is replaced only where it stands as a whole
+  token. When it begins or ends with a letter, digit, `_` or `-`, the
+  character next to it must not be one of those (in a query string or form
+  body, an escaped neighbor such as `%20` counts as what it encodes, and a
+  match never begins or ends inside a `%XX` escape).
+  Before, stand-ins matched as plain substrings: with CVC stand-in `919`, a
+  form field `amount=19190` in the same request became `amount=1<CVC>0`.
+  A stand-in written inside a longer word or number is now left as is and
+  not looked up.

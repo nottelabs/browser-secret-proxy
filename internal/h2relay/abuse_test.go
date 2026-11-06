@@ -503,8 +503,8 @@ func TestSwappedHeaderListsShareTheBudget(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.MaxBuffered = 100 << 10; expandingSession(t, o) })
 	h.serverSend(settingsFrame(Setting{ID: SettingMaxConcurrentStreams, Value: 0}))
 	h.expect(h.toClient, "client", isType(FrameSettings))
-	get := request("GET", hpack.HeaderField{Name: "x-t", Value: strings.Repeat("t1", 100)})
-	swapped := request("GET", hpack.HeaderField{Name: "x-t", Value: strings.Repeat(strings.Repeat("R", 200), 100)})
+	get := request("GET", hpack.HeaderField{Name: "x-t", Value: strings.Repeat("t1,", 100)})
+	swapped := request("GET", hpack.HeaderField{Name: "x-t", Value: strings.Repeat(strings.Repeat("R", 200)+",", 100)})
 	size := fieldsSize(swapped)
 	fit := (100 << 10) / size
 	for i := range fit + 1 {
@@ -527,7 +527,7 @@ func TestSwappedHeaderListsShareTheBudget(t *testing.T) {
 // goes upstream, and nothing of it stays held. CONNECT tunnels are refused,
 // so trailers on an intercepted connection are tested on ordinary uploads.
 func TestSwapsPastTheBudgetEndTheRequest(t *testing.T) {
-	standIns := hpack.HeaderField{Name: "x-t", Value: strings.Repeat("t1", 100)}
+	standIns := hpack.HeaderField{Name: "x-t", Value: strings.Repeat("t1,", 100)}
 	t.Run("buffered", func(t *testing.T) {
 		h := newHarness(t, func(o *Options) { o.MaxBuffered = 10000; expandingSession(t, o) })
 		h.clientSend(

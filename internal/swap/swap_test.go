@@ -82,13 +82,14 @@ func TestHeaderChecksInsertedValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := map[string]string{
-		"tok_plain\x00":     "sk_plain\x00",
-		"tok_pem_safe":      "sk_safe",
-		"tok_pem_safe\r":    "sk_safe\r",
-		"x tok_plain y":     "x sk_plain y",
-		"no stand-in\x00":   "no stand-in\x00",
-		"tok_pe tok_plain":  "tok_pe sk_plain",
-		"tok_pem_safetok_p": "sk_safetok_p",
+		"tok_plain\x00":      "sk_plain\x00",
+		"tok_pem_safe":       "sk_safe",
+		"tok_pem_safe\r":     "sk_safe\r",
+		"x tok_plain y":      "x sk_plain y",
+		"no stand-in\x00":    "no stand-in\x00",
+		"tok_pe tok_plain":   "tok_pe sk_plain",
+		"tok_pem_safe,tok_p": "sk_safe,tok_p",
+		"tok_pem_safetok_p":  "tok_pem_safetok_p", // not a whole token
 	}
 	for in, want := range cases {
 		got, _, err := s.Header(in, noLimit)
@@ -182,7 +183,7 @@ func TestJSONStringsGetEscapedValues(t *testing.T) {
 	}
 	for _, contentType := range []string{"application/json", "application/json; charset=utf-8", "application/vnd.api+json", "text/json"} {
 		for standIn, real := range reals {
-			in := `{"password":"` + standIn + `","list":["x-` + standIn + `-y"],"nested":{"k":"` + standIn + `"}}`
+			in := `{"password":"` + standIn + `","list":["x ` + standIn + ` y"],"nested":{"k":"` + standIn + `"}}`
 			out, changed, err := s.Body(contentType, []byte(in), noLimit)
 			if err != nil || !changed {
 				t.Fatalf("%s %q: %v, changed %v", contentType, standIn, err, changed)
@@ -191,7 +192,7 @@ func TestJSONStringsGetEscapedValues(t *testing.T) {
 			if err := json.Unmarshal(out, &decoded); err != nil {
 				t.Fatalf("%s: swapping %q gave invalid JSON %q: %v", contentType, real, out, err)
 			}
-			want := document{Password: real, List: []string{"x-" + real + "-y"}, Nested: map[string]string{"k": real}}
+			want := document{Password: real, List: []string{"x " + real + " y"}, Nested: map[string]string{"k": real}}
 			if !reflect.DeepEqual(decoded, want) {
 				t.Fatalf("%s: decoded %+v, want %+v", contentType, decoded, want)
 			}
@@ -233,7 +234,7 @@ func TestSwapsStopAtTheLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repeated := strings.Repeat("t1", 500) // 1000 bytes in, 500,000 out
+	repeated := strings.Repeat("t1,", 500) // 1500 bytes in, 500,500 out
 	if _, _, err := s.Header(repeated, 10000); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("Header: %v", err)
 	}
@@ -250,11 +251,11 @@ func TestSwapsStopAtTheLimit(t *testing.T) {
 		}
 	}
 	// At the limit exactly is fine.
-	out, _, err := s.Body("text/plain", []byte("t1t1"), 2000)
-	if err != nil || len(out) != 2000 {
+	out, _, err := s.Body("text/plain", []byte("t1,t1"), 2001)
+	if err != nil || len(out) != 2001 {
 		t.Fatalf("Body at the limit: %d bytes, %v", len(out), err)
 	}
-	if _, _, err := s.Body("text/plain", []byte("t1t1"), 1999); !errors.Is(err, ErrTooLarge) {
+	if _, _, err := s.Body("text/plain", []byte("t1,t1"), 2000); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("Body one byte over the limit: %v", err)
 	}
 }
@@ -276,6 +277,76 @@ func TestLoad(t *testing.T) {
 		}
 		if _, err := Load(path); err == nil {
 			t.Errorf("Load(%s) succeeded, want an error", name)
+		}
+	}
+}
+
+// A stand-in is replaced only as a whole token: a short one, such as a
+// CVC, does not replace digits of a longer number or word in the same
+// request. Before, "amount=19190" became "amount=1<CVC>0".
+func TestStandInsMatchWholeTokens(t *testing.T) {
+	s, err := New(map[string]string{"919": "123", "{{pin}}": "4321", "a b": "X"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := func(in string) string {
+		out, _, err := s.Body("application/x-www-form-urlencoded", []byte(in), noLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+	raw := func(in string) string {
+		out, _, err := s.Body("text/plain", []byte(in), noLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+	jsonBody := func(in string) string {
+		out, _, err := s.Body("application/json", []byte(in), noLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+	header := func(in string) string {
+		out, _, err := s.Header(in, noLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	target := func(in string) string {
+		out, _, err := s.Target(in, noLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	cases := []struct {
+		name     string
+		swap     func(string) string
+		in, want string
+	}{
+		{"form", form, "cvc=919&amount=19190", "cvc=123&amount=19190"},
+		{"form, before a letter", form, "x=919a&y=a919&z=_919&w=919-", "x=919a&y=a919&z=_919&w=919-"},
+		{"form, after an escaped space", form, "q=x%20919%2C", "q=x%20123%2C"},
+		{"form, after an escaped dash", form, "q=x%2D919", "q=x%2D919"},
+		{"form, after a plus", form, "q=x+919+y", "q=x+123+y"},
+		{"form, escaped stand-in in a word", form, "q=za%20b", "q=za%20b"},
+		{"target", target, "/p?cvc=919&n=9191", "/p?cvc=123&n=9191"},
+		{"raw", raw, "919 19190 919.", "123 19190 123."},
+		{"json string", jsonBody, `{"cvc":"919","amount":"19190","t":"x919"}`, `{"cvc":"123","amount":"19190","t":"x919"}`},
+		{"json escaped string", jsonBody, `{"t":"9919","u":" 919"}`, `{"t":"9919","u":" 123"}`},
+		{"json number", jsonBody, `{"cvc":919,"amount":19190}`, `{"cvc":123,"amount":19190}`},
+		{"header", header, "cvc 919, ref 91919", "cvc 123, ref 91919"},
+		// A stand-in that begins and ends with other bytes needs no boundary.
+		{"own delimiters", raw, "x{{pin}}y", "x4321y"},
+	}
+	for _, c := range cases {
+		if got := c.swap(c.in); got != c.want {
+			t.Errorf("%s: %q swapped to %q, want %q", c.name, c.in, got, c.want)
 		}
 	}
 }

@@ -48,7 +48,7 @@ func TestDeclaredBodyIsNotAllocatedUpFront(t *testing.T) {
 // A body larger than the first buffer still arrives whole, swapped.
 func TestLargeBodyIsReadWhole(t *testing.T) {
 	client, _, _, serverReader := pipes(t)
-	body := strings.Repeat("a", 300<<10) + "tok_standin" + strings.Repeat("b", 200<<10)
+	body := strings.Repeat("a", 300<<10) + " tok_standin " + strings.Repeat("b", 200<<10)
 	go func() {
 		_, _ = io.WriteString(client, "POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: "+strconv.Itoa(len(body))+"\r\n\r\n"+body)
 	}()

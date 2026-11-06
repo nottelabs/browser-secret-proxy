@@ -338,9 +338,9 @@ func TestSwapLimitsEndTheConnection(t *testing.T) {
 		name, real, request string
 		want                error
 	}{
-		{"body", long, "POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 800\r\n\r\n" + strings.Repeat("t1", 400), swap.ErrTooLarge},
-		{"header", strings.Repeat("R", 2000), "GET / HTTP/1.1\r\nHost: allowed.test\r\nX-Token: " + strings.Repeat("t1", 1000) + "\r\n\r\n", swap.ErrTooLarge},
-		{"target", strings.Repeat("R", 2000), "GET /?q=" + strings.Repeat("t1", 1000) + " HTTP/1.1\r\nHost: allowed.test\r\n\r\n", swap.ErrTooLarge},
+		{"body", long, "POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 750\r\n\r\n" + strings.Repeat("t1,", 250), swap.ErrTooLarge},
+		{"header", strings.Repeat("R", 2000), "GET / HTTP/1.1\r\nHost: allowed.test\r\nX-Token: " + strings.Repeat("t1,", 1000) + "\r\n\r\n", swap.ErrTooLarge},
+		{"target", strings.Repeat("R", 2000), "GET /?q=" + strings.Repeat("t1,", 1000) + " HTTP/1.1\r\nHost: allowed.test\r\n\r\n", swap.ErrTooLarge},
 		{"line break", "a\r\nX-Injected: 1", "GET / HTTP/1.1\r\nHost: allowed.test\r\nAuthorization: Bearer t1\r\n\r\n", swap.ErrUnsafeHeader},
 	}
 	for _, c := range cases {

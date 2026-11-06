@@ -61,3 +61,24 @@ func sortedCopy(s []string) []string {
 	}
 	return out
 }
+
+// Matches skips a stand-in found only inside a longer token, as the Swapper
+// does, so its value is not looked up.
+func TestMatchesSkipsStandInsInsideTokens(t *testing.T) {
+	cases := []struct {
+		part Part
+		want string
+	}{
+		{Part{Query, "amount=19190"}, ""},
+		{Part{Query, "cvc=919&amount=19190"}, "919"},
+		{Part{Query, "q=x%20919"}, "919"},
+		{Part{Literal, "ref-919"}, ""},
+		{Part{JSON, `{"n":19190,"s":"a919"}`}, ""},
+		{Part{JSON, `{"n":19190,"s":"919"}`}, "919"},
+	}
+	for _, c := range cases {
+		if got := strings.Join(Matches(c.part, []string{"919"}), ","); got != c.want {
+			t.Errorf("Matches(%+v) = %q, want %q", c.part, got, c.want)
+		}
+	}
+}
