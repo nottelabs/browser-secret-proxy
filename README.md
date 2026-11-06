@@ -1126,8 +1126,6 @@ Each release publishes binaries for linux and darwin (amd64, arm64), a
 keyless signing, an SPDX SBOM per archive, and a signed multi-arch image,
 `ghcr.io/nottelabs/browser-secret-proxy`.
 
-No release is published yet; the first is planned as 0.1.0.
-
 Only `.github/workflows/release.yml`, run for the release's tag, signs a
 release. Check for that exact identity: a pattern that matches any workflow
 of the repository also accepts a signature made by another workflow or on a

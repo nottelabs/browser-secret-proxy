@@ -6,7 +6,9 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
-First release, planned as 0.1.0.
+## [0.1.0] - 2026-11-06
+
+First release.
 
 ### Added
 
@@ -219,6 +221,12 @@ First release, planned as 0.1.0.
   stand-in let a multi-line value through). Over HTTP/2, a request whose
   field values hold a NUL, CR or LF, or start or end with a space or tab
   (malformed, RFC 9113 8.2.1), is answered `502` and not sent.
+- Documentation in `docs/`: concepts and threat model, deployment, resolvers
+  in depth, a hardening checklist, and a cookbook with one recipe per use
+  case (card and CVC, password in a form or JSON call, TOTP code, Bearer
+  token, API key in a query string, response masking).
+  `examples/totp-resolver` is a reference `http` resolver that computes
+  RFC 6238 codes.
 
 ### Changed
 
