@@ -269,12 +269,10 @@ proxy per tenant with its own credential (and, in `http` mode, check
 | `sealed` | Each decrypted token, values included (at most 256) | The earlier of its `exp` and 5 minutes after it was decrypted |
 | Masking record (all modes, when masking is on) | Each value looked up, per principal | The earlier of its expiry and 15 minutes after its last lookup |
 
-Decrypted sealed tokens and the masking record leave memory within 5
-seconds of their time, whether or not more requests come. An `http` cache
-entry is dropped when it is next looked up or when the cache is full, so
-an expired value can stay in memory, unused, until then. Set
-`-resolver-cache-ttl 0` if that matters to you: nothing is then cached. Nothing is written
-to disk.
+Cached `http` values, decrypted sealed tokens and the masking record leave
+memory within 5 seconds of their time, whether or not more requests come.
+Set `-resolver-cache-ttl 0` to keep no `http` values in memory between
+requests at all. Nothing is written to disk.
 
 A value past its `expires_at` is refused even if it was cached. Set
 `expires_at` on values that change on a schedule (TOTP codes) or must end

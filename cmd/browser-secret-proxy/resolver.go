@@ -136,6 +136,7 @@ func (f *resolverFlags) build(fixedUsername string, logger *slog.Logger) (*resol
 			return nil, err
 		}
 		setup.resolver = h
+		setup.close = h.Close
 		setup.timeout = f.timeout
 		setup.logAttrs = append(setup.logAttrs, "timeout", f.timeout.String(), "cache_ttl", f.cacheTTL.String())
 		if fixedUsername == "" {

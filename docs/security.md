@@ -115,8 +115,9 @@ that:
   token per session.
 - `file` mode: rotate the file's values on a schedule, and keep the file
   to the values the proxy's clients may all use.
-- Keep `-resolver-cache-ttl` short (default 1 minute); `0` sends every
-  lookup to your service.
+- Keep `-resolver-cache-ttl` short (default 1 minute): a cached value leaves
+  memory within 5 seconds of the earlier of that and its `expires_at`.
+  `0` sends every lookup to your service and caches nothing.
 
 ## Audit logging
 
