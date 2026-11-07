@@ -32,8 +32,8 @@ to the shop's.
   Using the same length as the real card keeps the request's length, and a
   masked response's framing, unchanged.
 - **CVC:** the field only takes 3 or 4 digits, so the stand-in is short.
-  Pick digits that appear nowhere else in requests to the payment host
-  (see [pitfalls](#pitfalls)), such as `919`.
+  Pick digits that are not a value of their own anywhere else in requests
+  to the payment host (see [pitfalls](#pitfalls)), such as `919`.
 - **Formatted variants:** if the page sends the number with spaces or
   dashes (`4242 4242 4242 4242`), add that exact form as its own stand-in.
   The proxy finds a stand-in as typed, query-escaped, path-escaped and
@@ -119,12 +119,15 @@ secret, so they can sit in the prompt, the agent's memory and logs.
 
 ## Pitfalls
 
-- **Short stand-ins replace substrings.** The proxy replaces every
-  occurrence of a stand-in in requests to the allowlisted host, as a
-  substring. With CVC stand-in `919`, a field `amount=19190` in the same
-  request becomes `amount=1<CVC>0`. Allowlist only the card endpoint,
-  check what else it receives, and pick CVC digits that do not occur
-  there.
+- **Short stand-ins match whole values only.** The proxy replaces a
+  stand-in only where it stands on its own: not next to a letter, digit,
+  `_` or `-` (in a query string or form body, an escaped neighbor such as
+  `%20` counts as the character it encodes). With CVC stand-in `919`,
+  `cvc=919` gets the real CVC and `amount=19190` or `ref=a919` is left
+  alone. A field that holds exactly `919`, such as `qty=919`, is still
+  replaced: allowlist only the card endpoint, check what else it
+  receives, and pick CVC digits that do not appear there as a value of
+  their own.
 - **The CVC is not masked in responses.** Masking skips values shorter
   than 8 bytes. A site that echoes the CVC shows the real one.
 - **Client-side encryption.** Some payment widgets encrypt the card fields

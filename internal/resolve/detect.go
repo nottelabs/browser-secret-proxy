@@ -110,6 +110,10 @@ func (d *Detector) FindIn(known KnownStandIns, p Principal, texts ...string) []s
 	return out
 }
 
+// containsAny reports whether a form is anywhere in texts, as a plain
+// substring. Detection may find more than a swap replaces (a stand-in
+// inside a longer token): the scope keeps only the stand-ins swap.Matches
+// says a swap would replace, before anything is looked up.
 func containsAny(texts, forms []string) bool {
 	for _, text := range texts {
 		for _, form := range forms {
@@ -119,10 +123,6 @@ func containsAny(texts, forms []string) bool {
 		}
 	}
 	return false
-}
-
-func tokenByte(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
 }
 
 // findPrefixed adds every prefix-led token of text to found, in one pass:
@@ -135,12 +135,12 @@ func findPrefixed(text, prefix string, found map[string]bool) {
 			return
 		}
 		start := i + j
-		if start > 0 && tokenByte(text[start-1]) {
+		if start > 0 && swap.TokenByte(text[start-1]) {
 			i = start + 1
 			continue
 		}
 		end := start + len(prefix)
-		for end < len(text) && tokenByte(text[end]) {
+		for end < len(text) && swap.TokenByte(text[end]) {
 			end++
 		}
 		if end > start+len(prefix) {

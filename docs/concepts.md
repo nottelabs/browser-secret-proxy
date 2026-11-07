@@ -48,9 +48,11 @@ the real value would go. The proxy recognizes it and replaces it.
 Good stand-ins:
 
 - **Cannot appear by accident** in other traffic to the same host. The
-  proxy replaces every occurrence it finds, as a plain substring, not as a
-  word (see [pitfalls](cookbook/card.md#pitfalls) for what a short stand-in
-  can break).
+  proxy replaces every occurrence it finds that stands as a whole token:
+  not next to a letter, digit, `_` or `-`. A short stand-in therefore does
+  not break a longer number that contains it, but any field that holds
+  exactly the stand-in gets the real value (see
+  [pitfalls](cookbook/card.md#pitfalls)).
 - **Pass the page's own checks.** A card field may check the Luhn digit
   and the length; a 2FA field may accept only six digits. A stand-in that
   the page rejects never reaches the proxy.

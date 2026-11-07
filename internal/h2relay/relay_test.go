@@ -312,7 +312,7 @@ func TestBufferedBodiesShareABudget(t *testing.T) {
 	if _, _, held := h.state(); held != 600+fieldsSize(post) {
 		t.Fatalf("relay holds %d bytes, want the 600 of stream 1 and its headers", held)
 	}
-	h.clientSend(Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte("tok_standin")})
+	h.clientSend(Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(" tok_standin")})
 	headers := h.expect(h.toServer, "server", isType(FrameHeaders))
 	if headers.Stream != 1 {
 		t.Fatalf("server got headers on stream %d", headers.Stream)
@@ -325,7 +325,7 @@ func TestBufferedBodiesShareABudget(t *testing.T) {
 			break
 		}
 	}
-	if want := strings.Repeat("a", 600) + "real_value"; string(body) != want {
+	if want := strings.Repeat("a", 600) + " real_value"; string(body) != want {
 		t.Fatalf("server body %q", body)
 	}
 	if _, _, held := h.state(); held != 0 {
@@ -808,7 +808,7 @@ func TestBodyExpansionIsBoundedByMaxBody(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.MaxBody = 1000; expandingSession(t, o) })
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
-		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1", 400))}, // 800 bytes, 80,000 swapped
+		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1,", 300))}, // 900 bytes, 60,300 swapped
 	)
 	h.expect(h.toClient, "client", isRefusal(1))
 	h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
@@ -820,7 +820,7 @@ func TestBodyExpansionIsBoundedByTheConnectionBudget(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.MaxBuffered = 5000; expandingSession(t, o) })
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
-		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1", 400))},
+		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1,", 400))},
 	)
 	h.expect(h.toClient, "client", isRefusal(1))
 	h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })
@@ -828,11 +828,11 @@ func TestBodyExpansionIsBoundedByTheConnectionBudget(t *testing.T) {
 	// A body whose swap fits still goes through.
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 3, Payload: h.clientBlock(request("POST")...)},
-		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 3, Payload: []byte("t1t1")},
+		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 3, Payload: []byte("t1,t1")},
 	)
 	h.expect(h.toServer, "server", isType(FrameHeaders))
-	if f := h.expect(h.toServer, "server", isType(FrameData)); len(f.Payload) != 400 {
-		t.Fatalf("server got %d bytes, want 400", len(f.Payload))
+	if f := h.expect(h.toServer, "server", isType(FrameData)); len(f.Payload) != 401 {
+		t.Fatalf("server got %d bytes, want 401", len(f.Payload))
 	}
 }
 
@@ -840,7 +840,7 @@ func TestBodyExpansionIsBoundedByTheConnectionBudget(t *testing.T) {
 // value with a line break never reaches a header.
 func TestHeaderSwapsAreBoundedAndSafe(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.MaxHeaderBytes = 16384; expandingSession(t, o) })
-	repeated := strings.Repeat("t1", 1000) // 2,000 bytes, 200,000 swapped
+	repeated := strings.Repeat("t1,", 1000) // 3,000 bytes, 201,000 swapped
 	h.clientSend(Frame{Type: FrameHeaders, Flags: FlagEndHeaders | FlagEndStream, Stream: 1,
 		Payload: h.clientBlock(request("GET", hpack.HeaderField{Name: "x-token", Value: repeated})...)})
 	h.expect(h.toClient, "client", isRefusal(1))
