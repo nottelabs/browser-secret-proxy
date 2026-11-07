@@ -1103,7 +1103,10 @@ return.
 - Response masking has limits of its own: see
   [What masking misses](#what-masking-misses).
 - The CA, the `http` mode's client certificate and the `sealed` key are
-  read once at start. Restart the proxy to change them. The swaps file is
+  read once at start. Restart the proxy to change them. The proxy refuses
+  to start with a CA that has expired or is not valid yet, and logs a
+  warning once a day from 7 days before the CA expires (see
+  [Rotate the CA](docs/deployment.md#rotate-the-ca)). The swaps file is
   reloaded (see [file](#file)).
 - In `http` mode, a request that needs a lookup waits for it on its own:
   over HTTP/2, the other requests of the connection go on meanwhile, and a

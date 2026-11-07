@@ -24,10 +24,16 @@ import (
 // valid until notAfter, with basicConstraints CA set to isCA.
 func testCA(t *testing.T, key crypto.Signer, notAfter time.Time, isCA bool) []byte {
 	t.Helper()
+	return testCAValid(t, key, time.Now().Add(-time.Hour), notAfter, isCA)
+}
+
+// testCAValid is testCA valid from notBefore.
+func testCAValid(t *testing.T, key crypto.Signer, notBefore, notAfter time.Time, isCA bool) []byte {
+	t.Helper()
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "test CA"},
-		NotBefore:             time.Now().Add(-time.Hour),
+		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		IsCA:                  isCA,
 		BasicConstraintsValid: true,

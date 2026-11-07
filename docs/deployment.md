@@ -77,16 +77,28 @@ chmod 600 ca.key
 below it.
 
 The proxy accepts the key as PKCS #8, PKCS #1 or SEC 1 PEM, and checks
-that it matches the certificate and that the certificate is a CA. It
+that it matches the certificate, that the certificate is a CA, and that it
+is valid now: it refuses to start with an expired CA or one that is not
+valid yet, and says which date failed. It
 generates one P-256 key for all leaf certificates at start. Each leaf is
 valid for 7 days, never past the CA's own expiry, is kept in memory per
 host and renewed an hour before it ends.
 
 ## Rotate the CA
 
-The CA is read once at start, and the proxy does not warn when it is
-close to expiry or expired. Leaf certificates never outlive the CA, so an
-expired CA breaks every intercepted connection. Monitor it:
+The CA is read once at start. Leaf certificates never outlive the CA, so
+an expired CA breaks every intercepted connection. The proxy:
+
+- refuses to start with a CA that has expired or is not valid yet;
+- logs a warning (`the CA certificate expires soon`, with `not_after` and
+  `expires_in`) at start and then once a day, from 7 days before the CA
+  expires. In that window, new leaf certificates end with the CA, sooner
+  than their usual 7 days;
+- logs an error (`the CA certificate has expired`) when the CA expires
+  while it runs, and once a day after that, until it restarts with a new
+  CA.
+
+Alert on those log lines, or check the file yourself:
 
 ```sh
 # Exit status 1 when ca.pem expires within 7 days.
