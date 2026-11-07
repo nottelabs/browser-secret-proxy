@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -586,28 +587,38 @@ func TestHTTPCacheIsSweptWhileIdle(t *testing.T) {
 	}))
 	cfg := d.config()
 	cfg.CacheTTL = 3 * time.Hour
-	// The proxy's clock reads 100ms before tok_short expires, so its time
-	// comes without waiting an hour.
-	offset := time.Until(short) - 100*time.Millisecond
-	cfg.now = func() time.Time { return time.Now().Add(offset) }
+	// The proxy's clock stands still 200ms before tok_short expires while
+	// both values are looked up and cached, however long that takes, then
+	// jumps past that expiry. Only the armed sweep can then drop tok_short:
+	// no request comes.
+	var clock atomic.Int64
+	clock.Store(short.Add(-200 * time.Millisecond).UnixNano())
+	cfg.now = func() time.Time { return time.Unix(0, clock.Load()) }
 	h := newTestHTTP(t, cfg)
 	h.sweepEvery = 10 * time.Millisecond
 	if _, err := h.Resolve(context.Background(), Request{StandIns: []string{"tok_short", "tok_long"}, Host: "api.test"}); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	cached := func() []string {
 		h.mu.Lock()
+		defer h.mu.Unlock()
 		var kept []string
 		for k := range h.cache {
 			kept = append(kept, k.standIn)
 		}
-		h.mu.Unlock()
-		if len(kept) == 1 && kept[0] == "tok_long" {
+		slices.Sort(kept)
+		return kept
+	}
+	if got := cached(); !slices.Equal(got, []string{"tok_long", "tok_short"}) {
+		t.Fatalf("cached %q before tok_short's expiry, want both", got)
+	}
+	clock.Store(short.Add(time.Millisecond).UnixNano())
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := cached(); slices.Equal(got, []string{"tok_long"}) {
 			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("with no request, %q still cached past tok_short's expiry (want only tok_long)", kept)
+		} else if time.Now().After(deadline) {
+			t.Fatalf("with no request, %q still cached past tok_short's expiry (want only tok_long)", got)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
