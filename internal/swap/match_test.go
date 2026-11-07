@@ -72,6 +72,7 @@ func TestMatchesSkipsStandInsInsideTokens(t *testing.T) {
 		{Part{Query, "amount=19190"}, ""},
 		{Part{Query, "cvc=919&amount=19190"}, "919"},
 		{Part{Query, "q=x%20919"}, "919"},
+		{Part{Query, "q=hello%919"}, ""},
 		{Part{Literal, "ref-919"}, ""},
 		{Part{JSON, `{"n":19190,"s":"a919"}`}, ""},
 		{Part{JSON, `{"n":19190,"s":"919"}`}, "919"},

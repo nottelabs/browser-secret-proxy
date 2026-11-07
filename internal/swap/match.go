@@ -186,6 +186,11 @@ func (m *matcher) at(text string, i int) *matchForm {
 		if !strings.HasPrefix(text[i:], f.text) {
 			continue
 		}
+		// In a query string, a match must not begin or end inside a %XX
+		// escape: "209" in "hello%209" ("hello 9") is not the stand-in.
+		if m.splitsEscape(text, i) || m.splitsEscape(text, i+len(f.text)) {
+			continue
+		}
 		if f.tokenStart && i > 0 && TokenByte(m.before(text, i)) {
 			continue
 		}
@@ -195,6 +200,26 @@ func (m *matcher) at(text string, i int) *matchForm {
 		return f
 	}
 	return nil
+}
+
+// splitsEscape reports whether, in a query string, the boundary before
+// text[p] falls inside a valid %XX escape: after its '%' or between its two
+// hex digits.
+func (m *matcher) splitsEscape(text string, p int) bool {
+	if !m.query || p <= 0 || p >= len(text) {
+		return false
+	}
+	if text[p-1] == '%' && p+1 < len(text) {
+		if _, ok := unhex2(text[p], text[p+1]); ok {
+			return true
+		}
+	}
+	if p >= 2 && text[p-2] == '%' {
+		if _, ok := unhex2(text[p-1], text[p]); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // before is the byte before text[i], decoded when the matcher reads a query

@@ -808,7 +808,7 @@ func TestBodyExpansionIsBoundedByMaxBody(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.MaxBody = 1000; expandingSession(t, o) })
 	h.clientSend(
 		Frame{Type: FrameHeaders, Flags: FlagEndHeaders, Stream: 1, Payload: h.clientBlock(request("POST")...)},
-		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1,", 400))}, // 1,200 bytes, 80,400 swapped
+		Frame{Type: FrameData, Flags: FlagEndStream, Stream: 1, Payload: []byte(strings.Repeat("t1,", 300))}, // 900 bytes, 60,300 swapped
 	)
 	h.expect(h.toClient, "client", isRefusal(1))
 	h.quiet(h.toServer, 50*time.Millisecond, func(f Frame) bool { return f.Type == FrameHeaders || f.Type == FrameData })

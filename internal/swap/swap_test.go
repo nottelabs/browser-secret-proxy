@@ -335,6 +335,7 @@ func TestStandInsMatchWholeTokens(t *testing.T) {
 		{"form, after an escaped dash", form, "q=x%2D919", "q=x%2D919"},
 		{"form, after a plus", form, "q=x+919+y", "q=x+123+y"},
 		{"form, escaped stand-in in a word", form, "q=za%20b", "q=za%20b"},
+		{"form, inside an escape", form, "q=hello%919&r=%9199", "q=hello%919&r=%9199"},
 		{"target", target, "/p?cvc=919&n=9191", "/p?cvc=123&n=9191"},
 		{"raw", raw, "919 19190 919.", "123 19190 123."},
 		{"json string", jsonBody, `{"cvc":"919","amount":"19190","t":"x919"}`, `{"cvc":"123","amount":"19190","t":"x919"}`},
